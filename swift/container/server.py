@@ -17,6 +17,7 @@ import json
 import os
 import time
 import traceback
+import math
 from swift import gettext_ as _
 from xml.etree.cElementTree import Element, SubElement, tostring
 
@@ -183,11 +184,12 @@ class ContainerController(BaseStorageServer):
         if len(account_hosts) != len(account_devices):
             # This shouldn't happen unless there's a bug in the proxy,
             # but if there is, we want to know about it.
-            self.logger.error(_('ERROR Account update failed: different  '
-                                'numbers of hosts and devices in request: '
-                                '"%s" vs "%s"') %
-                               (req.headers.get('X-Account-Host', ''),
-                                req.headers.get('X-Account-Device', '')))
+            self.logger.error(_(
+                'ERROR Account update failed: different  '
+                'numbers of hosts and devices in request: '
+                '"%(hosts)s" vs "%(devices)s"') % {
+                    'hosts': req.headers.get('X-Account-Host', ''),
+                    'devices': req.headers.get('X-Account-Device', '')})
             return HTTPBadRequest(req=req)
 
         if account_partition:
@@ -432,7 +434,9 @@ class ContainerController(BaseStorageServer):
             if value != '' and (key.lower() in self.save_headers or
                                 is_sys_or_user_meta('container', key)))
         headers['Content-Type'] = out_content_type
-        return HTTPNoContent(request=req, headers=headers, charset='utf-8')
+        resp = HTTPNoContent(request=req, headers=headers, charset='utf-8')
+        resp.last_modified = math.ceil(float(headers['X-PUT-Timestamp']))
+        return resp
 
     def update_data_record(self, record):
         """
@@ -529,6 +533,7 @@ class ContainerController(BaseStorageServer):
             if not container_list:
                 return HTTPNoContent(request=req, headers=resp_headers)
             ret.body = '\n'.join(rec[0] for rec in container_list) + '\n'
+        ret.last_modified = math.ceil(float(resp_headers['X-PUT-Timestamp']))
         return ret
 
     @public
@@ -593,14 +598,10 @@ class ContainerController(BaseStorageServer):
         else:
             try:
                 # disallow methods which have not been marked 'public'
-                try:
-                    if req.method not in self.allowed_methods:
-                        raise AttributeError('Not allowed method.')
-                except AttributeError:
+                if req.method not in self.allowed_methods:
                     res = HTTPMethodNotAllowed()
                 else:
-                    method = getattr(self, req.method)
-                    res = method(req)
+                    res = getattr(self, req.method)(req)
             except HTTPException as error_response:
                 res = error_response
             except (Exception, Timeout):

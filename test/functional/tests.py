@@ -79,8 +79,8 @@ class Base(unittest2.TestCase):
 
     def assert_body(self, body):
         response_body = self.env.conn.response.read()
-        self.assertTrue(response_body == body,
-                        'Body returned: %s' % (response_body))
+        self.assertEqual(response_body, body,
+                         'Body returned: %s' % (response_body))
 
     def assert_status(self, status_or_statuses):
         self.assertTrue(
@@ -173,7 +173,9 @@ class TestAccount(Base):
         finally:
             self.env.account.conn.storage_url = was_url
 
-    def testPUT(self):
+    def testPUTError(self):
+        if load_constraint('allow_account_management'):
+            raise SkipTest("Allow account management is enabled")
         self.env.account.conn.make_request('PUT')
         self.assert_status([403, 405])
 
@@ -184,7 +186,7 @@ class TestAccount(Base):
 
             info = self.env.account.info()
             for field in ['object_count', 'container_count', 'bytes_used']:
-                self.assertTrue(info[field] >= 0)
+                self.assertGreaterEqual(info[field], 0)
 
             if info['container_count'] == len(self.env.containers):
                 break
@@ -211,8 +213,8 @@ class TestAccount(Base):
         for format_type in ['json', 'xml']:
             for a in self.env.account.containers(
                     parms={'format': format_type}):
-                self.assertTrue(a['count'] >= 0)
-                self.assertTrue(a['bytes'] >= 0)
+                self.assertGreaterEqual(a['count'], 0)
+                self.assertGreaterEqual(a['bytes'], 0)
 
             headers = dict(self.env.conn.response.getheaders())
             if format_type == 'json':
@@ -228,7 +230,8 @@ class TestAccount(Base):
             p = {'limit': l}
 
             if l <= limit:
-                self.assertTrue(len(self.env.account.containers(parms=p)) <= l)
+                self.assertLessEqual(len(self.env.account.containers(parms=p)),
+                                     l)
                 self.assert_status(200)
             else:
                 self.assertRaises(ResponseError,
@@ -314,11 +317,12 @@ class TestAccount(Base):
                     parms={'format': format_type,
                            'marker': marker,
                            'limit': limit})
-                self.assertTrue(len(containers) <= limit)
+                self.assertLessEqual(len(containers), limit)
                 if containers:
                     if isinstance(containers[0], dict):
                         containers = [x['name'] for x in containers]
-                    self.assertTrue(locale.strcoll(containers[0], marker) > 0)
+                    self.assertGreater(locale.strcoll(containers[0], marker),
+                                       0)
 
     def testContainersOrderedByName(self):
         for format_type in [None, 'json', 'xml']:
@@ -543,12 +547,11 @@ class TestContainer(Base):
         for i in range(len(files)):
             f = files[i]
             for j in range(1, len(files) - i):
-                self.assertTrue(
-                    cont.files(parms={'limit': j, 'marker': f}) ==
-                    files[i + 1: i + j + 1])
-            self.assertTrue(cont.files(parms={'marker': f}) == files[i + 1:])
-            self.assertTrue(cont.files(parms={'marker': f, 'prefix': f}) == [])
-            self.assertTrue(cont.files(parms={'prefix': f}) == [f])
+                self.assertEqual(cont.files(parms={'limit': j, 'marker': f}),
+                                 files[i + 1: i + j + 1])
+            self.assertEqual(cont.files(parms={'marker': f}), files[i + 1:])
+            self.assertEqual(cont.files(parms={'marker': f, 'prefix': f}), [])
+            self.assertEqual(cont.files(parms={'prefix': f}), [f])
 
     def testPrefixAndLimit(self):
         load_constraint('container_listing_limit')
@@ -570,13 +573,19 @@ class TestContainer(Base):
 
         for format_type in [None, 'json', 'xml']:
             for prefix in prefixs:
-                files = cont.files(parms={'prefix': prefix})
+                files = cont.files(parms={'prefix': prefix,
+                                          'format': format_type})
+                if isinstance(files[0], dict):
+                    files = [x.get('name', x.get('subdir')) for x in files]
                 self.assertEqual(files, sorted(prefix_files[prefix]))
 
         for format_type in [None, 'json', 'xml']:
             for prefix in prefixs:
                 files = cont.files(parms={'limit': limit_count,
-                                   'prefix': prefix})
+                                          'prefix': prefix,
+                                          'format': format_type})
+                if isinstance(files[0], dict):
+                    files = [x.get('name', x.get('subdir')) for x in files]
                 self.assertEqual(len(files), limit_count)
 
                 for file_item in files:
@@ -593,12 +602,24 @@ class TestContainer(Base):
             file_item = cont.file(f)
             self.assertTrue(file_item.write_random())
 
-        results = cont.files()
-        results = cont.files(parms={'delimiter': delimiter})
-        self.assertEqual(results, ['test', 'test-'])
+        for format_type in [None, 'json', 'xml']:
+            results = cont.files(parms={'format': format_type})
+            if isinstance(results[0], dict):
+                results = [x.get('name', x.get('subdir')) for x in results]
+            self.assertEqual(results, ['test', 'test-bar', 'test-foo'])
 
-        results = cont.files(parms={'delimiter': delimiter, 'reverse': 'yes'})
-        self.assertEqual(results, ['test-', 'test'])
+            results = cont.files(parms={'delimiter': delimiter,
+                                        'format': format_type})
+            if isinstance(results[0], dict):
+                results = [x.get('name', x.get('subdir')) for x in results]
+            self.assertEqual(results, ['test', 'test-'])
+
+            results = cont.files(parms={'delimiter': delimiter,
+                                        'format': format_type,
+                                        'reverse': 'yes'})
+            if isinstance(results[0], dict):
+                results = [x.get('name', x.get('subdir')) for x in results]
+            self.assertEqual(results, ['test-', 'test'])
 
     def testListDelimiterAndPrefix(self):
         cont = self.env.account.container(Utils.create_name())
@@ -742,6 +763,30 @@ class TestContainer(Base):
             for file_item in files:
                 self.assertIn(file_item, self.env.files)
 
+    def _testContainerFormattedFileList(self, format_type):
+        expected = {}
+        for name in self.env.files:
+            expected[name] = self.env.container.file(name).info()
+
+        file_list = self.env.container.files(parms={'format': format_type})
+        self.assert_status(200)
+        for actual in file_list:
+            name = actual['name']
+            self.assertIn(name, expected)
+            self.assertEqual(expected[name]['etag'], actual['hash'])
+            self.assertEqual(
+                expected[name]['content_type'], actual['content_type'])
+            self.assertEqual(
+                expected[name]['content_length'], actual['bytes'])
+            expected.pop(name)
+        self.assertFalse(expected)  # sanity check
+
+    def testContainerJsonFileList(self):
+        self._testContainerFormattedFileList('json')
+
+    def testContainerXmlFileList(self):
+        self._testContainerFormattedFileList('xml')
+
     def testMarkerLimitFileList(self):
         for format_type in [None, 'json', 'xml']:
             for marker in ['0', 'A', 'I', 'R', 'Z', 'a', 'i', 'r', 'z',
@@ -757,11 +802,11 @@ class TestContainer(Base):
                 if isinstance(files[0], dict):
                     files = [x['name'] for x in files]
 
-                self.assertTrue(len(files) <= limit)
+                self.assertLessEqual(len(files), limit)
                 if files:
                     if isinstance(files[0], dict):
                         files = [x['name'] for x in files]
-                    self.assertTrue(locale.strcoll(files[0], marker) > 0)
+                    self.assertGreater(locale.strcoll(files[0], marker), 0)
 
     def testFileOrder(self):
         for format_type in [None, 'json', 'xml']:
@@ -805,6 +850,45 @@ class TestContainer(Base):
         self.assertTrue(cont.create())
         file_item = cont.file(Utils.create_name())
         file_item.write_random()
+
+    def testContainerLastModified(self):
+        container = self.env.account.container(Utils.create_name())
+        self.assertTrue(container.create())
+        info = container.info()
+        t0 = info['last_modified']
+        # last modified header is in date format which supports in second
+        # so we need to wait to increment a sec in the header.
+        eventlet.sleep(1)
+
+        # POST container change last modified timestamp
+        self.assertTrue(
+            container.update_metadata({'x-container-meta-japan': 'mitaka'}))
+        info = container.info()
+        t1 = info['last_modified']
+        self.assertNotEqual(t0, t1)
+        eventlet.sleep(1)
+
+        # PUT container (overwrite) also change last modified
+        self.assertTrue(container.create())
+        info = container.info()
+        t2 = info['last_modified']
+        self.assertNotEqual(t1, t2)
+        eventlet.sleep(1)
+
+        # PUT object doesn't change container last modified timestamp
+        obj = container.file(Utils.create_name())
+        self.assertTrue(
+            obj.write("aaaaa", hdrs={'Content-Type': 'text/plain'}))
+        info = container.info()
+        t3 = info['last_modified']
+        self.assertEqual(t2, t3)
+
+        # POST object also doesn't change container last modified timestamp
+        self.assertTrue(
+            obj.sync_metadata({'us': 'austin'}))
+        info = container.info()
+        t4 = info['last_modified']
+        self.assertEqual(t2, t4)
 
 
 class TestContainerUTF8(Base2, TestContainer):
@@ -1057,7 +1141,7 @@ class TestContainerPaths(Base):
         for format_type in ('json', 'xml'):
             for file_item in self.env.container.files(parms={'format':
                                                              format_type}):
-                self.assertTrue(int(file_item['bytes']) >= 0)
+                self.assertGreaterEqual(int(file_item['bytes']), 0)
                 self.assertIn('last_modified', file_item)
                 if file_item['name'].endswith('/'):
                     self.assertEqual(file_item['content_type'],
@@ -1159,11 +1243,24 @@ class TestFile(Base):
         file_item = self.env.container.file(source_filename)
 
         metadata = {}
-        for i in range(1):
-            metadata[Utils.create_ascii_name()] = Utils.create_name()
+        metadata[Utils.create_ascii_name()] = Utils.create_name()
+        put_headers = {'Content-Type': 'application/test',
+                       'Content-Encoding': 'gzip',
+                       'Content-Disposition': 'attachment; filename=myfile'}
+        file_item.metadata = metadata
+        data = file_item.write_random(hdrs=put_headers)
 
-        data = file_item.write_random()
-        file_item.sync_metadata(metadata)
+        # the allowed headers are configurable in object server, so we cannot
+        # assert that content-encoding and content-disposition get *copied*
+        # unless they were successfully set on the original PUT, so populate
+        # expected_headers by making a HEAD on the original object
+        file_item.initialize()
+        self.assertEqual('application/test', file_item.content_type)
+        resp_headers = dict(file_item.conn.response.getheaders())
+        expected_headers = {}
+        for k, v in put_headers.items():
+            if k.lower() in resp_headers:
+                expected_headers[k] = v
 
         dest_cont = self.env.account.container(Utils.create_name())
         self.assertTrue(dest_cont.create())
@@ -1174,16 +1271,151 @@ class TestFile(Base):
             for prefix in ('', '/'):
                 dest_filename = Utils.create_name()
 
-                file_item = self.env.container.file(source_filename)
-                file_item.copy('%s%s' % (prefix, cont), dest_filename)
+                extra_hdrs = {'X-Object-Meta-Extra': 'fresh'}
+                self.assertTrue(file_item.copy(
+                    '%s%s' % (prefix, cont), dest_filename, hdrs=extra_hdrs))
+
+                # verify container listing for copy
+                listing = cont.files(parms={'format': 'json'})
+                for obj in listing:
+                    if obj['name'] == dest_filename:
+                        break
+                else:
+                    self.fail('Failed to find %s in listing' % dest_filename)
+
+                self.assertEqual(file_item.size, obj['bytes'])
+                self.assertEqual(file_item.etag, obj['hash'])
+                self.assertEqual(file_item.content_type, obj['content_type'])
+
+                file_copy = cont.file(dest_filename)
+
+                self.assertEqual(data, file_copy.read())
+                self.assertTrue(file_copy.initialize())
+                expected_metadata = dict(metadata)
+                # new metadata should be merged with existing
+                expected_metadata['extra'] = 'fresh'
+                self.assertDictEqual(expected_metadata, file_copy.metadata)
+                resp_headers = dict(file_copy.conn.response.getheaders())
+                for k, v in expected_headers.items():
+                    self.assertIn(k.lower(), resp_headers)
+                    self.assertEqual(v, resp_headers[k.lower()])
+
+                # repeat copy with updated content-type, content-encoding and
+                # content-disposition, which should get updated
+                extra_hdrs = {
+                    'X-Object-Meta-Extra': 'fresher',
+                    'Content-Type': 'application/test-changed',
+                    'Content-Encoding': 'not_gzip',
+                    'Content-Disposition': 'attachment; filename=notmyfile'}
+                self.assertTrue(file_item.copy(
+                    '%s%s' % (prefix, cont), dest_filename, hdrs=extra_hdrs))
 
                 self.assertIn(dest_filename, cont.files())
 
-                file_item = cont.file(dest_filename)
+                file_copy = cont.file(dest_filename)
 
-                self.assertTrue(data == file_item.read())
-                self.assertTrue(file_item.initialize())
-                self.assertTrue(metadata == file_item.metadata)
+                self.assertEqual(data, file_copy.read())
+                self.assertTrue(file_copy.initialize())
+                expected_metadata['extra'] = 'fresher'
+                self.assertDictEqual(expected_metadata, file_copy.metadata)
+                resp_headers = dict(file_copy.conn.response.getheaders())
+                # if k is in expected_headers then we can assert its new value
+                for k, v in expected_headers.items():
+                    v = extra_hdrs.get(k, v)
+                    self.assertIn(k.lower(), resp_headers)
+                    self.assertEqual(v, resp_headers[k.lower()])
+
+                # verify container listing for copy
+                listing = cont.files(parms={'format': 'json'})
+                for obj in listing:
+                    if obj['name'] == dest_filename:
+                        break
+                else:
+                    self.fail('Failed to find %s in listing' % dest_filename)
+
+                self.assertEqual(file_item.size, obj['bytes'])
+                self.assertEqual(file_item.etag, obj['hash'])
+                self.assertEqual(
+                    'application/test-changed', obj['content_type'])
+
+                # repeat copy with X-Fresh-Metadata header - existing user
+                # metadata should not be copied, new completely replaces it.
+                extra_hdrs = {'Content-Type': 'application/test-updated',
+                              'X-Object-Meta-Extra': 'fresher',
+                              'X-Fresh-Metadata': 'true'}
+                self.assertTrue(file_item.copy(
+                    '%s%s' % (prefix, cont), dest_filename, hdrs=extra_hdrs))
+
+                self.assertIn(dest_filename, cont.files())
+
+                file_copy = cont.file(dest_filename)
+
+                self.assertEqual(data, file_copy.read())
+                self.assertTrue(file_copy.initialize())
+                self.assertEqual('application/test-updated',
+                                 file_copy.content_type)
+                expected_metadata = {'extra': 'fresher'}
+                self.assertDictEqual(expected_metadata, file_copy.metadata)
+                resp_headers = dict(file_copy.conn.response.getheaders())
+                for k in ('Content-Disposition', 'Content-Encoding'):
+                    self.assertNotIn(k.lower(), resp_headers)
+
+                # verify container listing for copy
+                listing = cont.files(parms={'format': 'json'})
+                for obj in listing:
+                    if obj['name'] == dest_filename:
+                        break
+                else:
+                    self.fail('Failed to find %s in listing' % dest_filename)
+
+                self.assertEqual(file_item.size, obj['bytes'])
+                self.assertEqual(file_item.etag, obj['hash'])
+                self.assertEqual(
+                    'application/test-updated', obj['content_type'])
+
+    def testCopyRange(self):
+        # makes sure to test encoded characters
+        source_filename = 'dealde%2Fl04 011e%204c8df/flash.png'
+        file_item = self.env.container.file(source_filename)
+
+        metadata = {Utils.create_ascii_name(): Utils.create_name()}
+
+        data = file_item.write_random(1024)
+        file_item.sync_metadata(metadata)
+        file_item.initialize()
+
+        dest_cont = self.env.account.container(Utils.create_name())
+        self.assertTrue(dest_cont.create())
+
+        expected_body = data[100:201]
+        expected_etag = hashlib.md5(expected_body)
+        # copy both from within and across containers
+        for cont in (self.env.container, dest_cont):
+            # copy both with and without initial slash
+            for prefix in ('', '/'):
+                dest_filename = Utils.create_name()
+
+                file_item.copy('%s%s' % (prefix, cont), dest_filename,
+                               hdrs={'Range': 'bytes=100-200'})
+                self.assertEqual(201, file_item.conn.response.status)
+
+                # verify container listing for copy
+                listing = cont.files(parms={'format': 'json'})
+                for obj in listing:
+                    if obj['name'] == dest_filename:
+                        break
+                else:
+                    self.fail('Failed to find %s in listing' % dest_filename)
+
+                self.assertEqual(101, obj['bytes'])
+                self.assertEqual(expected_etag.hexdigest(), obj['hash'])
+                self.assertEqual(file_item.content_type, obj['content_type'])
+
+                # verify copy object
+                copy_file_item = cont.file(dest_filename)
+                self.assertEqual(expected_body, copy_file_item.read())
+                self.assertTrue(copy_file_item.initialize())
+                self.assertEqual(metadata, copy_file_item.metadata)
 
     def testCopyAccount(self):
         # makes sure to test encoded characters
@@ -1214,9 +1446,9 @@ class TestFile(Base):
 
                 file_item = cont.file(dest_filename)
 
-                self.assertTrue(data == file_item.read())
+                self.assertEqual(data, file_item.read())
                 self.assertTrue(file_item.initialize())
-                self.assertTrue(metadata == file_item.metadata)
+                self.assertEqual(metadata, file_item.metadata)
 
         dest_cont = self.env.account2.container(Utils.create_name())
         self.assertTrue(dest_cont.create(hdrs={
@@ -1237,9 +1469,9 @@ class TestFile(Base):
 
             file_item = dest_cont.file(dest_filename)
 
-            self.assertTrue(data == file_item.read())
+            self.assertEqual(data, file_item.read())
             self.assertTrue(file_item.initialize())
-            self.assertTrue(metadata == file_item.metadata)
+            self.assertEqual(metadata, file_item.metadata)
 
     def testCopy404s(self):
         source_filename = Utils.create_name()
@@ -1275,10 +1507,9 @@ class TestFile(Base):
 
             # invalid destination container
             file_item = self.env.container.file(source_filename)
-            self.assertTrue(
-                not file_item.copy(
-                    '%s%s' % (prefix, Utils.create_name()),
-                    Utils.create_name()))
+            self.assertFalse(file_item.copy(
+                '%s%s' % (prefix, Utils.create_name()),
+                Utils.create_name()))
 
     def testCopyAccount404s(self):
         acct = self.env.conn.account_name
@@ -1306,12 +1537,10 @@ class TestFile(Base):
                     acct,
                     '%s%s' % (prefix, self.env.container),
                     Utils.create_name()))
-                if acct == acct2:
-                    # there is no such source container
-                    # and foreign user can have no permission to read it
-                    self.assert_status(403)
-                else:
-                    self.assert_status(404)
+                # there is no such source container but user has
+                # permissions to do a GET (done internally via COPY) for
+                # objects in his own account.
+                self.assert_status(404)
 
                 self.assertFalse(file_item.copy_account(
                     acct,
@@ -1325,12 +1554,10 @@ class TestFile(Base):
                     acct,
                     '%s%s' % (prefix, self.env.container),
                     Utils.create_name()))
-                if acct == acct2:
-                    # there is no such object
-                    # and foreign user can have no permission to read it
-                    self.assert_status(403)
-                else:
-                    self.assert_status(404)
+                # there is no such source container but user has
+                # permissions to do a GET (done internally via COPY) for
+                # objects in his own account.
+                self.assert_status(404)
 
                 self.assertFalse(file_item.copy_account(
                     acct,
@@ -1401,9 +1628,9 @@ class TestFile(Base):
 
                 file_item = cont.file(dest_filename)
 
-                self.assertTrue(data == file_item.read())
+                self.assertEqual(data, file_item.read())
                 self.assertTrue(file_item.initialize())
-                self.assertTrue(metadata == file_item.metadata)
+                self.assertEqual(metadata, file_item.metadata)
 
     def testCopyFromAccountHeader(self):
         acct = self.env.conn.account_name
@@ -1444,9 +1671,9 @@ class TestFile(Base):
 
                 file_item = cont.file(dest_filename)
 
-                self.assertTrue(data == file_item.read())
+                self.assertEqual(data, file_item.read())
                 self.assertTrue(file_item.initialize())
-                self.assertTrue(metadata == file_item.metadata)
+                self.assertEqual(metadata, file_item.metadata)
 
     def testCopyFromHeader404s(self):
         source_filename = Utils.create_name()
@@ -1584,7 +1811,6 @@ class TestFile(Base):
 
             j = size_limit / (i * 2)
 
-            size = 0
             metadata = {}
             while len(metadata.keys()) < i:
                 key = Utils.create_ascii_name()
@@ -1594,7 +1820,6 @@ class TestFile(Base):
                     key = key[:j]
                     val = val[:j]
 
-                size += len(key) + len(val)
                 metadata[key] = val
 
             file_item = self.env.container.file(Utils.create_name())
@@ -1646,8 +1871,8 @@ class TestFile(Base):
         for i in range(0, file_length, range_size):
             range_string = 'bytes=%d-%d' % (i, i + range_size - 1)
             hdrs = {'Range': range_string}
-            self.assertTrue(
-                data[i: i + range_size] == file_item.read(hdrs=hdrs),
+            self.assertEqual(
+                data[i: i + range_size], file_item.read(hdrs=hdrs),
                 range_string)
 
             range_string = 'bytes=-%d' % (i)
@@ -1848,7 +2073,7 @@ class TestFile(Base):
         for r in ('BYTES=0-999', 'bytes = 0-999', 'BYTES = 0 - 999',
                   'bytes = 0 - 999', 'bytes=0 - 999', 'bytes=0-999 '):
 
-            self.assertTrue(file_item.read(hdrs={'Range': r}) == data[0:1000])
+            self.assertEqual(file_item.read(hdrs={'Range': r}), data[0:1000])
 
     def testFileSizeLimit(self):
         limit = load_constraint('max_file_size')
@@ -1862,6 +2087,16 @@ class TestFile(Base):
                 return True
             else:
                 return False
+
+        # This loop will result in fallocate calls for 4x the limit
+        # (minus 111 bytes). With fallocate turned on in the object servers,
+        # this may fail if you don't have 4x the limit available on your
+        # data drives.
+
+        # Note that this test does not actually send any data to the system.
+        # All it does is ensure that a response (success or failure) comes
+        # back within 3 seconds. For the successful tests (size smaller
+        # than limit), the cluster will log a 499.
 
         for i in (limit - 100, limit - 10, limit - 1, limit, limit + 1,
                   limit + 10, limit + 100):
@@ -1922,8 +2157,8 @@ class TestFile(Base):
             self.assert_status(405)
 
         # bad range headers
-        self.assertTrue(
-            len(file_item.read(hdrs={'Range': 'parsecs=8-12'})) ==
+        self.assertEqual(
+            len(file_item.read(hdrs={'Range': 'parsecs=8-12'})),
             file_length)
         self.assert_status(200)
 
@@ -1965,7 +2200,7 @@ class TestFile(Base):
             file_item = self.env.container.file(Utils.create_name())
             data = file_item.write_random()
             self.assert_status(201)
-            self.assertTrue(data == file_item.read())
+            self.assertEqual(data, file_item.read())
             self.assert_status(200)
 
     def testHead(self):
@@ -2141,9 +2376,9 @@ class TestFile(Base):
 
         lm_diff = max([f['last_modified'] for f in files]) -\
             min([f['last_modified'] for f in files])
-        self.assertTrue(
-            lm_diff < write_time + 1, 'Diff in last '
-            'modified times should be less than time to write files')
+        self.assertLess(lm_diff, write_time + 1,
+                        'Diff in last modified times '
+                        'should be less than time to write files')
 
         for f in files:
             for format_type in ['json', 'xml']:
@@ -2158,7 +2393,7 @@ class TestFile(Base):
             data = file_item.write_random(512)
             file_item.write(data)
 
-        self.assertTrue(file_item.read() == data)
+        self.assertEqual(file_item.read(), data)
 
     def testTooLongName(self):
         file_item = self.env.container.file('x' * 1025)
@@ -2170,7 +2405,7 @@ class TestFile(Base):
 
         self.assertTrue(file_item.write(''))
         self.assertIn(file_item.name, self.env.container.files())
-        self.assertTrue(file_item.read() == '')
+        self.assertEqual(file_item.read(), '')
 
     def testEtagResponse(self):
         file_item = self.env.container.file(Utils.create_name())
@@ -2205,7 +2440,7 @@ class TestFile(Base):
                 file_item.chunked_write(j)
 
             self.assertTrue(file_item.chunked_write())
-            self.assertTrue(data == file_item.read())
+            self.assertEqual(data, file_item.read())
 
             info = file_item.info()
             self.assertEqual(etag, info['etag'])
@@ -2512,6 +2747,122 @@ class TestDlo(Base):
             contents,
             "ffffffffffgggggggggghhhhhhhhhhiiiiiiiiiijjjjjjjjjj")
 
+    def test_dlo_post_with_manifest_header(self):
+        # verify that performing a POST to a DLO manifest
+        # preserves the fact that it is a manifest file.
+        # verify that the x-object-manifest header may be updated.
+
+        # create a new manifest for this test to avoid test coupling.
+        x_o_m = self.env.container.file('man1').info()['x_object_manifest']
+        file_item = self.env.container.file(Utils.create_name())
+        file_item.write('manifest-contents', hdrs={"X-Object-Manifest": x_o_m})
+
+        # sanity checks
+        manifest_contents = file_item.read(parms={'multipart-manifest': 'get'})
+        self.assertEqual('manifest-contents', manifest_contents)
+        expected_contents = ''.join([(c * 10) for c in 'abcde'])
+        contents = file_item.read(parms={})
+        self.assertEqual(expected_contents, contents)
+
+        # POST a modified x-object-manifest value
+        new_x_o_m = x_o_m.rstrip('lower') + 'upper'
+        file_item.post({'x-object-meta-foo': 'bar',
+                        'x-object-manifest': new_x_o_m})
+
+        # verify that x-object-manifest was updated
+        file_item.info()
+        resp_headers = file_item.conn.response.getheaders()
+        self.assertIn(('x-object-manifest', new_x_o_m), resp_headers)
+        self.assertIn(('x-object-meta-foo', 'bar'), resp_headers)
+
+        # verify that manifest content was not changed
+        manifest_contents = file_item.read(parms={'multipart-manifest': 'get'})
+        self.assertEqual('manifest-contents', manifest_contents)
+
+        # verify that updated manifest points to new content
+        expected_contents = ''.join([(c * 10) for c in 'ABCDE'])
+        contents = file_item.read(parms={})
+        self.assertEqual(expected_contents, contents)
+
+        # Now revert the manifest to point to original segments, including a
+        # multipart-manifest=get param just to check that has no effect
+        file_item.post({'x-object-manifest': x_o_m},
+                       parms={'multipart-manifest': 'get'})
+
+        # verify that x-object-manifest was reverted
+        info = file_item.info()
+        self.assertIn('x_object_manifest', info)
+        self.assertEqual(x_o_m, info['x_object_manifest'])
+
+        # verify that manifest content was not changed
+        manifest_contents = file_item.read(parms={'multipart-manifest': 'get'})
+        self.assertEqual('manifest-contents', manifest_contents)
+
+        # verify that updated manifest points new content
+        expected_contents = ''.join([(c * 10) for c in 'abcde'])
+        contents = file_item.read(parms={})
+        self.assertEqual(expected_contents, contents)
+
+    def test_dlo_post_without_manifest_header(self):
+        # verify that a POST to a DLO manifest object with no
+        # x-object-manifest header will cause the existing x-object-manifest
+        # header to be lost
+
+        # create a new manifest for this test to avoid test coupling.
+        x_o_m = self.env.container.file('man1').info()['x_object_manifest']
+        file_item = self.env.container.file(Utils.create_name())
+        file_item.write('manifest-contents', hdrs={"X-Object-Manifest": x_o_m})
+
+        # sanity checks
+        manifest_contents = file_item.read(parms={'multipart-manifest': 'get'})
+        self.assertEqual('manifest-contents', manifest_contents)
+        expected_contents = ''.join([(c * 10) for c in 'abcde'])
+        contents = file_item.read(parms={})
+        self.assertEqual(expected_contents, contents)
+
+        # POST with no x-object-manifest header
+        file_item.post({})
+
+        # verify that existing x-object-manifest was removed
+        info = file_item.info()
+        self.assertNotIn('x_object_manifest', info)
+
+        # verify that object content was not changed
+        manifest_contents = file_item.read(parms={'multipart-manifest': 'get'})
+        self.assertEqual('manifest-contents', manifest_contents)
+
+        # verify that object is no longer a manifest
+        contents = file_item.read(parms={})
+        self.assertEqual('manifest-contents', contents)
+
+    def test_dlo_post_with_manifest_regular_object(self):
+        # verify that performing a POST to a regular object
+        # with a manifest header will create a DLO.
+
+        # Put a regular object
+        file_item = self.env.container.file(Utils.create_name())
+        file_item.write('file contents', hdrs={})
+
+        # sanity checks
+        file_contents = file_item.read(parms={})
+        self.assertEqual('file contents', file_contents)
+
+        # get the path associated with man1
+        x_o_m = self.env.container.file('man1').info()['x_object_manifest']
+
+        # POST a x-object-manifest value to the regular object
+        file_item.post({'x-object-manifest': x_o_m})
+
+        # verify that the file is now a manifest
+        manifest_contents = file_item.read(parms={'multipart-manifest': 'get'})
+        self.assertEqual('file contents', manifest_contents)
+        expected_contents = ''.join([(c * 10) for c in 'abcde'])
+        contents = file_item.read(parms={})
+        self.assertEqual(expected_contents, contents)
+        file_item.info()
+        resp_headers = file_item.conn.response.getheaders()
+        self.assertIn(('x-object-manifest', x_o_m), resp_headers)
+
 
 class TestDloUTF8(Base2, TestDlo):
     set_up = False
@@ -2678,6 +3029,23 @@ class TestSloEnv(object):
     slo_enabled = None  # tri-state: None initially, then True/False
 
     @classmethod
+    def create_segments(cls, container):
+        seg_info = {}
+        for letter, size in (('a', 1024 * 1024),
+                             ('b', 1024 * 1024),
+                             ('c', 1024 * 1024),
+                             ('d', 1024 * 1024),
+                             ('e', 1)):
+            seg_name = "seg_%s" % letter
+            file_item = container.file(seg_name)
+            file_item.write(letter * size)
+            seg_info[seg_name] = {
+                'size_bytes': size,
+                'etag': file_item.md5,
+                'path': '/%s/%s' % (container.name, seg_name)}
+        return seg_info
+
+    @classmethod
     def setUp(cls):
         cls.conn = Connection(tf.config)
         cls.conn.authenticate()
@@ -2711,19 +3079,7 @@ class TestSloEnv(object):
             if not cont.create():
                 raise ResponseError(cls.conn.response)
 
-        cls.seg_info = seg_info = {}
-        for letter, size in (('a', 1024 * 1024),
-                             ('b', 1024 * 1024),
-                             ('c', 1024 * 1024),
-                             ('d', 1024 * 1024),
-                             ('e', 1)):
-            seg_name = "seg_%s" % letter
-            file_item = cls.container.file(seg_name)
-            file_item.write(letter * size)
-            seg_info[seg_name] = {
-                'size_bytes': size,
-                'etag': file_item.md5,
-                'path': '/%s/%s' % (cls.container.name, seg_name)}
+        cls.seg_info = seg_info = cls.create_segments(cls.container)
 
         file_item = cls.container.file("manifest-abcde")
         file_item.write(
@@ -2872,18 +3228,26 @@ class TestSlo(Base):
     def test_slo_container_listing(self):
         # the listing object size should equal the sum of the size of the
         # segments, not the size of the manifest body
-        raise SkipTest('Only passes with object_post_as_copy=False')
-        file_item = self.env.container.file(Utils.create_name)
+        file_item = self.env.container.file(Utils.create_name())
         file_item.write(
             json.dumps([self.env.seg_info['seg_a']]),
             parms={'multipart-manifest': 'put'})
+        # The container listing has the etag of the actual manifest object
+        # contents which we get using multipart-manifest=get. Arguably this
+        # should be the etag that we get when NOT using multipart-manifest=get,
+        # to be consistent with size and content-type. But here we at least
+        # verify that it remains consistent when the object is updated with a
+        # POST.
+        file_item.initialize(parms={'multipart-manifest': 'get'})
+        expected_etag = file_item.etag
 
-        files = self.env.container.files(parms={'format': 'json'})
-        for f_dict in files:
+        listing = self.env.container.files(parms={'format': 'json'})
+        for f_dict in listing:
             if f_dict['name'] == file_item.name:
                 self.assertEqual(1024 * 1024, f_dict['bytes'])
                 self.assertEqual('application/octet-stream',
                                  f_dict['content_type'])
+                self.assertEqual(expected_etag, f_dict['hash'])
                 break
         else:
             self.fail('Failed to find manifest file in container listing')
@@ -2895,12 +3259,31 @@ class TestSlo(Base):
         self.assertEqual('image/jpeg', file_item.content_type)  # sanity
 
         # verify that the container listing is consistent with the file
-        files = self.env.container.files(parms={'format': 'json'})
-        for f_dict in files:
+        listing = self.env.container.files(parms={'format': 'json'})
+        for f_dict in listing:
             if f_dict['name'] == file_item.name:
                 self.assertEqual(1024 * 1024, f_dict['bytes'])
                 self.assertEqual(file_item.content_type,
                                  f_dict['content_type'])
+                self.assertEqual(expected_etag, f_dict['hash'])
+                break
+        else:
+            self.fail('Failed to find manifest file in container listing')
+
+        # now POST with no change to content-type
+        file_item.sync_metadata({'X-Object-Meta-Test': 'blah'},
+                                cfg={'no_content_type': True})
+        file_item.initialize()
+        self.assertEqual('image/jpeg', file_item.content_type)  # sanity
+
+        # verify that the container listing is consistent with the file
+        listing = self.env.container.files(parms={'format': 'json'})
+        for f_dict in listing:
+            if f_dict['name'] == file_item.name:
+                self.assertEqual(1024 * 1024, f_dict['bytes'])
+                self.assertEqual(file_item.content_type,
+                                 f_dict['content_type'])
+                self.assertEqual(expected_etag, f_dict['hash'])
                 break
         else:
             self.fail('Failed to find manifest file in container listing')
@@ -2965,6 +3348,34 @@ class TestSlo(Base):
         self.assertEqual('b', file_contents[1])
         self.assertEqual('b', file_contents[-2])
         self.assertEqual('c', file_contents[-1])
+
+    def test_slo_multi_ranged_get(self):
+        file_item = self.env.container.file('manifest-abcde')
+        file_contents = file_item.read(
+            hdrs={"Range": "bytes=1048571-1048580,2097147-2097156"})
+
+        # See testMultiRangeGets for explanation
+        parser = email.parser.FeedParser()
+        parser.feed("Content-Type: %s\r\n\r\n" % file_item.content_type)
+        parser.feed(file_contents)
+
+        root_message = parser.close()
+        self.assertTrue(root_message.is_multipart())  # sanity check
+
+        byteranges = root_message.get_payload()
+        self.assertEqual(len(byteranges), 2)
+
+        self.assertEqual(byteranges[0]['Content-Type'],
+                         "application/octet-stream")
+        self.assertEqual(
+            byteranges[0]['Content-Range'], "bytes 1048571-1048580/4194305")
+        self.assertEqual(byteranges[0].get_payload(), "aaaaabbbbb")
+
+        self.assertEqual(byteranges[1]['Content-Type'],
+                         "application/octet-stream")
+        self.assertEqual(
+            byteranges[1]['Content-Range'], "bytes 2097147-2097156/4194305")
+        self.assertEqual(byteranges[1].get_payload(), "bbbbbccccc")
 
     def test_slo_ranged_submanifest(self):
         file_item = self.env.container.file('manifest-abcde-submanifest')
@@ -3124,16 +3535,109 @@ class TestSlo(Base):
         self.assertEqual(4 * 1024 * 1024 + 1, len(copied_contents))
 
     def test_slo_copy_the_manifest(self):
-        file_item = self.env.container.file("manifest-abcde")
-        file_item.copy(self.env.container.name, "copied-abcde-manifest-only",
-                       parms={'multipart-manifest': 'get'})
+        source = self.env.container.file("manifest-abcde")
+        source_contents = source.read(parms={'multipart-manifest': 'get'})
+        source_json = json.loads(source_contents)
+        source.initialize()
+        self.assertEqual('application/octet-stream', source.content_type)
+        source.initialize(parms={'multipart-manifest': 'get'})
+        source_hash = hashlib.md5()
+        source_hash.update(source_contents)
+        self.assertEqual(source_hash.hexdigest(), source.etag)
+
+        self.assertTrue(source.copy(self.env.container.name,
+                                    "copied-abcde-manifest-only",
+                                    parms={'multipart-manifest': 'get'}))
 
         copied = self.env.container.file("copied-abcde-manifest-only")
         copied_contents = copied.read(parms={'multipart-manifest': 'get'})
         try:
-            json.loads(copied_contents)
+            copied_json = json.loads(copied_contents)
         except ValueError:
             self.fail("COPY didn't copy the manifest (invalid json on GET)")
+        self.assertEqual(source_json, copied_json)
+        copied.initialize()
+        self.assertEqual('application/octet-stream', copied.content_type)
+        copied.initialize(parms={'multipart-manifest': 'get'})
+        copied_hash = hashlib.md5()
+        copied_hash.update(copied_contents)
+        self.assertEqual(copied_hash.hexdigest(), copied.etag)
+
+        # verify the listing metadata
+        listing = self.env.container.files(parms={'format': 'json'})
+        names = {}
+        for f_dict in listing:
+            if f_dict['name'] in ('manifest-abcde',
+                                  'copied-abcde-manifest-only'):
+                names[f_dict['name']] = f_dict
+
+        self.assertIn('manifest-abcde', names)
+        actual = names['manifest-abcde']
+        self.assertEqual(4 * 1024 * 1024 + 1, actual['bytes'])
+        self.assertEqual('application/octet-stream', actual['content_type'])
+        self.assertEqual(source.etag, actual['hash'])
+
+        self.assertIn('copied-abcde-manifest-only', names)
+        actual = names['copied-abcde-manifest-only']
+        self.assertEqual(4 * 1024 * 1024 + 1, actual['bytes'])
+        self.assertEqual('application/octet-stream', actual['content_type'])
+        self.assertEqual(copied.etag, actual['hash'])
+
+    def test_slo_copy_the_manifest_updating_metadata(self):
+        source = self.env.container.file("manifest-abcde")
+        source.content_type = 'application/octet-stream'
+        source.sync_metadata({'test': 'original'})
+        source_contents = source.read(parms={'multipart-manifest': 'get'})
+        source_json = json.loads(source_contents)
+        source.initialize()
+        self.assertEqual('application/octet-stream', source.content_type)
+        source.initialize(parms={'multipart-manifest': 'get'})
+        source_hash = hashlib.md5()
+        source_hash.update(source_contents)
+        self.assertEqual(source_hash.hexdigest(), source.etag)
+        self.assertEqual(source.metadata['test'], 'original')
+
+        self.assertTrue(
+            source.copy(self.env.container.name, "copied-abcde-manifest-only",
+                        parms={'multipart-manifest': 'get'},
+                        hdrs={'Content-Type': 'image/jpeg',
+                              'X-Object-Meta-Test': 'updated'}))
+
+        copied = self.env.container.file("copied-abcde-manifest-only")
+        copied_contents = copied.read(parms={'multipart-manifest': 'get'})
+        try:
+            copied_json = json.loads(copied_contents)
+        except ValueError:
+            self.fail("COPY didn't copy the manifest (invalid json on GET)")
+        self.assertEqual(source_json, copied_json)
+        copied.initialize()
+        self.assertEqual('image/jpeg', copied.content_type)
+        copied.initialize(parms={'multipart-manifest': 'get'})
+        copied_hash = hashlib.md5()
+        copied_hash.update(copied_contents)
+        self.assertEqual(copied_hash.hexdigest(), copied.etag)
+        self.assertEqual(copied.metadata['test'], 'updated')
+
+        # verify the listing metadata
+        listing = self.env.container.files(parms={'format': 'json'})
+        names = {}
+        for f_dict in listing:
+            if f_dict['name'] in ('manifest-abcde',
+                                  'copied-abcde-manifest-only'):
+                names[f_dict['name']] = f_dict
+
+        self.assertIn('manifest-abcde', names)
+        actual = names['manifest-abcde']
+        self.assertEqual(4 * 1024 * 1024 + 1, actual['bytes'])
+        self.assertEqual('application/octet-stream', actual['content_type'])
+        # the container listing should have the etag of the manifest contents
+        self.assertEqual(source.etag, actual['hash'])
+
+        self.assertIn('copied-abcde-manifest-only', names)
+        actual = names['copied-abcde-manifest-only']
+        self.assertEqual(4 * 1024 * 1024 + 1, actual['bytes'])
+        self.assertEqual('image/jpeg', actual['content_type'])
+        self.assertEqual(copied.etag, actual['hash'])
 
     def test_slo_copy_the_manifest_account(self):
         acct = self.env.conn.account_name
@@ -3157,10 +3661,40 @@ class TestSlo(Base):
         self.assertTrue(dest_cont.create(hdrs={
             'X-Container-Write': self.env.conn.user_acl
         }))
-        file_item.copy_account(acct,
-                               dest_cont,
-                               "copied-abcde-manifest-only",
-                               parms={'multipart-manifest': 'get'})
+
+        # manifest copy will fail because there is no read access to segments
+        # in destination account
+        file_item.copy_account(
+            acct, dest_cont, "copied-abcde-manifest-only",
+            parms={'multipart-manifest': 'get'})
+        self.assertEqual(400, file_item.conn.response.status)
+        resp_body = file_item.conn.response.read()
+        self.assertEqual(5, resp_body.count('403 Forbidden'),
+                         'Unexpected response body %r' % resp_body)
+
+        # create segments container in account2 with read access for account1
+        segs_container = self.env.account2.container(self.env.container.name)
+        self.assertTrue(segs_container.create(hdrs={
+            'X-Container-Read': self.env.conn.user_acl
+        }))
+
+        # manifest copy will still fail because there are no segments in
+        # destination account
+        file_item.copy_account(
+            acct, dest_cont, "copied-abcde-manifest-only",
+            parms={'multipart-manifest': 'get'})
+        self.assertEqual(400, file_item.conn.response.status)
+        resp_body = file_item.conn.response.read()
+        self.assertEqual(5, resp_body.count('404 Not Found'),
+                         'Unexpected response body %r' % resp_body)
+
+        # create segments in account2 container with same name as in account1,
+        # manifest copy now succeeds
+        self.env.create_segments(segs_container)
+
+        self.assertTrue(file_item.copy_account(
+            acct, dest_cont, "copied-abcde-manifest-only",
+            parms={'multipart-manifest': 'get'}))
 
         copied = dest_cont.file("copied-abcde-manifest-only")
         copied_contents = copied.read(parms={'multipart-manifest': 'get'})
@@ -3261,8 +3795,8 @@ class TestSlo(Base):
         got_body = manifest.read(parms={'multipart-manifest': 'get',
                                         'format': 'raw'})
 
-        self.assertEqual('application/json; charset=utf-8',
-                         manifest.content_type)
+        # raw format should have the actual manifest object content-type
+        self.assertEqual('application/octet-stream', manifest.content_type)
         try:
             value = json.loads(got_body)
         except ValueError:
@@ -3395,6 +3929,7 @@ class TestSloUTF8(Base2, TestSlo):
 
 class TestObjectVersioningEnv(object):
     versioning_enabled = None  # tri-state: None initially, then True/False
+    location_header_key = 'X-Versions-Location'
 
     @classmethod
     def setUp(cls):
@@ -3421,15 +3956,16 @@ class TestObjectVersioningEnv(object):
             raise ResponseError(cls.conn.response)
 
         cls.container = cls.account.container(prefix + "-objs")
-        if not cls.container.create(
-                hdrs={'X-Versions-Location': cls.versions_container.name}):
+        container_headers = {
+            cls.location_header_key: cls.versions_container.name}
+        if not cls.container.create(hdrs=container_headers):
             if cls.conn.response.status == 412:
                 cls.versioning_enabled = False
                 return
             raise ResponseError(cls.conn.response)
 
         container_info = cls.container.info()
-        # if versioning is off, then X-Versions-Location won't persist
+        # if versioning is off, then cls.location_header_key won't persist
         cls.versioning_enabled = 'versions' in container_info
 
         # setup another account to test ACLs
@@ -3462,6 +3998,7 @@ class TestCrossPolicyObjectVersioningEnv(object):
     versioning_enabled = None
     multiple_policies_enabled = None
     policies = None
+    location_header_key = 'X-Versions-Location'
 
     @classmethod
     def setUp(cls):
@@ -3509,7 +4046,7 @@ class TestCrossPolicyObjectVersioningEnv(object):
 
         cls.container = cls.account.container(prefix + "-objs")
         if not cls.container.create(
-                hdrs={'X-Versions-Location': cls.versions_container.name,
+                hdrs={cls.location_header_key: cls.versions_container.name,
                       'X-Storage-Policy': version_policy['name']}):
             if cls.conn.response.status == 412:
                 cls.versioning_enabled = False
@@ -3545,6 +4082,10 @@ class TestCrossPolicyObjectVersioningEnv(object):
         cls.account2.delete_containers()
 
 
+class TestObjectVersioningHistoryModeEnv(TestObjectVersioningEnv):
+    location_header_key = 'X-History-Location'
+
+
 class TestObjectVersioning(Base):
     env = TestObjectVersioningEnv
     set_up = False
@@ -3577,12 +4118,13 @@ class TestObjectVersioning(Base):
         self.assertEqual(self.env.container.info()['versions'],
                          self.env.versions_container.name)
         self.env.container.update_metadata(
-            hdrs={'X-Versions-Location': ''})
-        self.assertEqual(self.env.container.info().get('versions'), None)
+            hdrs={self.env.location_header_key: ''})
+        self.assertIsNone(self.env.container.info().get('versions'))
 
         # set location back to the way it was
         self.env.container.update_metadata(
-            hdrs={'X-Versions-Location': self.env.versions_container.name})
+            hdrs={self.env.location_header_key:
+                  self.env.versions_container.name})
         self.assertEqual(self.env.container.info()['versions'],
                          self.env.versions_container.name)
 
@@ -3633,7 +4175,7 @@ class TestObjectVersioning(Base):
             self.assertEqual(v, resp_headers[k.lower()])
 
         # make sure the new obj metadata did not leak to the prev. version
-        self.assertTrue('foo' not in prev_version.metadata)
+        self.assertNotIn('foo', prev_version.metadata)
 
         # check that POST does not create a new version
         versioned_obj.sync_metadata(metadata={'fu': 'baz'})
@@ -3647,8 +4189,8 @@ class TestObjectVersioning(Base):
         prev_version.initialize()
         self.assertEqual("bbbbb", prev_version.read())
         self.assertEqual(prev_version.content_type, 'text/jibberish02')
-        self.assertTrue('foo' in prev_version.metadata)
-        self.assertTrue('fu' in prev_version.metadata)
+        self.assertNotIn('foo', prev_version.metadata)
+        self.assertIn('fu', prev_version.metadata)
 
         # as we delete things, the old contents return
         self.assertEqual("ccccc", versioned_obj.read())
@@ -3741,15 +4283,16 @@ class TestObjectVersioning(Base):
 
         # check account2 cannot set X-Versions-Location on container
         self.assertRaises(ResponseError, container.update_metadata, hdrs={
-            'X-Versions-Location': versions_container},
+            self.env.location_header_key: versions_container},
             cfg={'use_token': self.env.storage_token2})
 
         # good! now let admin set the X-Versions-Location
         # p.s.: sticking a 'x-remove' header here to test precedence
         # of both headers. Setting the location should succeed.
         self.assertTrue(container.update_metadata(hdrs={
-            'X-Remove-Versions-Location': versions_container,
-            'X-Versions-Location': versions_container}))
+            'X-Remove-' + self.env.location_header_key[len('X-'):]:
+            versions_container,
+            self.env.location_header_key: versions_container}))
 
         # write object twice to container and check version
         obj_name = Utils.create_name()
@@ -3777,11 +4320,16 @@ class TestObjectVersioning(Base):
                           cfg={'use_token': self.env.storage_token3})
 
         # user3 cannot write or delete from source container either
+        number_of_versions = versions_container.info()['object_count']
         self.assertRaises(ResponseError, versioned_obj.write,
                           "some random user trying to write data",
                           cfg={'use_token': self.env.storage_token3})
+        self.assertEqual(number_of_versions,
+                         versions_container.info()['object_count'])
         self.assertRaises(ResponseError, versioned_obj.delete,
                           cfg={'use_token': self.env.storage_token3})
+        self.assertEqual(number_of_versions,
+                         versions_container.info()['object_count'])
 
         # user2 can't read or delete from versions-location
         self.assertRaises(ResponseError, backup_file.read,
@@ -3818,7 +4366,9 @@ class TestObjectVersioning(Base):
         org_token = self.env.account.conn.storage_token
         self.env.account.conn.storage_token = self.env.conn2.storage_token
         try:
-            self.assertRaises(ResponseError, versioned_obj.delete)
+            with self.assertRaises(ResponseError) as cm:
+                versioned_obj.delete()
+            self.assertEqual(403, cm.exception.status)
         finally:
             self.env.account.conn.storage_token = org_token
 
@@ -3850,6 +4400,192 @@ class TestCrossPolicyObjectVersioning(TestObjectVersioning):
             raise Exception("Expected multiple_policies_enabled "
                             "to be True/False, got %r" % (
                                 self.env.versioning_enabled,))
+
+
+class TestObjectVersioningHistoryMode(TestObjectVersioning):
+    env = TestObjectVersioningHistoryModeEnv
+    set_up = False
+
+    # those override tests includes assertions for delete versioned objects
+    # behaviors different from default object versioning using
+    # x-versions-location.
+
+    # The difference from the parent is since below delete
+    def test_overwriting(self):
+        container = self.env.container
+        versions_container = self.env.versions_container
+        cont_info = container.info()
+        self.assertEqual(cont_info['versions'], versions_container.name)
+        expected_content_types = []
+        obj_name = Utils.create_name()
+
+        versioned_obj = container.file(obj_name)
+        put_headers = {'Content-Type': 'text/jibberish01',
+                       'Content-Encoding': 'gzip',
+                       'Content-Disposition': 'attachment; filename=myfile'}
+        versioned_obj.write("aaaaa", hdrs=put_headers)
+        obj_info = versioned_obj.info()
+        self.assertEqual('text/jibberish01', obj_info['content_type'])
+        expected_content_types.append('text/jibberish01')
+
+        # the allowed headers are configurable in object server, so we cannot
+        # assert that content-encoding or content-disposition get *copied* to
+        # the object version unless they were set on the original PUT, so
+        # populate expected_headers by making a HEAD on the original object
+        resp_headers = dict(versioned_obj.conn.response.getheaders())
+        expected_headers = {}
+        for k, v in put_headers.items():
+            if k.lower() in resp_headers:
+                expected_headers[k] = v
+
+        self.assertEqual(0, versions_container.info()['object_count'])
+        versioned_obj.write("bbbbb", hdrs={'Content-Type': 'text/jibberish02',
+                            'X-Object-Meta-Foo': 'Bar'})
+        versioned_obj.initialize()
+        self.assertEqual(versioned_obj.content_type, 'text/jibberish02')
+        expected_content_types.append('text/jibberish02')
+        self.assertEqual(versioned_obj.metadata['foo'], 'Bar')
+
+        # the old version got saved off
+        self.assertEqual(1, versions_container.info()['object_count'])
+        versioned_obj_name = versions_container.files()[0]
+        prev_version = versions_container.file(versioned_obj_name)
+        prev_version.initialize()
+        self.assertEqual("aaaaa", prev_version.read())
+        self.assertEqual(prev_version.content_type, 'text/jibberish01')
+
+        resp_headers = dict(prev_version.conn.response.getheaders())
+        for k, v in expected_headers.items():
+            self.assertIn(k.lower(), resp_headers)
+            self.assertEqual(v, resp_headers[k.lower()])
+
+        # make sure the new obj metadata did not leak to the prev. version
+        self.assertNotIn('foo', prev_version.metadata)
+
+        # check that POST does not create a new version
+        versioned_obj.sync_metadata(metadata={'fu': 'baz'})
+        self.assertEqual(1, versions_container.info()['object_count'])
+        expected_content_types.append('text/jibberish02')
+
+        # if we overwrite it again, there are two versions
+        versioned_obj.write("ccccc")
+        self.assertEqual(2, versions_container.info()['object_count'])
+        versioned_obj_name = versions_container.files()[1]
+        prev_version = versions_container.file(versioned_obj_name)
+        prev_version.initialize()
+        self.assertEqual("bbbbb", prev_version.read())
+        self.assertEqual(prev_version.content_type, 'text/jibberish02')
+        self.assertNotIn('foo', prev_version.metadata)
+        self.assertIn('fu', prev_version.metadata)
+
+        # versioned_obj keeps the newest content
+        self.assertEqual("ccccc", versioned_obj.read())
+
+        # test copy from a different container
+        src_container = self.env.account.container(Utils.create_name())
+        self.assertTrue(src_container.create())
+        src_name = Utils.create_name()
+        src_obj = src_container.file(src_name)
+        src_obj.write("ddddd", hdrs={'Content-Type': 'text/jibberish04'})
+        src_obj.copy(container.name, obj_name)
+
+        self.assertEqual("ddddd", versioned_obj.read())
+        versioned_obj.initialize()
+        self.assertEqual(versioned_obj.content_type, 'text/jibberish04')
+        expected_content_types.append('text/jibberish04')
+
+        # make sure versions container has the previous version
+        self.assertEqual(3, versions_container.info()['object_count'])
+        versioned_obj_name = versions_container.files()[2]
+        prev_version = versions_container.file(versioned_obj_name)
+        prev_version.initialize()
+        self.assertEqual("ccccc", prev_version.read())
+
+        # test delete
+        # at first, delete will succeed with 204
+        versioned_obj.delete()
+        expected_content_types.append(
+            'application/x-deleted;swift_versions_deleted=1')
+        # after that, any time the delete doesn't restore the old version
+        # and we will get 404 NotFound
+        for x in range(3):
+            with self.assertRaises(ResponseError) as cm:
+                versioned_obj.delete()
+            self.assertEqual(404, cm.exception.status)
+            expected_content_types.append(
+                'application/x-deleted;swift_versions_deleted=1')
+        # finally, we have 4 versioned items and 4 delete markers total in
+        # the versions container
+        self.assertEqual(8, versions_container.info()['object_count'])
+        self.assertEqual(expected_content_types, [
+            o['content_type'] for o in versions_container.files(
+                parms={'format': 'json'})])
+
+        # update versioned_obj
+        versioned_obj.write("eeee", hdrs={'Content-Type': 'text/thanksgiving',
+                            'X-Object-Meta-Bar': 'foo'})
+        # verify the PUT object is kept successfully
+        obj_info = versioned_obj.info()
+        self.assertEqual('text/thanksgiving', obj_info['content_type'])
+
+        # we still have delete-marker there
+        self.assertEqual(8, versions_container.info()['object_count'])
+
+        # update versioned_obj
+        versioned_obj.write("ffff", hdrs={'Content-Type': 'text/teriyaki',
+                            'X-Object-Meta-Food': 'chickin'})
+        # verify the PUT object is kept successfully
+        obj_info = versioned_obj.info()
+        self.assertEqual('text/teriyaki', obj_info['content_type'])
+
+        # new obj will be inserted after delete-marker there
+        self.assertEqual(9, versions_container.info()['object_count'])
+
+        versioned_obj.delete()
+        with self.assertRaises(ResponseError) as cm:
+            versioned_obj.read()
+        self.assertEqual(404, cm.exception.status)
+        self.assertEqual(11, versions_container.info()['object_count'])
+
+    # the difference from the parent is since below delete
+    def test_versioning_check_acl(self):
+        container = self.env.container
+        versions_container = self.env.versions_container
+        versions_container.create(hdrs={'X-Container-Read': '.r:*,.rlistings'})
+
+        obj_name = Utils.create_name()
+        versioned_obj = container.file(obj_name)
+        versioned_obj.write("aaaaa")
+        self.assertEqual("aaaaa", versioned_obj.read())
+
+        versioned_obj.write("bbbbb")
+        self.assertEqual("bbbbb", versioned_obj.read())
+
+        # Use token from second account and try to delete the object
+        org_token = self.env.account.conn.storage_token
+        self.env.account.conn.storage_token = self.env.conn2.storage_token
+        try:
+            with self.assertRaises(ResponseError) as cm:
+                versioned_obj.delete()
+            self.assertEqual(403, cm.exception.status)
+        finally:
+            self.env.account.conn.storage_token = org_token
+
+        # Verify with token from first account
+        self.assertEqual("bbbbb", versioned_obj.read())
+
+        versioned_obj.delete()
+        with self.assertRaises(ResponseError) as cm:
+            versioned_obj.read()
+        self.assertEqual(404, cm.exception.status)
+
+        # we have 3 objects in the versions_container, 'aaaaa', 'bbbbb'
+        # and delete-marker with empty content
+        self.assertEqual(3, versions_container.info()['object_count'])
+        files = versions_container.files()
+        for actual, expected in zip(files, ['aaaaa', 'bbbbb', '']):
+            prev_version = versions_container.file(actual)
+            self.assertEqual(expected, prev_version.read())
 
 
 class TestSloWithVersioning(Base):

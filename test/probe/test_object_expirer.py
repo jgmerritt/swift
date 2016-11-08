@@ -13,17 +13,18 @@
 # limitations under the License.
 
 import random
+import time
 import uuid
 import unittest
 
 from nose import SkipTest
 
-from swift.common.internal_client import InternalClient
+from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.utils import Timestamp
 
 from test.probe.common import ReplProbeTest, ENABLED_POLICIES
-from test.probe.test_container_merge_policy_index import BrainSplitter
+from test.probe.brain import BrainSplitter
 
 from swiftclient import client
 
@@ -31,9 +32,6 @@ from swiftclient import client
 class TestObjectExpirer(ReplProbeTest):
 
     def setUp(self):
-        if len(ENABLED_POLICIES) < 2:
-            raise SkipTest('Need more than one policy')
-
         self.expirer = Manager(['object-expirer'])
         self.expirer.start()
         err = self.expirer.stop()
@@ -52,7 +50,19 @@ class TestObjectExpirer(ReplProbeTest):
         self.brain = BrainSplitter(self.url, self.token, self.container_name,
                                    self.object_name)
 
+    def _check_obj_in_container_listing(self):
+        for obj in self.client.iter_objects(self.account,
+                                            self.container_name):
+
+            if self.object_name == obj['name']:
+                return True
+
+        return False
+
     def test_expirer_object_split_brain(self):
+        if len(ENABLED_POLICIES) < 2:
+            raise SkipTest('Need more than one policy')
+
         old_policy = random.choice(ENABLED_POLICIES)
         wrong_policy = random.choice([p for p in ENABLED_POLICIES
                                       if p != old_policy])
@@ -87,17 +97,13 @@ class TestObjectExpirer(ReplProbeTest):
             self.account, self.container_name, self.object_name,
             acceptable_statuses=(4,),
             headers={'X-Backend-Storage-Policy-Index': int(old_policy)})
-        self.assertTrue('x-backend-timestamp' in metadata)
+        self.assertIn('x-backend-timestamp', metadata)
         self.assertEqual(Timestamp(metadata['x-backend-timestamp']),
                          create_timestamp)
 
         # but it is still in the listing
-        for obj in self.client.iter_objects(self.account,
-                                            self.container_name):
-            if self.object_name == obj['name']:
-                break
-        else:
-            self.fail('Did not find listing for %s' % self.object_name)
+        self.assertTrue(self._check_obj_in_container_listing(),
+                        msg='Did not find listing for %s' % self.object_name)
 
         # clear proxy cache
         client.post_container(self.url, self.token, self.container_name, {})
@@ -105,10 +111,8 @@ class TestObjectExpirer(ReplProbeTest):
         self.expirer.once()
 
         # object is not in the listing
-        for obj in self.client.iter_objects(self.account,
-                                            self.container_name):
-            if self.object_name == obj['name']:
-                self.fail('Found listing for %s' % self.object_name)
+        self.assertFalse(self._check_obj_in_container_listing(),
+                         msg='Found listing for %s' % self.object_name)
 
         # and validate object is tombstoned
         found_in_policy = None
@@ -122,9 +126,176 @@ class TestObjectExpirer(ReplProbeTest):
                     self.fail('found object in %s and also %s' %
                               (found_in_policy, policy))
                 found_in_policy = policy
-                self.assertTrue('x-backend-timestamp' in metadata)
-                self.assertTrue(Timestamp(metadata['x-backend-timestamp']) >
-                                create_timestamp)
+                self.assertIn('x-backend-timestamp', metadata)
+                self.assertGreater(Timestamp(metadata['x-backend-timestamp']),
+                                   create_timestamp)
+
+    def test_expirer_object_should_not_be_expired(self):
+
+        # Current object-expirer checks the correctness via x-if-delete-at
+        # header that it can be deleted by expirer. If there are objects
+        # either which doesn't have x-delete-at header as metadata or which
+        # has different x-delete-at value from x-if-delete-at value,
+        # object-expirer's delete will fail as 412 PreconditionFailed.
+        # However, if some of the objects are in handoff nodes, the expirer
+        # can put the tombstone with the timestamp as same as x-delete-at and
+        # the object consistency will be resolved as the newer timestamp will
+        # be winner (in particular, overwritten case w/o x-delete-at). This
+        # test asserts such a situation that, at least, the overwriten object
+        # which have larger timestamp than the original expirered date should
+        # be safe.
+
+        def put_object(headers):
+            # use internal client to PUT objects so that X-Timestamp in headers
+            # is effective
+            headers['Content-Length'] = '0'
+            path = self.client.make_path(
+                self.account, self.container_name, self.object_name)
+            try:
+                self.client.make_request('PUT', path, headers, (2,))
+            except UnexpectedResponse as e:
+                self.fail(
+                    'Expected 201 for PUT object but got %s' % e.resp.status)
+
+        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
+                                  self.object_name, 'object', self.policy)
+
+        # T(obj_created) < T(obj_deleted with x-delete-at) < T(obj_recreated)
+        #   < T(expirer_executed)
+        # Recreated obj should be appeared in any split brain case
+
+        obj_brain.put_container()
+
+        # T(obj_deleted with x-delete-at)
+        # object-server accepts req only if X-Delete-At is later than 'now'
+        # so here, T(obj_created) < T(obj_deleted with x-delete-at)
+        now = time.time()
+        delete_at = int(now + 2.0)
+        recreate_at = delete_at + 1.0
+        put_object(headers={'X-Delete-At': delete_at,
+                            'X-Timestamp': Timestamp(now).normal})
+
+        # some object servers stopped to make a situation that the
+        # object-expirer can put tombstone in the primary nodes.
+        obj_brain.stop_primary_half()
+
+        # increment the X-Timestamp explicitly
+        # (will be T(obj_deleted with x-delete-at) < T(obj_recreated))
+        put_object(headers={'X-Object-Meta-Expired': 'False',
+                            'X-Timestamp': Timestamp(recreate_at).normal})
+
+        # make sure auto-created containers get in the account listing
+        Manager(['container-updater']).once()
+        # sanity, the newer object is still there
+        try:
+            metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name)
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.resp.status)
+
+        self.assertIn('x-object-meta-expired', metadata)
+
+        # some object servers recovered
+        obj_brain.start_primary_half()
+
+        # sleep until after recreated_at
+        while time.time() <= recreate_at:
+            time.sleep(0.1)
+        # Now, expirer runs at the time after obj is recreated
+        self.expirer.once()
+
+        # verify that original object was deleted by expirer
+        obj_brain.stop_handoff_half()
+        try:
+            metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name,
+                acceptable_statuses=(4,))
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 404 for HEAD object but got %s' % e.resp.status)
+        obj_brain.start_handoff_half()
+
+        # and inconsistent state of objects is recovered by replicator
+        Manager(['object-replicator']).once()
+
+        # check if you can get recreated object
+        try:
+            metadata = self.client.get_object_metadata(
+                self.account, self.container_name, self.object_name)
+        except UnexpectedResponse as e:
+            self.fail(
+                'Expected 200 for HEAD object but got %s' % e.resp.status)
+
+        self.assertIn('x-object-meta-expired', metadata)
+
+    def _test_expirer_delete_outdated_object_version(self, object_exists):
+        # This test simulates a case where the expirer tries to delete
+        # an outdated version of an object.
+        # One case is where the expirer gets a 404, whereas the newest version
+        # of the object is offline.
+        # Another case is where the expirer gets a 412, since the old version
+        # of the object mismatches the expiration time sent by the expirer.
+        # In any of these cases, the expirer should retry deleting the object
+        # later, for as long as a reclaim age has not passed.
+        obj_brain = BrainSplitter(self.url, self.token, self.container_name,
+                                  self.object_name, 'object', self.policy)
+
+        obj_brain.put_container()
+
+        if object_exists:
+            obj_brain.put_object()
+
+        # currently, the object either doesn't exist, or does not have
+        # an expiration
+
+        # stop primary servers and put a newer version of the object, this
+        # time with an expiration. only the handoff servers will have
+        # the new version
+        obj_brain.stop_primary_half()
+        now = time.time()
+        delete_at = int(now + 2.0)
+        obj_brain.put_object({'X-Delete-At': delete_at})
+
+        # make sure auto-created containers get in the account listing
+        Manager(['container-updater']).once()
+
+        # update object record in the container listing
+        Manager(['container-replicator']).once()
+
+        # take handoff servers down, and bring up the outdated primary servers
+        obj_brain.start_primary_half()
+        obj_brain.stop_handoff_half()
+
+        # wait until object expiration time
+        while time.time() <= delete_at:
+            time.sleep(0.1)
+
+        # run expirer against the outdated servers. it should fail since
+        # the outdated version does not match the expiration time
+        self.expirer.once()
+
+        # bring all servers up, and run replicator to update servers
+        obj_brain.start_handoff_half()
+        Manager(['object-replicator']).once()
+
+        # verify the deletion has failed by checking the container listing
+        self.assertTrue(self._check_obj_in_container_listing(),
+                        msg='Did not find listing for %s' % self.object_name)
+
+        # run expirer again, delete should now succeed
+        self.expirer.once()
+
+        # verify the deletion by checking the container listing
+        self.assertFalse(self._check_obj_in_container_listing(),
+                         msg='Found listing for %s' % self.object_name)
+
+    def test_expirer_delete_returns_outdated_404(self):
+        self._test_expirer_delete_outdated_object_version(object_exists=False)
+
+    def test_expirer_delete_returns_outdated_412(self):
+        self._test_expirer_delete_outdated_object_version(object_exists=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from os.path import join
 import random
@@ -77,8 +78,7 @@ class RebuildingECDiskFileStream(object):
         self.datafile_metadata = datafile_metadata
 
         # the new FA is going to have the same length as others in the set
-        self._content_length = self.datafile_metadata['Content-Length']
-
+        self._content_length = int(self.datafile_metadata['Content-Length'])
         # update the FI and delete the ETag, the obj server will
         # recalc on the other side...
         self.datafile_metadata['X-Object-Sysmeta-Ec-Frag-Index'] = frag_index
@@ -127,7 +127,7 @@ class ObjectReconstructor(Daemon):
         self.bind_ip = conf.get('bind_ip', '0.0.0.0')
         self.servers_per_port = int(conf.get('servers_per_port', '0') or 0)
         self.port = None if self.servers_per_port else \
-            int(conf.get('bind_port', 6000))
+            int(conf.get('bind_port', 6200))
         self.concurrency = int(conf.get('concurrency', 1))
         self.stats_interval = int(conf.get('stats_interval', '300'))
         self.ring_check_interval = int(conf.get('ring_check_interval', 15))
@@ -245,9 +245,15 @@ class ObjectReconstructor(Daemon):
         # of the node we're rebuilding to within the primary part list
         fi_to_rebuild = node['index']
 
-        # KISS send out connection requests to all nodes, see what sticks
+        # KISS send out connection requests to all nodes, see what sticks.
+        # Use fragment preferences header to tell other nodes that we want
+        # fragments at the same timestamp as our fragment, and that they don't
+        # need to be durable.
         headers = self.headers.copy()
         headers['X-Backend-Storage-Policy-Index'] = int(job['policy'])
+        frag_prefs = [{'timestamp': datafile_metadata['X-Timestamp'],
+                       'exclude': []}]
+        headers['X-Backend-Fragment-Preferences'] = json.dumps(frag_prefs)
         pile = GreenAsyncPile(len(part_nodes))
         path = datafile_metadata['name']
         for node in part_nodes:
@@ -843,6 +849,9 @@ class ObjectReconstructor(Daemon):
                 self.part_count += len(partitions)
                 for partition in partitions:
                     part_path = join(obj_path, partition)
+                    if partition in ('auditor_status_ALL.json',
+                                     'auditor_status_ZBF.json'):
+                        continue
                     if not (partition.isdigit() and
                             os.path.isdir(part_path)):
                         self.logger.warning(

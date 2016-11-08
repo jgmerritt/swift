@@ -117,7 +117,6 @@ class ReplConnection(BufferedHTTPConnection):
     """
 
     def __init__(self, node, partition, hash_, logger):
-        ""
         self.logger = logger
         self.node = node
         host = "%s:%s" % (node['replication_ip'], node['replication_port'])
@@ -296,7 +295,7 @@ class Replicator(Daemon):
                     return False
         with Timeout(replicate_timeout or self.node_timeout):
             response = http.replicate(replicate_method, local_id)
-        return response and response.status >= 200 and response.status < 300
+        return response and 200 <= response.status < 300
 
     def _usync_db(self, point, broker, http, remote_id, local_id):
         """
@@ -342,7 +341,7 @@ class Replicator(Daemon):
         else:
             with Timeout(self.node_timeout):
                 response = http.replicate('merge_syncs', sync_table)
-            if response and response.status >= 200 and response.status < 300:
+            if response and 200 <= response.status < 300:
                 broker.merge_syncs([{'remote_id': remote_id,
                                      'sync_point': point}],
                                    incoming=False)
@@ -429,7 +428,7 @@ class Replicator(Daemon):
                                   different_region=different_region)
         elif response.status == HTTP_INSUFFICIENT_STORAGE:
             raise DriveNotMounted()
-        elif response.status >= 200 and response.status < 300:
+        elif 200 <= response.status < 300:
             rinfo = json.loads(response.data)
             local_sync = broker.get_sync(rinfo['id'], incoming=False)
             if self._in_sync(rinfo, info, broker, local_sync):
@@ -507,8 +506,7 @@ class Replicator(Daemon):
         # than the put_timestamp, and there are no objects.
         delete_timestamp = Timestamp(info.get('delete_timestamp') or 0)
         put_timestamp = Timestamp(info.get('put_timestamp') or 0)
-        if delete_timestamp < (now - self.reclaim_age) and \
-                delete_timestamp > put_timestamp and \
+        if (now - self.reclaim_age) > delete_timestamp > put_timestamp and \
                 info['count'] in (None, '', 0, '0'):
             if self.report_up_to_date(info):
                 self.delete_db(broker)
@@ -525,10 +523,13 @@ class Replicator(Daemon):
         if shouldbehere:
             shouldbehere = bool([n for n in nodes if n['id'] == node_id])
         # See Footnote [1] for an explanation of the repl_nodes assignment.
-        i = 0
-        while i < len(nodes) and nodes[i]['id'] != node_id:
-            i += 1
-        repl_nodes = nodes[i + 1:] + nodes[:i]
+        if len(nodes) > 1:
+            i = 0
+            while i < len(nodes) and nodes[i]['id'] != node_id:
+                i += 1
+            repl_nodes = nodes[i + 1:] + nodes[:i]
+        else:  # Special case if using only a single replica
+            repl_nodes = nodes
         more_nodes = self.ring.get_more_nodes(int(partition))
         if not local_dev:
             # Check further if local device is a handoff node
@@ -563,7 +564,7 @@ class Replicator(Daemon):
         except (Exception, Timeout):
             self.logger.exception('UNHANDLED EXCEPTION: in post replicate '
                                   'hook for %s', broker.db_file)
-        if not shouldbehere and all(responses):
+        if not shouldbehere and responses and all(responses):
             # If the db shouldn't be on this node and has been successfully
             # synced to all of its peers, it can be removed.
             if not self.delete_db(broker):

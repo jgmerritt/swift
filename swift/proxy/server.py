@@ -36,7 +36,8 @@ from swift.common.utils import cache_from_env, get_logger, \
 from swift.common.constraints import check_utf8, valid_api_version
 from swift.proxy.controllers import AccountController, ContainerController, \
     ObjectControllerRouter, InfoController
-from swift.proxy.controllers.base import get_container_info, NodeIter
+from swift.proxy.controllers.base import get_container_info, NodeIter, \
+    DEFAULT_RECHECK_CONTAINER_EXISTENCE, DEFAULT_RECHECK_ACCOUNT_EXISTENCE
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
     HTTPMethodNotAllowed, HTTPNotFound, HTTPPreconditionFailed, \
     HTTPServerError, HTTPException, Request, HTTPServiceUnavailable
@@ -64,10 +65,14 @@ required_filters = [
                                if pipe.startswith('catch_errors')
                                else [])},
     {'name': 'dlo', 'after_fn': lambda _junk: [
-        'staticweb', 'tempauth', 'keystoneauth',
+        'copy', 'staticweb', 'tempauth', 'keystoneauth',
         'catch_errors', 'gatekeeper', 'proxy_logging']},
     {'name': 'versioned_writes', 'after_fn': lambda _junk: [
-        'slo', 'dlo', 'staticweb', 'tempauth', 'keystoneauth',
+        'slo', 'dlo', 'copy', 'staticweb', 'tempauth',
+        'keystoneauth', 'catch_errors', 'gatekeeper', 'proxy_logging']},
+    # Put copy before dlo, slo and versioned_writes
+    {'name': 'copy', 'after_fn': lambda _junk: [
+        'staticweb', 'tempauth', 'keystoneauth',
         'catch_errors', 'gatekeeper', 'proxy_logging']}]
 
 
@@ -102,13 +107,13 @@ class Application(object):
         self.error_suppression_limit = \
             int(conf.get('error_suppression_limit', 10))
         self.recheck_container_existence = \
-            int(conf.get('recheck_container_existence', 60))
+            int(conf.get('recheck_container_existence',
+                         DEFAULT_RECHECK_CONTAINER_EXISTENCE))
         self.recheck_account_existence = \
-            int(conf.get('recheck_account_existence', 60))
+            int(conf.get('recheck_account_existence',
+                         DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
         self.allow_account_management = \
             config_true_value(conf.get('allow_account_management', 'no'))
-        self.object_post_as_copy = \
-            config_true_value(conf.get('object_post_as_copy', 'true'))
         self.container_ring = container_ring or Ring(swift_dir,
                                                      ring_name='container')
         self.account_ring = account_ring or Ring(swift_dir,
@@ -232,8 +237,8 @@ class Application(object):
         """
         if self._read_affinity and self.sorting_method != 'affinity':
             self.logger.warning(
-                "sorting_method is set to '%s', not 'affinity'; "
-                "read_affinity setting will have no effect." %
+                _("sorting_method is set to '%s', not 'affinity'; "
+                  "read_affinity setting will have no effect."),
                 self.sorting_method)
 
     def get_object_ring(self, policy_idx):
@@ -377,13 +382,12 @@ class Application(object):
             req.headers['x-trans-id'] = req.environ['swift.trans_id']
             controller.trans_id = req.environ['swift.trans_id']
             self.logger.client_ip = get_remote_client(req)
-            try:
-                handler = getattr(controller, req.method)
-                getattr(handler, 'publicly_accessible')
-            except AttributeError:
-                allowed_methods = getattr(controller, 'allowed_methods', set())
-                return HTTPMethodNotAllowed(
-                    request=req, headers={'Allow': ', '.join(allowed_methods)})
+
+            if req.method not in controller.allowed_methods:
+                return HTTPMethodNotAllowed(request=req, headers={
+                    'Allow': ', '.join(controller.allowed_methods)})
+            handler = getattr(controller, req.method)
+
             old_authorize = None
             if 'swift.authorize' in req.environ:
                 # We call authorize before the handler, always. If authorized,
@@ -392,8 +396,7 @@ class Application(object):
                 # controller's method indicates it'd like to gather more
                 # information and try again later.
                 resp = req.environ['swift.authorize'](req)
-                if not resp and not req.headers.get('X-Copy-From-Account') \
-                        and not req.headers.get('Destination-Account'):
+                if not resp:
                     # No resp means authorized, no delayed recheck required.
                     old_authorize = req.environ['swift.authorize']
                 else:
@@ -404,7 +407,7 @@ class Application(object):
             # Save off original request method (GET, POST, etc.) in case it
             # gets mutated during handling.  This way logging can display the
             # method the client actually sent.
-            req.environ['swift.orig_req_method'] = req.method
+            req.environ.setdefault('swift.orig_req_method', req.method)
             try:
                 if old_authorize:
                     req.environ.pop('swift.authorize', None)
@@ -506,7 +509,7 @@ class Application(object):
         """
         self._incr_node_errors(node)
         self.logger.error(_('%(msg)s %(ip)s:%(port)s/%(device)s'),
-                          {'msg': msg, 'ip': node['ip'],
+                          {'msg': msg.decode('utf-8'), 'ip': node['ip'],
                           'port': node['port'], 'device': node['device']})
 
     def iter_nodes(self, ring, partition, node_iter=None):
@@ -532,7 +535,7 @@ class Application(object):
               ' re: %(info)s'),
             {'type': typ, 'ip': node['ip'],
              'port': node['port'], 'device': node['device'],
-             'info': additional_info},
+             'info': additional_info.decode('utf-8')},
             **kwargs)
 
     def modify_wsgi_pipeline(self, pipe):
@@ -554,17 +557,18 @@ class Application(object):
                     except ValueError:  # not in pipeline; ignore it
                         pass
                 self.logger.info(
-                    'Adding required filter %s to pipeline at position %d' %
-                    (filter_name, insert_at))
+                    _('Adding required filter %(filter_name)s to pipeline at '
+                      'position %(insert_at)d'),
+                    {'filter_name': filter_name, 'insert_at': insert_at})
                 ctx = pipe.create_filter(filter_name)
                 pipe.insert_filter(ctx, index=insert_at)
                 pipeline_was_modified = True
 
         if pipeline_was_modified:
-            self.logger.info("Pipeline was modified. New pipeline is \"%s\".",
-                             pipe)
+            self.logger.info(_("Pipeline was modified. "
+                               "New pipeline is \"%s\"."), pipe)
         else:
-            self.logger.debug("Pipeline is \"%s\"", pipe)
+            self.logger.debug(_("Pipeline is \"%s\""), pipe)
 
 
 def app_factory(global_conf, **local_conf):

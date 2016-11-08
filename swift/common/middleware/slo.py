@@ -134,7 +134,7 @@ objects from the manifest much like DLO. If any of the segments from the
 manifest are not found or their Etag/Content Length have changed since upload,
 the connection will drop. In this case a 409 Conflict will be logged in the
 proxy logs and the user will receive incomplete results. Note that this will be
-enforced regardless of whether the user perfomed per-segment validation during
+enforced regardless of whether the user performed per-segment validation during
 upload.
 
 The headers from this GET or HEAD request will return the metadata attached
@@ -213,12 +213,11 @@ from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.swob import Request, HTTPBadRequest, HTTPServerError, \
     HTTPMethodNotAllowed, HTTPRequestEntityTooLarge, HTTPLengthRequired, \
     HTTPOk, HTTPPreconditionFailed, HTTPException, HTTPNotFound, \
-    HTTPUnauthorized, HTTPConflict, HTTPRequestedRangeNotSatisfiable,\
-    Response, Range
+    HTTPUnauthorized, HTTPConflict, Response, Range
 from swift.common.utils import get_logger, config_true_value, \
     get_valid_utf8_str, override_bytes_from_content_type, split_path, \
     register_swift_info, RateLimitedIterator, quote, close_if_possible, \
-    closing_if_possible
+    closing_if_possible, LRUCache
 from swift.common.request_helpers import SegmentedIterable
 from swift.common.constraints import check_utf8, MAX_BUFFERED_SLO_SEGMENTS
 from swift.common.http import HTTP_NOT_FOUND, HTTP_UNAUTHORIZED, is_success
@@ -297,11 +296,11 @@ def parse_and_validate_input(req_body, req_path):
                              for ek in sorted(extraneous_keys))))
             continue
 
-        if not isinstance(seg_dict['path'], basestring):
+        if not isinstance(seg_dict['path'], six.string_types):
             errors.append("Index %d: \"path\" must be a string" % seg_index)
             continue
         if not (seg_dict['etag'] is None or
-                isinstance(seg_dict['etag'], basestring)):
+                isinstance(seg_dict['etag'], six.string_types)):
             errors.append(
                 "Index %d: \"etag\" must be a string or null" % seg_index)
             continue
@@ -386,8 +385,6 @@ class SloGetContext(WSGIContext):
 
     def __init__(self, slo):
         self.slo = slo
-        self.first_byte = None
-        self.last_byte = None
         super(SloGetContext, self).__init__(slo.app)
 
     def _fetch_sub_slo_segments(self, req, version, acc, con, obj):
@@ -434,7 +431,7 @@ class SloGetContext(WSGIContext):
             return int(seg_dict['bytes'])
 
     def _segment_listing_iterator(self, req, version, account, segments,
-                                  recursion_depth=1):
+                                  byteranges):
         for seg_dict in segments:
             if config_true_value(seg_dict.get('sub_slo')):
                 override_bytes_from_content_type(seg_dict,
@@ -448,23 +445,46 @@ class SloGetContext(WSGIContext):
         # If we were to make SegmentedIterable handle all the range
         # calculations, we would be unable to make this optimization.
         total_length = sum(self._segment_length(seg) for seg in segments)
-        if self.first_byte is None:
-            self.first_byte = 0
-        if self.last_byte is None:
-            self.last_byte = total_length - 1
+        if not byteranges:
+            byteranges = [(0, total_length - 1)]
 
+        # Cache segments from sub-SLOs in case more than one byterange
+        # includes data from a particular sub-SLO. We only cache a few sets
+        # of segments so that a malicious user cannot build a giant SLO tree
+        # and then GET it to run the proxy out of memory.
+        #
+        # LRUCache is a little awkward to use this way, but it beats doing
+        # things manually.
+        #
+        # 20 is sort of an arbitrary choice; it's twice our max recursion
+        # depth, so we know this won't expand memory requirements by too
+        # much.
+        cached_fetch_sub_slo_segments = \
+            LRUCache(maxsize=20)(self._fetch_sub_slo_segments)
+
+        for first_byte, last_byte in byteranges:
+            byterange_listing_iter = self._byterange_listing_iterator(
+                req, version, account, segments, first_byte, last_byte,
+                cached_fetch_sub_slo_segments)
+            for seg_info in byterange_listing_iter:
+                yield seg_info
+
+    def _byterange_listing_iterator(self, req, version, account, segments,
+                                    first_byte, last_byte,
+                                    cached_fetch_sub_slo_segments,
+                                    recursion_depth=1):
         last_sub_path = None
         for seg_dict in segments:
             seg_length = self._segment_length(seg_dict)
-            if self.first_byte >= seg_length:
+            if first_byte >= seg_length:
                 # don't need any bytes from this segment
-                self.first_byte -= seg_length
-                self.last_byte -= seg_length
+                first_byte -= seg_length
+                last_byte -= seg_length
                 continue
 
-            if self.last_byte < 0:
+            if last_byte < 0:
                 # no bytes are needed from this or any future segment
-                break
+                return
 
             seg_range = seg_dict.get('range')
             if seg_range is None:
@@ -483,33 +503,30 @@ class SloGetContext(WSGIContext):
                 sub_path = get_valid_utf8_str(seg_dict['name'])
                 sub_cont, sub_obj = split_path(sub_path, 2, 2, True)
                 if last_sub_path != sub_path:
-                    sub_segments = self._fetch_sub_slo_segments(
+                    sub_segments = cached_fetch_sub_slo_segments(
                         req, version, account, sub_cont, sub_obj)
                 last_sub_path = sub_path
 
                 # Use the existing machinery to slice into the sub-SLO.
-                # This requires that we save off our current state, and
-                # restore at the other end.
-                orig_start, orig_end = self.first_byte, self.last_byte
-                self.first_byte = range_start + max(0, self.first_byte)
-                self.last_byte = min(range_end, range_start + self.last_byte)
-
-                for sub_seg_dict, sb, eb in self._segment_listing_iterator(
+                for sub_seg_dict, sb, eb in self._byterange_listing_iterator(
                         req, version, account, sub_segments,
+                        # This adjusts first_byte and last_byte to be
+                        # relative to the sub-SLO.
+                        range_start + max(0, first_byte),
+                        min(range_end, range_start + last_byte),
+
+                        cached_fetch_sub_slo_segments,
                         recursion_depth=recursion_depth + 1):
                     yield sub_seg_dict, sb, eb
-
-                # Restore the first/last state
-                self.first_byte, self.last_byte = orig_start, orig_end
             else:
                 if isinstance(seg_dict['name'], six.text_type):
                     seg_dict['name'] = seg_dict['name'].encode("utf-8")
                 yield (seg_dict,
-                       max(0, self.first_byte) + range_start,
-                       min(range_end, range_start + self.last_byte))
+                       max(0, first_byte) + range_start,
+                       min(range_end, range_start + last_byte))
 
-            self.first_byte -= seg_length
-            self.last_byte -= seg_length
+            first_byte -= seg_length
+            last_byte -= seg_length
 
     def _need_to_refetch_manifest(self, req):
         """
@@ -582,14 +599,15 @@ class SloGetContext(WSGIContext):
             if req.params.get('format') == 'raw':
                 resp_iter = self.convert_segment_listing(
                     self._response_headers, resp_iter)
-            new_headers = []
-            for header, value in self._response_headers:
-                if header.lower() == 'content-type':
-                    new_headers.append(('Content-Type',
-                                        'application/json; charset=utf-8'))
-                else:
-                    new_headers.append((header, value))
-            self._response_headers = new_headers
+            else:
+                new_headers = []
+                for header, value in self._response_headers:
+                    if header.lower() == 'content-type':
+                        new_headers.append(('Content-Type',
+                                            'application/json; charset=utf-8'))
+                    else:
+                        new_headers.append((header, value))
+                self._response_headers = new_headers
             start_response(self._response_status,
                            self._response_headers,
                            self._response_exc_info)
@@ -691,22 +709,18 @@ class SloGetContext(WSGIContext):
 
     def _manifest_get_response(self, req, content_length, response_headers,
                                segments):
-        self.first_byte, self.last_byte = None, None
         if req.range:
-            byteranges = req.range.ranges_for_length(content_length)
-            if len(byteranges) == 0:
-                return HTTPRequestedRangeNotSatisfiable(request=req)
-            elif len(byteranges) == 1:
-                self.first_byte, self.last_byte = byteranges[0]
+            byteranges = [
                 # For some reason, swob.Range.ranges_for_length adds 1 to the
                 # last byte's position.
-                self.last_byte -= 1
-            else:
-                req.range = None
+                (start, end - 1) for start, end
+                in req.range.ranges_for_length(content_length)]
+        else:
+            byteranges = []
 
         ver, account, _junk = req.split_path(3, 3, rest_with_last=True)
         plain_listing_iter = self._segment_listing_iterator(
-            req, ver, account, segments)
+            req, ver, account, segments, byteranges)
 
         def is_small_segment((seg_dict, start_byte, end_byte)):
             start = 0 if start_byte is None else start_byte
@@ -784,7 +798,9 @@ class StaticLargeObject(object):
             'rate_limit_after_segment', '10'))
         self.rate_limit_segments_per_sec = int(self.conf.get(
             'rate_limit_segments_per_sec', '1'))
-        self.bulk_deleter = Bulk(app, {}, logger=self.logger)
+        delete_concurrency = int(self.conf.get('delete_concurrency', '2'))
+        self.bulk_deleter = Bulk(
+            app, {}, delete_concurrency=delete_concurrency, logger=self.logger)
 
     def handle_multipart_get_or_head(self, req, start_response):
         """
@@ -797,20 +813,6 @@ class StaticLargeObject(object):
         :raises: HttpException on errors
         """
         return SloGetContext(self).handle_slo_get_or_head(req, start_response)
-
-    def copy_hook(self, inner_hook):
-
-        def slo_hook(source_req, source_resp, sink_req):
-            x_slo = source_resp.headers.get('X-Static-Large-Object')
-            if (config_true_value(x_slo)
-                    and source_req.params.get('multipart-manifest') != 'get'
-                    and 'swift.post_as_copy' not in source_req.environ):
-                source_resp = SloGetContext(self).get_or_head_response(
-                    source_req, source_resp.headers.items(),
-                    source_resp.app_iter)
-            return inner_hook(source_req, source_resp, sink_req)
-
-        return slo_hook
 
     def handle_multipart_put(self, req, start_response):
         """
@@ -1052,16 +1054,14 @@ class StaticLargeObject(object):
         """
         WSGI entry point
         """
+        if env.get('swift.slo_override'):
+            return self.app(env, start_response)
+
         req = Request(env)
         try:
             vrs, account, container, obj = req.split_path(4, 4, True)
         except ValueError:
             return self.app(env, start_response)
-
-        # install our COPY-callback hook
-        env['swift.copy_hook'] = self.copy_hook(
-            env.get('swift.copy_hook',
-                    lambda src_req, src_resp, sink_req: src_resp))
 
         try:
             if req.method == 'PUT' and \

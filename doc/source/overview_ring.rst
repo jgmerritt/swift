@@ -22,7 +22,7 @@ number, each replica will be assigned to a different device in the ring.
 
 Devices are added to the ring to describe the capacity available for
 part-replica assignment.  Devices are placed into failure domains consisting
-of region, zone, and server.  Regions can be used to describe geo-graphically
+of region, zone, and server.  Regions can be used to describe geographical
 systems characterized by lower-bandwidth or higher latency between machines in
 different regions.  Many rings will consist of only a single region.  Zones
 can be used to group devices based on physical locations, power separations,
@@ -80,7 +80,8 @@ the list of devices is a dictionary with the following keys:
 
 ======  =======  ==============================================================
 id      integer  The index into the list devices.
-zone    integer  The zone the devices resides in.
+zone    integer  The zone the device resides in.
+region  integer  The region the zone resides in.
 weight  float    The relative weight of the device in comparison to other
                  devices. This usually corresponds directly to the amount of
                  disk space the device has compared to other devices. For
@@ -158,6 +159,8 @@ for the ring. This means that some partitions will have more replicas than
 others. For example, if a ring has 3.25 replicas, then 25% of its partitions
 will have four replicas, while the remaining 75% will have just three.
 
+.. _ring_dispersion:
+
 **********
 Dispersion
 **********
@@ -172,6 +175,8 @@ the dispersion metric.
 
 A lower dispersion value is better, and the value can be used to find the
 proper value for "overload".
+
+.. _ring_overload:
 
 ********
 Overload
@@ -426,3 +431,5 @@ for rings that were close to balanceable, like 3 machines with 60TB, 60TB, and
 didn't always get it. After that, overload was added to the ring builder so
 that operators could choose a balance between dispersion and device weights.
 In time the overload concept was improved and made more accurate.
+
+For more background on consistent hashing rings, please see :doc:`ring_background`.

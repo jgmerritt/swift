@@ -243,8 +243,10 @@ class KeystoneAuth(object):
         service_roles = list_from_csv(environ.get('HTTP_X_SERVICE_ROLES', ''))
         identity = {'user': (environ.get('HTTP_X_USER_ID'),
                              environ.get('HTTP_X_USER_NAME')),
-                    'tenant': (environ.get('HTTP_X_TENANT_ID'),
-                               environ.get('HTTP_X_TENANT_NAME')),
+                    'tenant': (environ.get('HTTP_X_PROJECT_ID',
+                                           environ.get('HTTP_X_TENANT_ID')),
+                               environ.get('HTTP_X_PROJECT_NAME',
+                                           environ.get('HTTP_X_TENANT_NAME'))),
                     'roles': roles,
                     'service_roles': service_roles}
         token_info = environ.get('keystone.token_info', {})
@@ -287,7 +289,8 @@ class KeystoneAuth(object):
     def _get_project_domain_id(self, environ):
         info = get_account_info(environ, self.app, 'KS')
         domain_id = info.get('sysmeta', {}).get('project-domain-id')
-        exists = is_success(info.get('status', 0))
+        exists = (is_success(info.get('status', 0))
+                  and info.get('account_really_exists', True))
         return exists, domain_id
 
     def _set_project_domain_id(self, req, path_parts, env_identity):

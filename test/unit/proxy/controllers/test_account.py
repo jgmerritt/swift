@@ -25,6 +25,7 @@ from test.unit import fake_http_connect, FakeRing, FakeMemcache
 from swift.common.storage_policy import StoragePolicy
 from swift.common.request_helpers import get_sys_meta_prefix
 import swift.proxy.controllers.base
+from swift.proxy.controllers.base import get_account_info
 
 from test.unit import patch_policies
 
@@ -68,9 +69,10 @@ class TestAccountController(unittest.TestCase):
             req = Request.blank('/v1/AUTH_bob', {'PATH_INFO': '/v1/AUTH_bob'})
             resp = controller.HEAD(req)
         self.assertEqual(2, resp.status_int // 100)
-        self.assertTrue('swift.account/AUTH_bob' in resp.environ)
-        self.assertEqual(headers_to_account_info(resp.headers),
-                         resp.environ['swift.account/AUTH_bob'])
+        self.assertIn('account/AUTH_bob', resp.environ['swift.infocache'])
+        self.assertEqual(
+            headers_to_account_info(resp.headers),
+            resp.environ['swift.infocache']['account/AUTH_bob'])
 
     def test_swift_owner(self):
         owner_headers = {
@@ -84,7 +86,7 @@ class TestAccountController(unittest.TestCase):
             resp = controller.HEAD(req)
         self.assertEqual(2, resp.status_int // 100)
         for key in owner_headers:
-            self.assertTrue(key not in resp.headers)
+            self.assertNotIn(key, resp.headers)
 
         req = Request.blank('/v1/a', environ={'swift_owner': True})
         with mock.patch('swift.proxy.controllers.base.http_connect',
@@ -92,7 +94,7 @@ class TestAccountController(unittest.TestCase):
             resp = controller.HEAD(req)
         self.assertEqual(2, resp.status_int // 100)
         for key in owner_headers:
-            self.assertTrue(key in resp.headers)
+            self.assertIn(key, resp.headers)
 
     def test_get_deleted_account(self):
         resp_headers = {
@@ -146,9 +148,9 @@ class TestAccountController(unittest.TestCase):
                         fake_http_connect(200, 200, give_connect=callback)):
             controller.PUT(req)
         self.assertEqual(context['method'], 'PUT')
-        self.assertTrue(sys_meta_key in context['headers'])
+        self.assertIn(sys_meta_key, context['headers'])
         self.assertEqual(context['headers'][sys_meta_key], 'foo')
-        self.assertTrue(user_meta_key in context['headers'])
+        self.assertIn(user_meta_key, context['headers'])
         self.assertEqual(context['headers'][user_meta_key], 'bar')
         self.assertNotEqual(context['headers']['x-timestamp'], '1.0')
 
@@ -169,9 +171,9 @@ class TestAccountController(unittest.TestCase):
                         fake_http_connect(200, 200, give_connect=callback)):
             controller.POST(req)
         self.assertEqual(context['method'], 'POST')
-        self.assertTrue(sys_meta_key in context['headers'])
+        self.assertIn(sys_meta_key, context['headers'])
         self.assertEqual(context['headers'][sys_meta_key], 'foo')
-        self.assertTrue(user_meta_key in context['headers'])
+        self.assertIn(user_meta_key, context['headers'])
         self.assertEqual(context['headers'][user_meta_key], 'bar')
         self.assertNotEqual(context['headers']['x-timestamp'], '1.0')
 
@@ -210,7 +212,7 @@ class TestAccountController(unittest.TestCase):
                     self.assertEqual(resp.headers.get(header), value)
                 else:
                     # blank ACLs should result in no header
-                    self.assertTrue(header not in resp.headers)
+                    self.assertNotIn(header, resp.headers)
 
     def test_add_acls_impossible_cases(self):
         # For test coverage: verify that defensive coding does defend, in cases
@@ -225,13 +227,20 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(1, len(resp.headers))  # we always get Content-Type
         self.assertEqual(2, len(resp.environ))
 
-    def test_memcache_key_impossible_cases(self):
+    def test_cache_key_impossible_cases(self):
         # For test coverage: verify that defensive coding does defend, in cases
         # that shouldn't arise naturally
-        self.assertRaises(
-            ValueError,
-            lambda: swift.proxy.controllers.base.get_container_memcache_key(
-                '/a', None))
+        with self.assertRaises(ValueError):
+            # Container needs account
+            swift.proxy.controllers.base.get_cache_key(None, 'c')
+
+        with self.assertRaises(ValueError):
+            # Object needs account
+            swift.proxy.controllers.base.get_cache_key(None, 'c', 'o')
+
+        with self.assertRaises(ValueError):
+            # Object needs container
+            swift.proxy.controllers.base.get_cache_key('a', None, 'o')
 
     def test_stripping_swift_admin_headers(self):
         # Verify that a GET/HEAD which receives privileged headers from the
@@ -320,16 +329,16 @@ class TestAccountController4Replicas(TestAccountController):
             ((201, 201, 201, 201), 201),
             ((201, 201, 201, 404), 201),
             ((201, 201, 201, 503), 201),
-            ((201, 201, 404, 404), 503),
-            ((201, 201, 404, 503), 503),
-            ((201, 201, 503, 503), 503),
+            ((201, 201, 404, 404), 201),
+            ((201, 201, 404, 503), 201),
+            ((201, 201, 503, 503), 201),
             ((201, 404, 404, 404), 404),
-            ((201, 404, 404, 503), 503),
+            ((201, 404, 404, 503), 404),
             ((201, 404, 503, 503), 503),
             ((201, 503, 503, 503), 503),
             ((404, 404, 404, 404), 404),
             ((404, 404, 404, 503), 404),
-            ((404, 404, 503, 503), 503),
+            ((404, 404, 503, 503), 404),
             ((404, 503, 503, 503), 503),
             ((503, 503, 503, 503), 503)
         ]
@@ -340,16 +349,16 @@ class TestAccountController4Replicas(TestAccountController):
             ((204, 204, 204, 204), 204),
             ((204, 204, 204, 404), 204),
             ((204, 204, 204, 503), 204),
-            ((204, 204, 404, 404), 503),
-            ((204, 204, 404, 503), 503),
-            ((204, 204, 503, 503), 503),
+            ((204, 204, 404, 404), 204),
+            ((204, 204, 404, 503), 204),
+            ((204, 204, 503, 503), 204),
             ((204, 404, 404, 404), 404),
-            ((204, 404, 404, 503), 503),
+            ((204, 404, 404, 503), 404),
             ((204, 404, 503, 503), 503),
             ((204, 503, 503, 503), 503),
             ((404, 404, 404, 404), 404),
             ((404, 404, 404, 503), 404),
-            ((404, 404, 503, 503), 503),
+            ((404, 404, 503, 503), 404),
             ((404, 503, 503, 503), 503),
             ((503, 503, 503, 503), 503)
         ]
@@ -360,20 +369,37 @@ class TestAccountController4Replicas(TestAccountController):
             ((204, 204, 204, 204), 204),
             ((204, 204, 204, 404), 204),
             ((204, 204, 204, 503), 204),
-            ((204, 204, 404, 404), 503),
-            ((204, 204, 404, 503), 503),
-            ((204, 204, 503, 503), 503),
+            ((204, 204, 404, 404), 204),
+            ((204, 204, 404, 503), 204),
+            ((204, 204, 503, 503), 204),
             ((204, 404, 404, 404), 404),
-            ((204, 404, 404, 503), 503),
+            ((204, 404, 404, 503), 404),
             ((204, 404, 503, 503), 503),
             ((204, 503, 503, 503), 503),
             ((404, 404, 404, 404), 404),
             ((404, 404, 404, 503), 404),
-            ((404, 404, 503, 503), 503),
+            ((404, 404, 503, 503), 404),
             ((404, 503, 503, 503), 503),
             ((503, 503, 503, 503), 503)
         ]
         self._assert_responses('POST', POST_TEST_CASES)
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestGetAccountInfo(unittest.TestCase):
+    def setUp(self):
+        self.app = proxy_server.Application(
+            None, FakeMemcache(),
+            account_ring=FakeRing(), container_ring=FakeRing())
+
+    def test_get_deleted_account_410(self):
+        resp_headers = {'x-account-status': 'deleted'}
+
+        req = Request.blank('/v1/a')
+        with mock.patch('swift.proxy.controllers.base.http_connect',
+                        fake_http_connect(404, headers=resp_headers)):
+            info = get_account_info(req.environ, self.app)
+        self.assertEqual(410, info.get('status'))
 
 
 if __name__ == '__main__':

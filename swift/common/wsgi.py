@@ -22,7 +22,6 @@ import inspect
 import os
 import signal
 import time
-import mimetools
 from swift import gettext_ as _
 from textwrap import dedent
 
@@ -31,9 +30,12 @@ import eventlet.debug
 from eventlet import greenio, GreenPool, sleep, wsgi, listen, Timeout
 from paste.deploy import loadwsgi
 from eventlet.green import socket, ssl, os as green_os
+import six
 from six import BytesIO
 from six import StringIO
 from six.moves.urllib.parse import unquote
+if six.PY2:
+    import mimetools
 
 from swift.common import utils, constraints
 from swift.common.storage_policy import BindPortsCache
@@ -41,7 +43,7 @@ from swift.common.swob import Request
 from swift.common.utils import capture_stdio, disable_fallocate, \
     drop_privileges, get_logger, NullLogger, config_true_value, \
     validate_configuration, get_hub, config_auto_int_value, \
-    CloseableChain
+    reiterate
 
 # Set maximum line size of message headers to be accepted.
 wsgi.MAX_HEADER_LINE = constraints.MAX_HEADER_SIZE
@@ -146,6 +148,9 @@ def monkey_patch_mimetools():
     mimetools.Message defaults content-type to "text/plain"
     This changes it to default to None, so we can detect missing headers.
     """
+    if six.PY3:
+        # The mimetools has been removed from Python 3
+        return
 
     orig_parsetype = mimetools.Message.parsetype
 
@@ -168,8 +173,8 @@ def get_socket(conf):
 
     :param conf: Configuration dict to read settings from
 
-    :returns : a socket object as returned from socket.listen or
-               ssl.wrap_socket if conf specifies cert_file
+    :returns: a socket object as returned from socket.listen or
+              ssl.wrap_socket if conf specifies cert_file
     """
     try:
         bind_port = int(conf['bind_port'])
@@ -196,10 +201,10 @@ def get_socket(conf):
                 raise
             sleep(0.1)
     if not sock:
-        raise Exception(_('Could not bind to %s:%s '
-                          'after trying for %s seconds') % (
-                              bind_addr[0], bind_addr[1], bind_timeout))
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        raise Exception(_('Could not bind to %(addr)s:%(port)s '
+                          'after trying for %(timeout)s seconds') % {
+                              'addr': bind_addr[0], 'port': bind_addr[1],
+                              'timeout': bind_timeout})
     # in my experience, sockets can hang around forever without keepalive
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -643,7 +648,10 @@ class PortPidState(object):
         Yield all current listen sockets.
         """
 
-        for orphan_data in self.sock_data_by_port.itervalues():
+        # Use six.itervalues() instead of calling directly the .values() method
+        # on Python 2 to avoid a temporary list, because sock_data_by_port
+        # comes from users and can be large.
+        for orphan_data in six.itervalues(self.sock_data_by_port):
             yield orphan_data['sock']
 
     def forget_port(self, port):
@@ -873,6 +881,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
         print(e)
         return 1
 
+    # optional nice/ionice priority scheduling
+    utils.modify_priority(conf, logger)
+
     servers_per_port = int(conf.get('servers_per_port', '0') or 0)
 
     # NOTE: for now servers_per_port is object-server-only; future work could
@@ -897,9 +908,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     loadapp(conf_path, global_conf=global_conf)
 
     # set utils.FALLOCATE_RESERVE if desired
-    reserve = int(conf.get('fallocate_reserve', 0))
-    if reserve > 0:
-        utils.FALLOCATE_RESERVE = reserve
+    utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+        utils.config_fallocate_value(conf.get('fallocate_reserve', '1%'))
+
     # redirect errors to logger and close stdio
     capture_stdio(logger)
 
@@ -948,12 +959,21 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
 
         with Timeout(loop_timeout, exception=False):
             try:
-                pid, status = green_os.wait()
-                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                    strategy.register_worker_exit(pid)
-            except OSError as err:
-                if err.errno not in (errno.EINTR, errno.ECHILD):
-                    raise
+                try:
+                    pid, status = green_os.wait()
+                    if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                        strategy.register_worker_exit(pid)
+                except OSError as err:
+                    if err.errno not in (errno.EINTR, errno.ECHILD):
+                        raise
+                    if err.errno == errno.ECHILD:
+                        # If there are no children at all (ECHILD), then
+                        # there's nothing to actually wait on. We sleep
+                        # for a little bit to avoid a tight CPU spin
+                        # and still are able to catch any KeyboardInterrupt
+                        # events that happen. The value of 0.01 matches the
+                        # value in eventlet's waitpid().
+                        sleep(0.01)
             except KeyboardInterrupt:
                 logger.notice('User quit')
                 running[0] = False
@@ -1040,16 +1060,11 @@ class WSGIContext(object):
         self._response_headers = None
         self._response_exc_info = None
         resp = self.app(env, self._start_response)
-        # if start_response has been called, just return the iter
-        if self._response_status is not None:
-            return resp
-        resp = iter(resp)
-        try:
-            first_chunk = next(resp)
-        except StopIteration:
-            return iter([])
-        else:  # We got a first_chunk
-            return CloseableChain([first_chunk], resp)
+        # if start_response has not been called, iterate until we've got a
+        # non-empty chunk, by which time the app *should* have called it
+        if self._response_status is None:
+            resp = reiterate(resp)
+        return resp
 
     def _get_status_int(self):
         """
@@ -1100,7 +1115,8 @@ def make_env(env, method=None, path=None, agent='Swift', query_string=None,
                  'SERVER_PROTOCOL', 'swift.cache', 'swift.source',
                  'swift.trans_id', 'swift.authorize_override',
                  'swift.authorize', 'HTTP_X_USER_ID', 'HTTP_X_PROJECT_ID',
-                 'HTTP_REFERER'):
+                 'HTTP_REFERER', 'swift.orig_req_method', 'swift.log_info',
+                 'swift.infocache'):
         if name in env:
             newenv[name] = env[name]
     if method:

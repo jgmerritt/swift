@@ -284,7 +284,7 @@ def _resp_status_property():
         return '%s %s' % (self.status_int, self.title)
 
     def setter(self, value):
-        if isinstance(value, (int, long)):
+        if isinstance(value, six.integer_types):
             self.status_int = value
             self.explanation = self.title = RESPONSE_REASONS[value][0]
         else:
@@ -467,6 +467,8 @@ class Range(object):
     :param headerval: value of the header as a str
     """
     def __init__(self, headerval):
+        if not headerval:
+            raise ValueError('Invalid Range header: %r' % headerval)
         headerval = headerval.replace(' ', '')
         if not headerval.lower().startswith('bytes='):
             raise ValueError('Invalid Range header: %s' % headerval)
@@ -483,8 +485,10 @@ class Range(object):
             else:
                 start = None
             if end:
-                # when end contains non numeric value, this also causes
-                # ValueError
+                # We could just rely on int() raising the ValueError, but
+                # this catches things like '--0'
+                if not end.isdigit():
+                    raise ValueError('Invalid Range header: %s' % headerval)
                 end = int(end)
                 if end < 0:
                     raise ValueError('Invalid Range header: %s' % headerval)
@@ -584,7 +588,7 @@ class Range(object):
         #
         # We're defining "egregious" here as:
         #
-        # * more than 100 requested ranges OR
+        # * more than 50 requested ranges OR
         # * more than 2 overlapping ranges OR
         # * more than 8 non-ascending-order ranges
         if len(all_ranges) > MAX_RANGES:
@@ -888,6 +892,11 @@ class Request(object):
         return self._params_cache
     str_params = params
 
+    @params.setter
+    def params(self, param_pairs):
+        self._params_cache = None
+        self.query_string = urllib.parse.urlencode(param_pairs)
+
     @property
     def timestamp(self):
         """
@@ -1081,6 +1090,7 @@ class Response(object):
     content_range = _header_property('content-range')
     etag = _resp_etag_property()
     status = _resp_status_property()
+    status_int = None
     body = _resp_body_property()
     host_url = _host_url_property()
     last_modified = _datetime_property('last-modified')
@@ -1134,8 +1144,8 @@ class Response(object):
         conditional requests.
 
         It's most effectively used with X-Backend-Etag-Is-At which would
-        define the additional Metadata key where the original ETag of the
-        clear-form client request data.
+        define the additional Metadata key(s) where the original ETag of the
+        clear-form client request data may be found.
         """
         if self._conditional_etag is not None:
             return self._conditional_etag
@@ -1239,9 +1249,11 @@ class Response(object):
             ranges = self.request.range.ranges_for_length(self.content_length)
             if ranges == []:
                 self.status = 416
-                self.content_length = 0
                 close_if_possible(app_iter)
-                return ['']
+                # Setting body + app_iter to None makes us emit the default
+                # body text from RESPONSE_REASONS.
+                body = None
+                app_iter = None
             elif ranges:
                 range_size = len(ranges)
                 if range_size > 0:
@@ -1413,6 +1425,7 @@ HTTPOk = status_map[200]
 HTTPCreated = status_map[201]
 HTTPAccepted = status_map[202]
 HTTPNoContent = status_map[204]
+HTTPPartialContent = status_map[206]
 HTTPMovedPermanently = status_map[301]
 HTTPFound = status_map[302]
 HTTPSeeOther = status_map[303]

@@ -17,7 +17,7 @@
 
 from __future__ import print_function
 
-from eventlet.green import urllib2, socket
+from eventlet.green import socket
 from six.moves.urllib.parse import urlparse
 from swift.common.utils import SWIFT_CONF_FILE
 from swift.common.ring import Ring
@@ -28,7 +28,13 @@ import json
 import optparse
 import time
 import sys
+import six
 import os
+
+if six.PY3:
+    from eventlet.green.urllib import request as urllib2
+else:
+    from eventlet.green import urllib2
 
 
 def seconds2timeunit(seconds):
@@ -72,7 +78,7 @@ class Scout(object):
         Perform the actual HTTP request to obtain swift recon telemtry.
 
         :param base_url: the base url of the host you wish to check. str of the
-                        format 'http://127.0.0.1:6000/recon/'
+                        format 'http://127.0.0.1:6200/recon/'
         :param recon_type: the swift recon check to request.
         :returns: tuple of (recon url used, response body, and status)
         """
@@ -941,7 +947,8 @@ class SwiftRecon(object):
         """
         print("=" * 79)
         usage = '''
-        usage: %prog <server_type> [-v] [--suppress] [-a] [-r] [-u] [-d]
+        usage: %prog <server_type> [<server_type> [<server_type>]]
+        [-v] [--suppress] [-a] [-r] [-u] [-d]
         [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
         [--human-readable]
 
@@ -1009,103 +1016,110 @@ class SwiftRecon(object):
                         'storage policy (specified as name or index).')
         options, arguments = args.parse_args()
 
-        if len(sys.argv) <= 1 or len(arguments) > 1:
+        if len(sys.argv) <= 1 or len(arguments) > len(self.check_types):
             args.print_help()
             sys.exit(0)
 
         if arguments:
-            if arguments[0] in self.check_types:
-                self.server_type = arguments[0]
+            arguments = set(arguments)
+            if arguments.issubset(self.check_types):
+                server_types = arguments
             else:
                 print("Invalid Server Type")
                 args.print_help()
                 sys.exit(1)
-        else:
-            self.server_type = 'object'
+        else:  # default
+            server_types = ['object']
 
         swift_dir = options.swiftdir
         self.verbose = options.verbose
         self.suppress_errors = options.suppress
         self.timeout = options.timeout
 
-        ring_names = self._get_ring_names(options.policy)
-        if not ring_names:
-            print('Invalid Storage Policy')
-            args.print_help()
-            sys.exit(0)
-
-        hosts = self.get_hosts(options.region, options.zone,
-                               swift_dir, ring_names)
-
-        print("--> Starting reconnaissance on %s hosts" % len(hosts))
-        print("=" * 79)
-
-        if options.all:
-            if self.server_type == 'object':
-                self.async_check(hosts)
-                self.object_auditor_check(hosts)
-                self.updater_check(hosts)
-                self.expirer_check(hosts)
-            elif self.server_type == 'container':
-                self.auditor_check(hosts)
-                self.updater_check(hosts)
-            elif self.server_type == 'account':
-                self.auditor_check(hosts)
-            self.replication_check(hosts)
-            self.umount_check(hosts)
-            self.load_check(hosts)
-            self.disk_usage(hosts, options.top, options.lowest,
-                            options.human_readable)
-            self.get_ringmd5(hosts, swift_dir)
-            self.get_swiftconfmd5(hosts)
-            self.quarantine_check(hosts)
-            self.socket_usage(hosts)
-            self.server_type_check(hosts)
-            self.driveaudit_check(hosts)
-            self.time_check(hosts)
-        else:
-            if options.async:
+        for server_type in server_types:
+            self.server_type = server_type
+            ring_names = self._get_ring_names(options.policy)
+            if not ring_names:
+                print('Invalid Storage Policy: %s' % options.policy)
+                args.print_help()
+                sys.exit(0)
+            hosts = self.get_hosts(options.region, options.zone,
+                                   swift_dir, ring_names)
+            print("--> Starting reconnaissance on %s hosts (%s)" %
+                  (len(hosts), self.server_type))
+            print("=" * 79)
+            if options.all:
                 if self.server_type == 'object':
                     self.async_check(hosts)
-                else:
-                    print("Error: Can't check asyncs on non object servers.")
-            if options.unmounted:
-                self.umount_check(hosts)
-            if options.replication:
-                self.replication_check(hosts)
-            if options.auditor:
-                if self.server_type == 'object':
                     self.object_auditor_check(hosts)
-                else:
-                    self.auditor_check(hosts)
-            if options.updater:
-                if self.server_type == 'account':
-                    print("Error: Can't check updaters on account servers.")
-                else:
                     self.updater_check(hosts)
-            if options.expirer:
-                if self.server_type == 'object':
                     self.expirer_check(hosts)
-                else:
-                    print("Error: Can't check expired on non object servers.")
-            if options.validate_servers:
-                self.server_type_check(hosts)
-            if options.loadstats:
+                elif self.server_type == 'container':
+                    self.auditor_check(hosts)
+                    self.updater_check(hosts)
+                elif self.server_type == 'account':
+                    self.auditor_check(hosts)
+                self.replication_check(hosts)
+                self.umount_check(hosts)
                 self.load_check(hosts)
-            if options.diskusage:
                 self.disk_usage(hosts, options.top, options.lowest,
                                 options.human_readable)
-            if options.md5:
                 self.get_ringmd5(hosts, swift_dir)
                 self.get_swiftconfmd5(hosts)
-            if options.quarantined:
                 self.quarantine_check(hosts)
-            if options.sockstat:
                 self.socket_usage(hosts)
-            if options.driveaudit:
+                self.server_type_check(hosts)
                 self.driveaudit_check(hosts)
-            if options.time:
                 self.time_check(hosts)
+            else:
+                if options.async:
+                    if self.server_type == 'object':
+                        self.async_check(hosts)
+                    else:
+                        print("Error: Can't check asyncs on non object "
+                              "servers.")
+                        print("=" * 79)
+                if options.unmounted:
+                    self.umount_check(hosts)
+                if options.replication:
+                    self.replication_check(hosts)
+                if options.auditor:
+                    if self.server_type == 'object':
+                        self.object_auditor_check(hosts)
+                    else:
+                        self.auditor_check(hosts)
+                if options.updater:
+                    if self.server_type == 'account':
+                        print("Error: Can't check updaters on account "
+                              "servers.")
+                        print("=" * 79)
+                    else:
+                        self.updater_check(hosts)
+                if options.expirer:
+                    if self.server_type == 'object':
+                        self.expirer_check(hosts)
+                    else:
+                        print("Error: Can't check expired on non object "
+                              "servers.")
+                        print("=" * 79)
+                if options.validate_servers:
+                    self.server_type_check(hosts)
+                if options.loadstats:
+                    self.load_check(hosts)
+                if options.diskusage:
+                    self.disk_usage(hosts, options.top, options.lowest,
+                                    options.human_readable)
+                if options.md5:
+                    self.get_ringmd5(hosts, swift_dir)
+                    self.get_swiftconfmd5(hosts)
+                if options.quarantined:
+                    self.quarantine_check(hosts)
+                if options.sockstat:
+                    self.socket_usage(hosts)
+                if options.driveaudit:
+                    self.driveaudit_check(hosts)
+                if options.time:
+                    self.time_check(hosts)
 
 
 def main():

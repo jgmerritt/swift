@@ -23,18 +23,19 @@ from shutil import rmtree
 from hashlib import md5
 from tempfile import mkdtemp
 import textwrap
+from os.path import dirname, basename
 from test.unit import (FakeLogger, patch_policies, make_timestamp_iter,
                        DEFAULT_TEST_EC_TYPE)
 from swift.obj import auditor, replicator
 from swift.obj.diskfile import (
     DiskFile, write_metadata, invalidate_hash, get_data_dir,
     DiskFileManager, ECDiskFileManager, AuditLocation, clear_auditor_status,
-    get_auditor_status)
+    get_auditor_status, HASH_FILE, HASH_INVALIDATIONS_FILE)
 from swift.common.utils import (
     mkdirs, normalize_timestamp, Timestamp, readconf)
 from swift.common.storage_policy import (
-    ECStoragePolicy, StoragePolicy, POLICIES)
-
+    ECStoragePolicy, StoragePolicy, POLICIES, EC_POLICY)
+from test.unit.obj.common import write_diskfile
 
 _mocked_policies = [
     StoragePolicy(0, 'zero', False),
@@ -153,7 +154,9 @@ class TestAuditor(unittest.TestCase):
         def run_tests(disk_file):
             auditor_worker = auditor.AuditorWorker(self.conf, self.logger,
                                                    self.rcache, self.devices)
-            data = '0' * 1024
+            data = b'0' * 1024
+            if disk_file.policy.policy_type == EC_POLICY:
+                data = disk_file.policy.pyeclib_driver.encode(data)[0]
             etag = md5()
             with disk_file.create() as writer:
                 writer.write(data)
@@ -174,7 +177,7 @@ class TestAuditor(unittest.TestCase):
                                   policy=disk_file.policy))
                 self.assertEqual(auditor_worker.quarantines, pre_quarantines)
 
-                os.write(writer._fd, 'extra_data')
+                os.write(writer._fd, b'extra_data')
 
                 auditor_worker.object_audit(
                     AuditLocation(disk_file._datadir, 'sda', '0',
@@ -188,7 +191,7 @@ class TestAuditor(unittest.TestCase):
     def test_object_audit_diff_data(self):
         auditor_worker = auditor.AuditorWorker(self.conf, self.logger,
                                                self.rcache, self.devices)
-        data = '0' * 1024
+        data = b'0' * 1024
         etag = md5()
         timestamp = str(normalize_timestamp(time.time()))
         with self.disk_file.create() as writer:
@@ -212,9 +215,7 @@ class TestAuditor(unittest.TestCase):
             AuditLocation(self.disk_file._datadir, 'sda', '0',
                           policy=POLICIES.legacy))
         self.assertEqual(auditor_worker.quarantines, pre_quarantines)
-        etag = md5()
-        etag.update('1' + '0' * 1023)
-        etag = etag.hexdigest()
+        etag = md5(b'1' + b'0' * 1023).hexdigest()
         metadata['ETag'] = etag
 
         with self.disk_file.create() as writer:
@@ -227,12 +228,89 @@ class TestAuditor(unittest.TestCase):
                           policy=POLICIES.legacy))
         self.assertEqual(auditor_worker.quarantines, pre_quarantines + 1)
 
+    def test_object_audit_checks_EC_fragments(self):
+        disk_file = self.disk_file_ec
+
+        def do_test(data):
+            # create diskfile and set ETag and content-length to match the data
+            etag = md5(data).hexdigest()
+            timestamp = str(normalize_timestamp(time.time()))
+            with disk_file.create() as writer:
+                writer.write(data)
+                metadata = {
+                    'ETag': etag,
+                    'X-Timestamp': timestamp,
+                    'Content-Length': len(data),
+                }
+                writer.put(metadata)
+                writer.commit(Timestamp(timestamp))
+
+            auditor_worker = auditor.AuditorWorker(self.conf, FakeLogger(),
+                                                   self.rcache, self.devices)
+            self.assertEqual(0, auditor_worker.quarantines)  # sanity check
+            auditor_worker.object_audit(
+                AuditLocation(disk_file._datadir, 'sda', '0',
+                              policy=disk_file.policy))
+            return auditor_worker
+
+        # two good frags in an EC archive
+        frag_0 = disk_file.policy.pyeclib_driver.encode(
+            'x' * disk_file.policy.ec_segment_size)[0]
+        frag_1 = disk_file.policy.pyeclib_driver.encode(
+            'y' * disk_file.policy.ec_segment_size)[0]
+        data = frag_0 + frag_1
+        auditor_worker = do_test(data)
+        self.assertEqual(0, auditor_worker.quarantines)
+        self.assertFalse(auditor_worker.logger.get_lines_for_level('error'))
+
+        # corrupt second frag headers
+        corrupt_frag_1 = 'blah' * 16 + frag_1[64:]
+        data = frag_0 + corrupt_frag_1
+        auditor_worker = do_test(data)
+        self.assertEqual(1, auditor_worker.quarantines)
+        log_lines = auditor_worker.logger.get_lines_for_level('error')
+        self.assertIn('failed audit and was quarantined: '
+                      'Invalid EC metadata at offset 0x%x' %
+                      len(frag_0),
+                      log_lines[0])
+
+        # dangling extra corrupt frag data
+        data = frag_0 + frag_1 + 'wtf' * 100
+        auditor_worker = do_test(data)
+        self.assertEqual(1, auditor_worker.quarantines)
+        log_lines = auditor_worker.logger.get_lines_for_level('error')
+        self.assertIn('failed audit and was quarantined: '
+                      'Invalid EC metadata at offset 0x%x' %
+                      len(frag_0 + frag_1),
+                      log_lines[0])
+
+        # simulate bug https://bugs.launchpad.net/bugs/1631144 by writing start
+        # of an ssync subrequest into the diskfile
+        data = (
+            b'PUT /a/c/o\r\n' +
+            b'Content-Length: 999\r\n' +
+            b'Content-Type: image/jpeg\r\n' +
+            b'X-Object-Sysmeta-Ec-Content-Length: 1024\r\n' +
+            b'X-Object-Sysmeta-Ec-Etag: 1234bff7eb767cc6d19627c6b6f9edef\r\n' +
+            b'X-Object-Sysmeta-Ec-Frag-Index: 1\r\n' +
+            b'X-Object-Sysmeta-Ec-Scheme: ' + DEFAULT_TEST_EC_TYPE + '\r\n' +
+            b'X-Object-Sysmeta-Ec-Segment-Size: 1048576\r\n' +
+            b'X-Timestamp: 1471512345.17333\r\n\r\n'
+        )
+        data += frag_0[:disk_file.policy.fragment_size - len(data)]
+        auditor_worker = do_test(data)
+        self.assertEqual(1, auditor_worker.quarantines)
+        log_lines = auditor_worker.logger.get_lines_for_level('error')
+        self.assertIn('failed audit and was quarantined: '
+                      'Invalid EC metadata at offset 0x0',
+                      log_lines[0])
+
     def test_object_audit_no_meta(self):
         timestamp = str(normalize_timestamp(time.time()))
         path = os.path.join(self.disk_file._datadir, timestamp + '.data')
         mkdirs(self.disk_file._datadir)
-        fp = open(path, 'w')
-        fp.write('0' * 1024)
+        fp = open(path, 'wb')
+        fp.write(b'0' * 1024)
         fp.close()
         invalidate_hash(os.path.dirname(self.disk_file._datadir))
         auditor_worker = auditor.AuditorWorker(self.conf, self.logger,
@@ -328,7 +406,7 @@ class TestAuditor(unittest.TestCase):
         [object-auditor]
         rsync_tempfile_timeout = auto
         """
-        with open(os.path.join(self.testdir, 'objserver.conf'), 'w') as f:
+        with open(config_path, 'w') as f:
             f.write(textwrap.dedent(stub_config))
         conf = readconf(config_path, 'object-auditor')
         auditor_worker = auditor.AuditorWorker(conf, self.logger,
@@ -346,7 +424,7 @@ class TestAuditor(unittest.TestCase):
         [object-auditor]
         rsync_tempfile_timeout = auto
         """
-        with open(os.path.join(self.testdir, 'objserver.conf'), 'w') as f:
+        with open(config_path, 'w') as f:
             f.write(textwrap.dedent(stub_config))
         conf = readconf(config_path, 'object-auditor')
         auditor_worker = auditor.AuditorWorker(conf, self.logger,
@@ -362,7 +440,7 @@ class TestAuditor(unittest.TestCase):
         location = AuditLocation(self.disk_file._datadir, 'sda', '0',
                                  policy=self.disk_file.policy)
 
-        data = 'VERIFY'
+        data = b'VERIFY'
         etag = md5()
         timestamp = str(normalize_timestamp(time.time()))
         with self.disk_file.create() as writer:
@@ -440,7 +518,7 @@ class TestAuditor(unittest.TestCase):
         auditor_worker.last_logged = time.time()
         timestamp = str(normalize_timestamp(time.time()))
         pre_errors = auditor_worker.errors
-        data = '0' * 1024
+        data = b'0' * 1024
         etag = md5()
         with self.disk_file.create() as writer:
             writer.write(data)
@@ -464,7 +542,7 @@ class TestAuditor(unittest.TestCase):
         auditor_worker.log_time = 0
         timestamp = str(normalize_timestamp(time.time()))
         pre_quarantines = auditor_worker.quarantines
-        data = '0' * 1024
+        data = b'0' * 1024
 
         def write_file(df):
             with df.create() as writer:
@@ -491,7 +569,7 @@ class TestAuditor(unittest.TestCase):
         self.assertEqual(auditor_worker.stats_buckets[10240], 0)
 
         # pick up some additional code coverage, large file
-        data = '0' * 1024 * 1024
+        data = b'0' * 1024 * 1024
         for df in (self.disk_file, self.disk_file_ec):
             with df.create() as writer:
                 writer.write(data)
@@ -545,7 +623,7 @@ class TestAuditor(unittest.TestCase):
         pre_quarantines = auditor_worker.quarantines
         # pretend that we logged (and reset counters) just now
         auditor_worker.last_logged = time.time()
-        data = '0' * 1024
+        data = b'0' * 1024
         etag = md5()
         with self.disk_file.create() as writer:
             writer.write(data)
@@ -557,7 +635,7 @@ class TestAuditor(unittest.TestCase):
                 'Content-Length': str(os.fstat(writer._fd).st_size),
             }
             writer.put(metadata)
-            os.write(writer._fd, 'extra_data')
+            os.write(writer._fd, b'extra_data')
             writer.commit(Timestamp(timestamp))
         auditor_worker.audit_all_objects()
         self.assertEqual(auditor_worker.quarantines, pre_quarantines + 1)
@@ -569,7 +647,7 @@ class TestAuditor(unittest.TestCase):
         auditor_worker.last_logged = time.time()
         timestamp = str(normalize_timestamp(time.time()))
         pre_quarantines = auditor_worker.quarantines
-        data = '0' * 10
+        data = b'0' * 10
         etag = md5()
         with self.disk_file.create() as writer:
             writer.write(data)
@@ -585,7 +663,7 @@ class TestAuditor(unittest.TestCase):
         auditor_worker.audit_all_objects()
         self.disk_file = self.df_mgr.get_diskfile('sda', '0', 'a', 'c', 'ob',
                                                   policy=POLICIES.legacy)
-        data = '1' * 10
+        data = b'1' * 10
         etag = md5()
         with self.disk_file.create() as writer:
             writer.write(data)
@@ -598,14 +676,14 @@ class TestAuditor(unittest.TestCase):
             }
             writer.put(metadata)
             writer.commit(Timestamp(timestamp))
-            os.write(writer._fd, 'extra_data')
+            os.write(writer._fd, b'extra_data')
         auditor_worker.audit_all_objects()
         self.assertEqual(auditor_worker.quarantines, pre_quarantines + 1)
 
     def test_object_run_fast_track_non_zero(self):
         self.auditor = auditor.ObjectAuditor(self.conf)
         self.auditor.log_time = 0
-        data = '0' * 1024
+        data = b'0' * 1024
         etag = md5()
         with self.disk_file.create() as writer:
             writer.write(data)
@@ -620,7 +698,7 @@ class TestAuditor(unittest.TestCase):
             writer.put(metadata)
             writer.commit(Timestamp(timestamp))
             etag = md5()
-            etag.update('1' + '0' * 1023)
+            etag.update(b'1' + b'0' * 1023)
             etag = etag.hexdigest()
             metadata['ETag'] = etag
             write_metadata(writer._fd, metadata)
@@ -745,6 +823,193 @@ class TestAuditor(unittest.TestCase):
         kwargs = {'mode': 'once'}
         self.auditor.run_audit(**kwargs)
         self.assertFalse(os.path.exists(self.disk_file._datadir))
+
+    def _audit_tombstone(self, conf, ts_tomb, zero_byte_fps=0):
+        self.auditor = auditor.ObjectAuditor(conf)
+        self.auditor.log_time = 0
+        # create tombstone and hashes.pkl file, ensuring the tombstone is not
+        # reclaimed by mocking time to be the tombstone time
+        with mock.patch('time.time', return_value=float(ts_tomb)):
+            self.disk_file.delete(ts_tomb)
+            self.disk_file.manager.get_hashes(
+                self.devices + '/sda', '0', [], self.disk_file.policy)
+        suffix = basename(dirname(self.disk_file._datadir))
+        part_dir = dirname(dirname(self.disk_file._datadir))
+        # sanity checks...
+        self.assertEqual(['%s.ts' % ts_tomb.internal],
+                         os.listdir(self.disk_file._datadir))
+        self.assertTrue(os.path.exists(os.path.join(part_dir, HASH_FILE)))
+        self.assertFalse(os.path.exists(
+            os.path.join(part_dir, HASH_INVALIDATIONS_FILE)))
+        # Run auditor
+        self.auditor.run_audit(mode='once', zero_byte_fps=zero_byte_fps)
+        # sanity check - auditor should not remove tombstone file
+        self.assertEqual(['%s.ts' % ts_tomb.internal],
+                         os.listdir(self.disk_file._datadir))
+        return part_dir, suffix
+
+    def test_non_reclaimable_tombstone(self):
+        # audit with a recent tombstone
+        ts_tomb = Timestamp(time.time() - 55)
+        part_dir, suffix = self._audit_tombstone(self.conf, ts_tomb)
+        self.assertTrue(os.path.exists(os.path.join(part_dir, HASH_FILE)))
+        self.assertFalse(os.path.exists(
+            os.path.join(part_dir, HASH_INVALIDATIONS_FILE)))
+
+    def test_reclaimable_tombstone(self):
+        # audit with a reclaimable tombstone
+        ts_tomb = Timestamp(time.time() - 604800)
+        part_dir, suffix = self._audit_tombstone(self.conf, ts_tomb)
+        self.assertTrue(os.path.exists(os.path.join(part_dir, HASH_FILE)))
+        hash_invalid = os.path.join(part_dir, HASH_INVALIDATIONS_FILE)
+        self.assertTrue(os.path.exists(hash_invalid))
+        with open(hash_invalid, 'rb') as fp:
+            hash_val = fp.read()
+        self.assertEqual(suffix, hash_val.strip('\n'))
+
+    def test_non_reclaimable_tombstone_with_custom_reclaim_age(self):
+        # audit with a tombstone newer than custom reclaim age
+        ts_tomb = Timestamp(time.time() - 604800)
+        conf = dict(self.conf)
+        conf['reclaim_age'] = 2 * 604800
+        part_dir, suffix = self._audit_tombstone(conf, ts_tomb)
+        self.assertTrue(os.path.exists(os.path.join(part_dir, HASH_FILE)))
+        self.assertFalse(os.path.exists(
+            os.path.join(part_dir, HASH_INVALIDATIONS_FILE)))
+
+    def test_reclaimable_tombstone_with_custom_reclaim_age(self):
+        # audit with a tombstone older than custom reclaim age
+        ts_tomb = Timestamp(time.time() - 55)
+        conf = dict(self.conf)
+        conf['reclaim_age'] = 10
+        part_dir, suffix = self._audit_tombstone(conf, ts_tomb)
+        self.assertTrue(os.path.exists(os.path.join(part_dir, HASH_FILE)))
+        hash_invalid = os.path.join(part_dir, HASH_INVALIDATIONS_FILE)
+        self.assertTrue(os.path.exists(hash_invalid))
+        with open(hash_invalid, 'rb') as fp:
+            hash_val = fp.read()
+        self.assertEqual(suffix, hash_val.strip('\n'))
+
+    def test_reclaimable_tombstone_with_zero_byte_fps(self):
+        # audit with a tombstone older than reclaim age by a zero_byte_fps
+        # worker does not invalidate the hash
+        ts_tomb = Timestamp(time.time() - 604800)
+        part_dir, suffix = self._audit_tombstone(
+            self.conf, ts_tomb, zero_byte_fps=50)
+        self.assertTrue(os.path.exists(os.path.join(part_dir, HASH_FILE)))
+        self.assertFalse(os.path.exists(
+            os.path.join(part_dir, HASH_INVALIDATIONS_FILE)))
+
+    def _test_expired_object_is_ignored(self, zero_byte_fps):
+        # verify that an expired object does not get mistaken for a tombstone
+        audit = auditor.ObjectAuditor(self.conf)
+        audit.logger = FakeLogger()
+        audit.log_time = 0
+        now = time.time()
+        write_diskfile(self.disk_file, Timestamp(now - 20),
+                       extra_metadata={'X-Delete-At': now - 10})
+        files = os.listdir(self.disk_file._datadir)
+        self.assertTrue([f for f in files if f.endswith('.data')])  # sanity
+        with mock.patch.object(auditor, 'dump_recon_cache'):
+            audit.run_audit(mode='once', zero_byte_fps=zero_byte_fps)
+        self.assertTrue(os.path.exists(self.disk_file._datadir))
+        part_dir = dirname(dirname(self.disk_file._datadir))
+        self.assertFalse(os.path.exists(
+            os.path.join(part_dir, HASH_INVALIDATIONS_FILE)))
+        self.assertEqual(files, os.listdir(self.disk_file._datadir))
+        self.assertFalse(audit.logger.get_lines_for_level('error'))
+        self.assertFalse(audit.logger.get_lines_for_level('warning'))
+
+    def test_expired_object_is_ignored(self):
+        self._test_expired_object_is_ignored(0)
+
+    def test_expired_object_is_ignored_with_zero_byte_fps(self):
+        self._test_expired_object_is_ignored(50)
+
+    def test_auditor_reclaim_age(self):
+        # if we don't have access to the replicator config section we'll use
+        # diskfile's default
+        auditor_worker = auditor.AuditorWorker(self.conf, self.logger,
+                                               self.rcache, self.devices)
+        router = auditor_worker.diskfile_router
+        for policy in POLICIES:
+            self.assertEqual(router[policy].reclaim_age, 86400 * 7)
+
+        # if the reclaim_age option is set explicitly we use that
+        self.conf['reclaim_age'] = '1800'
+        auditor_worker = auditor.AuditorWorker(self.conf, self.logger,
+                                               self.rcache, self.devices)
+        router = auditor_worker.diskfile_router
+        for policy in POLICIES:
+            self.assertEqual(router[policy].reclaim_age, 1800)
+
+        # if we have a real config we can be a little smarter
+        config_path = os.path.join(self.testdir, 'objserver.conf')
+
+        # if there is no object-replicator section we still have to fall back
+        # to default because we can't parse the config for that section!
+        stub_config = """
+        [object-auditor]
+        """
+        with open(config_path, 'w') as f:
+            f.write(textwrap.dedent(stub_config))
+        conf = readconf(config_path, 'object-auditor')
+        auditor_worker = auditor.AuditorWorker(conf, self.logger,
+                                               self.rcache, self.devices)
+        router = auditor_worker.diskfile_router
+        for policy in POLICIES:
+            self.assertEqual(router[policy].reclaim_age, 86400 * 7)
+
+        # verify reclaim_age is of auditor config value
+        stub_config = """
+                [object-replicator]
+                [object-auditor]
+                reclaim_age = 60
+                """
+        with open(config_path, 'w') as f:
+            f.write(textwrap.dedent(stub_config))
+        conf = readconf(config_path, 'object-auditor')
+        auditor_worker = auditor.AuditorWorker(conf, self.logger,
+                                               self.rcache, self.devices)
+        router = auditor_worker.diskfile_router
+        for policy in POLICIES:
+            self.assertEqual(router[policy].reclaim_age, 60)
+
+        # verify reclaim_age falls back to replicator config value
+        # if there is no auditor config value
+        config_path = os.path.join(self.testdir, 'objserver.conf')
+        stub_config = """
+                [object-replicator]
+                reclaim_age = 60
+                [object-auditor]
+                """
+        with open(config_path, 'w') as f:
+            f.write(textwrap.dedent(stub_config))
+        conf = readconf(config_path, 'object-auditor')
+        auditor_worker = auditor.AuditorWorker(conf, self.logger,
+                                               self.rcache, self.devices)
+        router = auditor_worker.diskfile_router
+        for policy in POLICIES:
+            self.assertEqual(router[policy].reclaim_age, 60)
+
+        # we'll prefer our own DEFAULT section to the replicator though
+        self.assertEqual(auditor_worker.rsync_tempfile_timeout,
+                         replicator.DEFAULT_RSYNC_TIMEOUT + 900)
+        stub_config = """
+        [DEFAULT]
+        reclaim_age = 1209600
+        [object-replicator]
+        reclaim_age = 1800
+        [object-auditor]
+        """
+        with open(config_path, 'w') as f:
+            f.write(textwrap.dedent(stub_config))
+        conf = readconf(config_path, 'object-auditor')
+        auditor_worker = auditor.AuditorWorker(conf, self.logger,
+                                               self.rcache, self.devices)
+        router = auditor_worker.diskfile_router
+        for policy in POLICIES:
+            self.assertEqual(router[policy].reclaim_age, 1209600)
 
     def test_sleeper(self):
         with mock.patch(

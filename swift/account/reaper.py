@@ -73,7 +73,7 @@ class AccountReaper(Daemon):
         self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.myips = whataremyips(conf.get('bind_ip', '0.0.0.0'))
-        self.bind_port = int(conf.get('bind_port', 6002))
+        self.bind_port = int(conf.get('bind_port', 6202))
         self.concurrency = int(conf.get('concurrency', 25))
         self.container_concurrency = self.object_concurrency = \
             sqrt(self.concurrency)
@@ -84,6 +84,7 @@ class AccountReaper(Daemon):
         reap_warn_after = float(conf.get('reap_warn_after') or 86400 * 30)
         self.reap_not_done_after = reap_warn_after + self.delay_reaping
         self.start_time = time()
+        self.reset_stats()
 
     def get_account_ring(self):
         """The account :class:`swift.common.ring.Ring` for the cluster."""
@@ -109,7 +110,7 @@ class AccountReaper(Daemon):
     def run_forever(self, *args, **kwargs):
         """Main entry point when running the reaper in normal daemon mode.
 
-        This repeatedly calls :func:`reap_once` no quicker than the
+        This repeatedly calls :func:`run_once` no quicker than the
         configuration interval.
         """
         self.logger.debug('Daemon started.')

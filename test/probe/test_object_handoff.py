@@ -14,12 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import print_function
+
 from unittest import main
 from uuid import uuid4
 import random
 from hashlib import md5
 from collections import defaultdict
 import os
+import socket
+import errno
 
 from swiftclient import client
 
@@ -46,8 +50,7 @@ class TestObjectHandoff(ReplProbeTest):
         opart, onodes = self.object_ring.get_nodes(
             self.account, container, obj)
         onode = onodes[0]
-        kill_server((onode['ip'], onode['port']),
-                    self.ipport2server, self.pids)
+        kill_server((onode['ip'], onode['port']), self.ipport2server)
 
         # Create container/obj (goes to two primary servers and one handoff)
         client.put_object(self.url, self.token, container, obj, 'VERIFY')
@@ -56,11 +59,17 @@ class TestObjectHandoff(ReplProbeTest):
             raise Exception('Object GET did not return VERIFY, instead it '
                             'returned: %s' % repr(odata))
 
+        # Stash the on disk data from a primary for future comparison with the
+        # handoff - this may not equal 'VERIFY' if for example the proxy has
+        # crypto enabled
+        direct_get_data = direct_client.direct_get_object(
+            onodes[1], opart, self.account, container, obj, headers={
+                'X-Backend-Storage-Policy-Index': self.policy.idx})[-1]
+
         # Kill other two container/obj primary servers
         #   to ensure GET handoff works
         for node in onodes[1:]:
-            kill_server((node['ip'], node['port']),
-                        self.ipport2server, self.pids)
+            kill_server((node['ip'], node['port']), self.ipport2server)
 
         # Indirectly through proxy assert we can get container/obj
         odata = client.get_object(self.url, self.token, container, obj)[-1]
@@ -70,8 +79,7 @@ class TestObjectHandoff(ReplProbeTest):
 
         # Restart those other two container/obj primary servers
         for node in onodes[1:]:
-            start_server((node['ip'], node['port']),
-                         self.ipport2server, self.pids)
+            start_server((node['ip'], node['port']), self.ipport2server)
 
         # We've indirectly verified the handoff node has the container/object,
         #   but let's directly verify it.
@@ -79,9 +87,7 @@ class TestObjectHandoff(ReplProbeTest):
         odata = direct_client.direct_get_object(
             another_onode, opart, self.account, container, obj, headers={
                 'X-Backend-Storage-Policy-Index': self.policy.idx})[-1]
-        if odata != 'VERIFY':
-            raise Exception('Direct object GET did not return VERIFY, instead '
-                            'it returned: %s' % repr(odata))
+        self.assertEqual(direct_get_data, odata)
 
         # drop a tempfile in the handoff's datadir, like it might have
         # had if there was an rsync failure while it was previously a
@@ -114,8 +120,7 @@ class TestObjectHandoff(ReplProbeTest):
                     (cnode['ip'], cnode['port']))
 
         # Bring the first container/obj primary server back up
-        start_server((onode['ip'], onode['port']),
-                     self.ipport2server, self.pids)
+        start_server((onode['ip'], onode['port']), self.ipport2server)
 
         # Assert that it doesn't have container/obj yet
         try:
@@ -147,9 +152,7 @@ class TestObjectHandoff(ReplProbeTest):
         odata = direct_client.direct_get_object(
             onode, opart, self.account, container, obj, headers={
                 'X-Backend-Storage-Policy-Index': self.policy.idx})[-1]
-        if odata != 'VERIFY':
-            raise Exception('Direct object GET did not return VERIFY, instead '
-                            'it returned: %s' % repr(odata))
+        self.assertEqual(direct_get_data, odata)
 
         # and that it does *not* have a temporary rsync dropping!
         found_data_filename = False
@@ -177,8 +180,7 @@ class TestObjectHandoff(ReplProbeTest):
 
         # Kill the first container/obj primary server again (we have two
         #   primaries and the handoff up now)
-        kill_server((onode['ip'], onode['port']),
-                    self.ipport2server, self.pids)
+        kill_server((onode['ip'], onode['port']), self.ipport2server)
 
         # Delete container/obj
         try:
@@ -215,8 +217,7 @@ class TestObjectHandoff(ReplProbeTest):
                     (cnode['ip'], cnode['port']))
 
         # Restart the first container/obj primary server again
-        start_server((onode['ip'], onode['port']),
-                     self.ipport2server, self.pids)
+        start_server((onode['ip'], onode['port']), self.ipport2server)
 
         # Assert it still has container/obj
         direct_client.direct_get_object(
@@ -246,7 +247,7 @@ class TestObjectHandoff(ReplProbeTest):
             self.fail("Expected ClientException but didn't get it")
 
 
-class TestECObjectHandoffOverwrite(ECProbeTest):
+class TestECObjectHandoff(ECProbeTest):
 
     def get_object(self, container_name, object_name):
         headers, body = client.get_object(self.url, self.token,
@@ -279,6 +280,14 @@ class TestECObjectHandoffOverwrite(ECProbeTest):
         # shutdown one of the primary data nodes
         failed_primary = random.choice(onodes)
         failed_primary_device_path = self.device_dir('object', failed_primary)
+        # first read its ec etag value for future reference - this may not
+        # equal old_contents.etag if for example the proxy has crypto enabled
+        req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
+        headers = direct_client.direct_head_object(
+            failed_primary, opart, self.account, container_name,
+            object_name, headers=req_headers)
+        old_backend_etag = headers['X-Object-Sysmeta-EC-Etag']
+
         self.kill_drive(failed_primary_device_path)
 
         # overwrite our object with some new data
@@ -296,13 +305,18 @@ class TestECObjectHandoffOverwrite(ECProbeTest):
             failed_primary, opart, self.account, container_name,
             object_name, headers=req_headers)
         self.assertEqual(headers['X-Object-Sysmeta-EC-Etag'],
-                         old_contents.etag)
+                         old_backend_etag)
 
         # we have 1 primary with wrong old etag, and we should have 5 with
         # new etag plus a handoff with the new etag, so killing 2 other
         # primaries forces proxy to try to GET from all primaries plus handoff.
         other_nodes = [n for n in onodes if n != failed_primary]
         random.shuffle(other_nodes)
+        # grab the value of the new content's ec etag for future reference
+        headers = direct_client.direct_head_object(
+            other_nodes[0], opart, self.account, container_name,
+            object_name, headers=req_headers)
+        new_backend_etag = headers['X-Object-Sysmeta-EC-Etag']
         for node in other_nodes[:2]:
             self.kill_drive(self.device_dir('object', node))
 
@@ -320,8 +334,8 @@ class TestECObjectHandoffOverwrite(ECProbeTest):
                 continue
             found_frags[headers['X-Object-Sysmeta-EC-Etag']] += 1
         self.assertEqual(found_frags, {
-            new_contents.etag: 4,  # this should be enough to rebuild!
-            old_contents.etag: 1,
+            new_backend_etag: 4,  # this should be enough to rebuild!
+            old_backend_etag: 1,
         })
 
         # clear node error limiting
@@ -329,6 +343,122 @@ class TestECObjectHandoffOverwrite(ECProbeTest):
 
         resp_etag = self.get_object(container_name, object_name)
         self.assertEqual(resp_etag, new_contents.etag)
+
+    def _check_nodes(self, opart, onodes, container_name, object_name):
+        found_frags = defaultdict(int)
+        req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
+        for node in onodes + list(self.object_ring.get_more_nodes(opart)):
+            try:
+                headers = direct_client.direct_head_object(
+                    node, opart, self.account, container_name,
+                    object_name, headers=req_headers)
+            except socket.error as e:
+                if e.errno != errno.ECONNREFUSED:
+                    raise
+            except direct_client.DirectClientException as e:
+                if e.http_status != 404:
+                    raise
+            else:
+                found_frags[headers['X-Object-Sysmeta-Ec-Frag-Index']] += 1
+        return found_frags
+
+    def test_ec_handoff_duplicate_available(self):
+        container_name = 'container-%s' % uuid4()
+        object_name = 'object-%s' % uuid4()
+
+        # create EC container
+        headers = {'X-Storage-Policy': self.policy.name}
+        client.put_container(self.url, self.token, container_name,
+                             headers=headers)
+
+        # get our node lists
+        opart, onodes = self.object_ring.get_nodes(
+            self.account, container_name, object_name)
+
+        # find both primary servers that have both of their devices in
+        # the primary node list
+        group_nodes_by_config = defaultdict(list)
+        for n in onodes:
+            group_nodes_by_config[self.config_number(n)].append(n)
+        double_disk_primary = []
+        for config_number, node_list in group_nodes_by_config.items():
+            if len(node_list) > 1:
+                double_disk_primary.append((config_number, node_list))
+
+        # sanity, in a 4+2 with 8 disks two servers will be doubled
+        self.assertEqual(len(double_disk_primary), 2)
+
+        # shutdown the first double primary
+        primary0_config_number, primary0_node_list = double_disk_primary[0]
+        Manager(['object-server']).stop(number=primary0_config_number)
+
+        # PUT object
+        contents = Body()
+        client.put_object(self.url, self.token, container_name,
+                          object_name, contents=contents)
+
+        # sanity fetch two frags on handoffs
+        handoff_frags = []
+        for node in self.object_ring.get_more_nodes(opart):
+            headers, data = direct_client.direct_get_object(
+                node, opart, self.account, container_name, object_name,
+                headers={'X-Backend-Storage-Policy-Index': int(self.policy)}
+            )
+            handoff_frags.append((node, headers, data))
+
+        # bring the first double primary back, and fail the other one
+        Manager(['object-server']).start(number=primary0_config_number)
+        primary1_config_number, primary1_node_list = double_disk_primary[1]
+        Manager(['object-server']).stop(number=primary1_config_number)
+
+        # we can still GET the object
+        resp_etag = self.get_object(container_name, object_name)
+        self.assertEqual(resp_etag, contents.etag)
+
+        # now start to "revert" the first handoff frag
+        node = primary0_node_list[0]
+        handoff_node, headers, data = handoff_frags[0]
+        # N.B. object server api returns quoted ETag
+        headers['ETag'] = headers['Etag'].strip('"')
+        headers['X-Backend-Storage-Policy-Index'] = int(self.policy)
+        direct_client.direct_put_object(
+            node, opart,
+            self.account, container_name, object_name,
+            contents=data, headers=headers)
+
+        # sanity - check available frags
+        frag2count = self._check_nodes(opart, onodes,
+                                       container_name, object_name)
+        # ... five frags total
+        self.assertEqual(sum(frag2count.values()), 5)
+        # ... only 4 unique indexes
+        self.assertEqual(len(frag2count), 4)
+
+        # we can still GET the object
+        resp_etag = self.get_object(container_name, object_name)
+        self.assertEqual(resp_etag, contents.etag)
+
+        # ... but we need both handoffs or we get a error
+        for handoff_node, hdrs, data in handoff_frags:
+            Manager(['object-server']).stop(
+                number=self.config_number(handoff_node))
+            with self.assertRaises(Exception) as cm:
+                self.get_object(container_name, object_name)
+            self.assertIn(cm.exception.http_status, (404, 503))
+            Manager(['object-server']).start(
+                number=self.config_number(handoff_node))
+
+        # fix everything
+        Manager(['object-server']).start(number=primary1_config_number)
+        Manager(["object-reconstructor"]).once()
+
+        # sanity - check available frags
+        frag2count = self._check_nodes(opart, onodes,
+                                       container_name, object_name)
+        # ... six frags total
+        self.assertEqual(sum(frag2count.values()), 6)
+        # ... all six unique
+        self.assertEqual(len(frag2count), 6)
 
 if __name__ == '__main__':
     main()

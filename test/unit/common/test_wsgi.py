@@ -17,7 +17,6 @@
 
 import errno
 import logging
-import mimetools
 import socket
 import unittest
 import os
@@ -25,11 +24,15 @@ from textwrap import dedent
 from collections import defaultdict
 
 from eventlet import listen
+import six
 from six import BytesIO
 from six import StringIO
 from six.moves.urllib.parse import quote
+if six.PY2:
+    import mimetools
 
 import mock
+import nose
 
 import swift.common.middleware.catch_errors
 import swift.common.middleware.gatekeeper
@@ -65,12 +68,17 @@ class TestWSGI(unittest.TestCase):
 
     def setUp(self):
         utils.HASH_PATH_PREFIX = 'startcap'
-        self._orig_parsetype = mimetools.Message.parsetype
+        if six.PY2:
+            self._orig_parsetype = mimetools.Message.parsetype
 
     def tearDown(self):
-        mimetools.Message.parsetype = self._orig_parsetype
+        if six.PY2:
+            mimetools.Message.parsetype = self._orig_parsetype
 
     def test_monkey_patch_mimetools(self):
+        if six.PY3:
+            raise nose.SkipTest('test specific to Python 2')
+
         sio = StringIO('blah')
         self.assertEqual(mimetools.Message(sio).type, 'text/plain')
         sio = StringIO('blah')
@@ -135,6 +143,11 @@ class TestWSGI(unittest.TestCase):
         app = app.app
         expected = swift.common.middleware.gatekeeper.GatekeeperMiddleware
         self.assertTrue(isinstance(app, expected))
+
+        app = app.app
+        expected = \
+            swift.common.middleware.copy.ServerSideCopyMiddleware
+        self.assertIsInstance(app, expected)
 
         app = app.app
         expected = swift.common.middleware.dlo.DynamicLargeObject
@@ -276,7 +289,6 @@ class TestWSGI(unittest.TestCase):
             self.assertTrue(isinstance(sock, MockSocket))
             expected_socket_opts = {
                 socket.SOL_SOCKET: {
-                    socket.SO_REUSEADDR: 1,
                     socket.SO_KEEPALIVE: 1,
                 },
                 socket.IPPROTO_TCP: {
@@ -835,6 +847,11 @@ class TestWSGI(unittest.TestCase):
         self.assertTrue('HTTP_REFERER' in newenv)
         self.assertEqual(newenv['HTTP_REFERER'], 'http://blah.example.com')
 
+    def test_make_env_keeps_infocache(self):
+        oldenv = {'swift.infocache': {}}
+        newenv = wsgi.make_env(oldenv)
+        self.assertIs(newenv.get('swift.infocache'), oldenv['swift.infocache'])
+
 
 class TestServersPerPortStrategy(unittest.TestCase):
     def setUp(self):
@@ -1233,6 +1250,8 @@ class TestWSGIContext(unittest.TestCase):
     def test_app_iter_is_closable(self):
 
         def app(env, start_response):
+            yield ''
+            yield ''
             start_response('200 OK', [('Content-Length', '25')])
             yield 'aaaaa'
             yield 'bbbbb'
@@ -1437,6 +1456,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app),
                          ['swift.common.middleware.catch_errors',
                           'swift.common.middleware.gatekeeper',
+                          'swift.common.middleware.copy',
                           'swift.common.middleware.dlo',
                           'swift.common.middleware.versioned_writes',
                           'swift.proxy.server'])
@@ -1468,6 +1488,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app),
                          ['swift.common.middleware.catch_errors',
                           'swift.common.middleware.gatekeeper',
+                          'swift.common.middleware.copy',
                           'swift.common.middleware.dlo',
                           'swift.common.middleware.versioned_writes',
                           'swift.common.middleware.healthcheck',
@@ -1506,6 +1527,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app),
                          ['swift.common.middleware.catch_errors',
                           'swift.common.middleware.gatekeeper',
+                          'swift.common.middleware.copy',
                           'swift.common.middleware.slo',
                           'swift.common.middleware.dlo',
                           'swift.common.middleware.versioned_writes',
@@ -1605,6 +1627,7 @@ class TestPipelineModification(unittest.TestCase):
         self.assertEqual(self.pipeline_modules(app), [
             'swift.common.middleware.catch_errors',
             'swift.common.middleware.gatekeeper',
+            'swift.common.middleware.copy',
             'swift.common.middleware.dlo',
             'swift.common.middleware.versioned_writes',
             'swift.common.middleware.healthcheck',
@@ -1619,6 +1642,7 @@ class TestPipelineModification(unittest.TestCase):
             'swift.common.middleware.gatekeeper',
             'swift.common.middleware.healthcheck',
             'swift.common.middleware.catch_errors',
+            'swift.common.middleware.copy',
             'swift.common.middleware.dlo',
             'swift.common.middleware.versioned_writes',
             'swift.proxy.server'])
@@ -1632,6 +1656,7 @@ class TestPipelineModification(unittest.TestCase):
             'swift.common.middleware.healthcheck',
             'swift.common.middleware.catch_errors',
             'swift.common.middleware.gatekeeper',
+            'swift.common.middleware.copy',
             'swift.common.middleware.dlo',
             'swift.common.middleware.versioned_writes',
             'swift.proxy.server'])
@@ -1666,7 +1691,7 @@ class TestPipelineModification(unittest.TestCase):
                 tempdir, policy.ring_name + '.ring.gz')
 
         app = wsgi.loadapp(conf_path)
-        proxy_app = app.app.app.app.app.app
+        proxy_app = app.app.app.app.app.app.app
         self.assertEqual(proxy_app.account_ring.serialized_path,
                          account_ring_path)
         self.assertEqual(proxy_app.container_ring.serialized_path,

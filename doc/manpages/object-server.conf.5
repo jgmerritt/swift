@@ -20,7 +20,7 @@
 .SH NAME
 .LP
 .B object-server.conf
-\- configuration file for the openstack-swift object server
+\- configuration file for the OpenStack Swift object server
 
 
 
@@ -56,7 +56,7 @@ are acceptable within this section.
 IP address the object server should bind to. The default is 0.0.0.0 which will make
 it bind to all available addresses.
 .IP "\fBbind_port\fR"
-TCP port the object server should bind to. The default is 6000.
+TCP port the object server should bind to. The default is 6200.
 .IP "\fBbind_timeout\fR"
 Timeout to bind socket. The default is 30.
 .IP \fBbacklog\fR
@@ -77,7 +77,7 @@ The system user that the object server will run as. The default is swift.
 .IP \fBswift_dir\fR
 Swift configuration directory. The default is /etc/swift.
 .IP \fBdevices\fR
-Parent directory or where devices are mounted. Default is /srv/node.
+Parent directory of where devices are mounted. Default is /srv/node.
 .IP \fBmount_check\fR
 Whether or not check if the devices are mounted to prevent accidentally writing to
 the root device. The default is set to true.
@@ -88,10 +88,9 @@ The default is 86400.
 .IP \fBexpiring_objects_account_name\fR
 The default is 'expiring_objects'.
 .IP \fBservers_per_port\fR
-Make object-server run this many worker processes per unique port of
-"local" ring devices across all storage policies.  This can help provide
-the isolation of threads_per_disk without the severe overhead.  The default
-value of 0 disables this feature.
+Make object-server run this many worker processes per unique port of "local"
+ring devices across all storage policies. The default value of 0 disables this
+feature.
 .IP \fBlog_name\fR
 Label used when logging. The default is swift.
 .IP \fBlog_facility\fR
@@ -126,8 +125,10 @@ The default is empty.
 .IP \fBeventlet_debug\fR
 Debug mode for eventlet library. The default is false.
 .IP \fBfallocate_reserve\fR
-You can set fallocate_reserve to the number of bytes you'd like fallocate to
-reserve, whether there is space for the given file size or not. The default is 0.
+You can set fallocate_reserve to the number of bytes or percentage of disk
+space you'd like fallocate to reserve, whether there is space for the given
+file size or not. Percentage will be used if the value ends with a '%'.
+The default is 1%.
 .IP \fBnode_timeout\fR
 Request timeout to external services. The default is 3 seconds.
 .IP \fBconn_timeout\fR
@@ -141,6 +142,20 @@ backend node. The default is 60.
 The default is 65536.
 .IP \fBdisk_chunk_size\fR
 The default is 65536.
+.IP \fBnice_priority\fR
+Modify scheduling priority of server processes. Niceness values range from -20
+(most favorable to the process) to 19 (least favorable to the process).
+The default does not modify priority.
+.IP \fBionice_class\fR
+Modify I/O scheduling class of server processes. I/O niceness class values
+are IOPRIO_CLASS_RT (realtime), IOPRIO_CLASS_BE (best-effort) and IOPRIO_CLASS_IDLE (idle).
+The default does not modify class and priority.
+Work only with ionice_priority.
+.IP \fBionice_priority\fR
+Modify I/O scheduling priority of server processes. I/O niceness priority
+is a number which goes from 0 to 7. The higher the value, the lower
+the I/O priority of the process. Work only with ionice_class.
+Ignored if IOPRIO_CLASS_IDLE is set.
 .RE
 .PD
 
@@ -232,6 +247,26 @@ version 3.0 or greater. If you set "splice = yes" but the kernel
 does not support it, error messages will appear in the object server
 logs at startup, but your object servers should continue to function.
 The default is false.
+.IP \fBnode_timeout\fR
+Request timeout to external services. The default is 3 seconds.
+.IP \fBconn_timeout\fR
+Connection timeout to external services. The default is 0.5 seconds.
+.IP \fBcontainer_update_timeout\fR
+Time to wait while sending a container update on object update. The default is 1 second.
+.IP \fBnice_priority\fR
+Modify scheduling priority of server processes. Niceness values range from -20
+(most favorable to the process) to 19 (least favorable to the process).
+The default does not modify priority.
+.IP \fBionice_class\fR
+Modify I/O scheduling class of server processes. I/O niceness class values
+are IOPRIO_CLASS_RT (realtime), IOPRIO_CLASS_BE (best-effort) and IOPRIO_CLASS_IDLE (idle).
+The default does not modify class and priority.
+Work only with ionice_priority.
+.IP \fBionice_priority\fR
+Modify I/O scheduling priority of server processes. I/O niceness priority
+is a number which goes from 0 to 7. The higher the value, the lower
+the I/O priority of the process. Work only with ionice_class.
+Ignored if IOPRIO_CLASS_IDLE is set.
 .RE
 .PD
 
@@ -344,7 +379,7 @@ a different region than the local one.
 NOTE: Objects that are already compressed (for example: .tar.gz, .mp3) might
 slow down the syncing process. The default is false.
 .IP \fBrsync_module\fR
-Format of the rysnc module where the replicator will send data. See
+Format of the rsync module where the replicator will send data. See
 etc/rsyncd.conf-sample for some usage examples. The default is empty.
 .IP \fBnode_timeout\fR
 Request timeout to external services. The default is 10 seconds.
@@ -385,6 +420,20 @@ The handoffs_first and handoff_delete are options for a special case
 such as disk full in the cluster. These two options SHOULD NOT BE
 CHANGED, except for such an extreme situations. (e.g. disks filled up
 or are about to fill up. Anyway, DO NOT let your drives fill up).
+.IP \fBnice_priority\fR
+Modify scheduling priority of server processes. Niceness values range from -20
+(most favorable to the process) to 19 (least favorable to the process).
+The default does not modify priority.
+.IP \fBionice_class\fR
+Modify I/O scheduling class of server processes. I/O niceness class values
+are IOPRIO_CLASS_RT (realtime), IOPRIO_CLASS_BE (best-effort) and IOPRIO_CLASS_IDLE (idle).
+The default does not modify class and priority.
+Work only with ionice_priority.
+.IP \fBionice_priority\fR
+Modify I/O scheduling priority of server processes. I/O niceness priority
+is a number which goes from 0 to 7. The higher the value, the lower
+the I/O priority of the process. Work only with ionice_class.
+Ignored if IOPRIO_CLASS_IDLE is set.
 .RE
 
 
@@ -460,6 +509,20 @@ Slowdown will sleep that amount between objects. The default is 0.01 seconds.
 The recon_cache_path simply sets the directory where stats for a few items will be stored.
 Depending on the method of deployment you may need to create this directory manually
 and ensure that swift has read/write. The default is /var/cache/swift.
+.IP \fBnice_priority\fR
+Modify scheduling priority of server processes. Niceness values range from -20
+(most favorable to the process) to 19 (least favorable to the process).
+The default does not modify priority.
+.IP \fBionice_class\fR
+Modify I/O scheduling class of server processes. I/O niceness class values
+are IOPRIO_CLASS_RT (realtime), IOPRIO_CLASS_BE (best-effort) and IOPRIO_CLASS_IDLE (idle).
+The default does not modify class and priority.
+Work only with ionice_priority.
+.IP \fBionice_priority\fR
+Modify I/O scheduling priority of server processes. I/O niceness priority
+is a number which goes from 0 to 7. The higher the value, the lower
+the I/O priority of the process. Work only with ionice_class.
+Ignored if IOPRIO_CLASS_IDLE is set.
 .RE
 .PD
 
@@ -502,6 +565,20 @@ points and report the result after a full scan.
 .IP \fBrsync_tempfile_timeout\fR
 Time elapsed in seconds before rsync tempfiles will be unlinked. Config value of "auto"
 will try to use object-replicator's rsync_timeout + 900 or fall-back to 86400 (1 day).
+.IP \fBnice_priority\fR
+Modify scheduling priority of server processes. Niceness values range from -20
+(most favorable to the process) to 19 (least favorable to the process).
+The default does not modify priority.
+.IP \fBionice_class\fR
+Modify I/O scheduling class of server processes. I/O niceness class values
+are IOPRIO_CLASS_RT (realtime), IOPRIO_CLASS_BE (best-effort) and IOPRIO_CLASS_IDLE (idle).
+The default does not modify class and priority.
+Work only with ionice_priority.
+.IP \fBionice_priority\fR
+Modify I/O scheduling priority of server processes. I/O niceness priority
+is a number which goes from 0 to 7. The higher the value, the lower
+the I/O priority of the process. Work only with ionice_class.
+Ignored if IOPRIO_CLASS_IDLE is set.
 .RE
 
 
@@ -510,7 +587,7 @@ will try to use object-replicator's rsync_timeout + 900 or fall-back to 86400 (1
 .SH DOCUMENTATION
 .LP
 More in depth documentation about the swift-object-server and
-also Openstack-Swift as a whole can be found at
+also OpenStack Swift as a whole can be found at
 .BI http://swift.openstack.org/admin_guide.html
 and
 .BI http://swift.openstack.org

@@ -85,13 +85,17 @@ available to download the first set of segments.
 
 .. note::
 
+    When updating a manifest object using a POST request, a
+    ``X-Object-Manifest`` header must be included for the object to
+    continue to behave as a manifest object.
+
     The manifest file should have no content. However, this is not enforced.
     If the manifest path itself conforms to container/prefix specified in
-    X-Object-Manifest, and if manifest has some content/data in it, it would
-    also be considered as segment and manifest's content will be part of the
-    concatenated GET response. The order of concatenation follows the usual DLO
-    logic which is - the order of concatenation adheres to order returned when
-    segment names are sorted.
+    ``X-Object-Manifest``, and if manifest has some content/data in it, it
+    would also be considered as segment and manifest's content will be part of
+    the concatenated GET response. The order of concatenation follows the usual
+    DLO logic which is - the order of concatenation adheres to order returned
+    when segment names are sorted.
 
 
 Here's an example using ``curl`` with tiny 1-byte segments::
@@ -405,11 +409,6 @@ class DynamicLargeObject(object):
         except ValueError:
             return self.app(env, start_response)
 
-        # install our COPY-callback hook
-        env['swift.copy_hook'] = self.copy_hook(
-            env.get('swift.copy_hook',
-                    lambda src_req, src_resp, sink_req: src_resp))
-
         if ((req.method == 'GET' or req.method == 'HEAD') and
                 req.params.get('multipart-manifest') != 'get'):
             return GetContext(self, self.logger).\
@@ -437,24 +436,6 @@ class DynamicLargeObject(object):
                     request=req,
                     body=('X-Object-Manifest must be in the '
                           'format container/prefix'))
-
-    def copy_hook(self, inner_hook):
-
-        def dlo_copy_hook(source_req, source_resp, sink_req):
-            x_o_m = source_resp.headers.get('X-Object-Manifest')
-            if x_o_m:
-                if source_req.params.get('multipart-manifest') == 'get':
-                    # To copy the manifest, we let the copy proceed as normal,
-                    # but ensure that X-Object-Manifest is set on the new
-                    # object.
-                    sink_req.headers['X-Object-Manifest'] = x_o_m
-                else:
-                    ctx = GetContext(self, self.logger)
-                    source_resp = ctx.get_or_head_response(
-                        source_req, x_o_m, source_resp.headers.items())
-            return inner_hook(source_req, source_resp, sink_req)
-
-        return dlo_copy_hook
 
 
 def filter_factory(global_conf, **local_conf):

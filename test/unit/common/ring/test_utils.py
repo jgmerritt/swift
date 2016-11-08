@@ -19,8 +19,7 @@ from swift.common import ring
 from swift.common.ring.utils import (tiers_for_dev, build_tier_tree,
                                      validate_and_normalize_ip,
                                      validate_and_normalize_address,
-                                     is_valid_ip, is_valid_ipv4,
-                                     is_valid_ipv6, is_valid_hostname,
+                                     is_valid_hostname,
                                      is_local_device, parse_search_value,
                                      parse_search_values_from_opts,
                                      parse_change_values_from_opts,
@@ -34,33 +33,33 @@ class TestUtils(unittest.TestCase):
 
     def setUp(self):
         self.test_dev = {'region': 1, 'zone': 1, 'ip': '192.168.1.1',
-                         'port': '6000', 'id': 0}
+                         'port': '6200', 'id': 0}
 
         def get_test_devs():
             dev0 = {'region': 1, 'zone': 1, 'ip': '192.168.1.1',
-                    'port': '6000', 'id': 0}
+                    'port': '6200', 'id': 0}
             dev1 = {'region': 1, 'zone': 1, 'ip': '192.168.1.1',
-                    'port': '6000', 'id': 1}
+                    'port': '6200', 'id': 1}
             dev2 = {'region': 1, 'zone': 1, 'ip': '192.168.1.1',
-                    'port': '6000', 'id': 2}
+                    'port': '6200', 'id': 2}
             dev3 = {'region': 1, 'zone': 1, 'ip': '192.168.1.2',
-                    'port': '6000', 'id': 3}
+                    'port': '6200', 'id': 3}
             dev4 = {'region': 1, 'zone': 1, 'ip': '192.168.1.2',
-                    'port': '6000', 'id': 4}
+                    'port': '6200', 'id': 4}
             dev5 = {'region': 1, 'zone': 1, 'ip': '192.168.1.2',
-                    'port': '6000', 'id': 5}
+                    'port': '6200', 'id': 5}
             dev6 = {'region': 1, 'zone': 2, 'ip': '192.168.2.1',
-                    'port': '6000', 'id': 6}
+                    'port': '6200', 'id': 6}
             dev7 = {'region': 1, 'zone': 2, 'ip': '192.168.2.1',
-                    'port': '6000', 'id': 7}
+                    'port': '6200', 'id': 7}
             dev8 = {'region': 1, 'zone': 2, 'ip': '192.168.2.1',
-                    'port': '6000', 'id': 8}
+                    'port': '6200', 'id': 8}
             dev9 = {'region': 1, 'zone': 2, 'ip': '192.168.2.2',
-                    'port': '6000', 'id': 9}
+                    'port': '6200', 'id': 9}
             dev10 = {'region': 1, 'zone': 2, 'ip': '192.168.2.2',
-                     'port': '6000', 'id': 10}
+                     'port': '6200', 'id': 10}
             dev11 = {'region': 1, 'zone': 2, 'ip': '192.168.2.2',
-                     'port': '6000', 'id': 11}
+                     'port': '6200', 'id': 11}
             return [dev0, dev1, dev2, dev3, dev4, dev5,
                     dev6, dev7, dev8, dev9, dev10, dev11]
 
@@ -102,78 +101,6 @@ class TestUtils(unittest.TestCase):
                               (1, 2, '192.168.2.2', 10),
                               (1, 2, '192.168.2.2', 11)]))
 
-    def test_is_valid_ip(self):
-        self.assertTrue(is_valid_ip("127.0.0.1"))
-        self.assertTrue(is_valid_ip("10.0.0.1"))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80::204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80::204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "fe80::"
-        self.assertTrue(is_valid_ip(ipv6))
-        ipv6 = "::1"
-        self.assertTrue(is_valid_ip(ipv6))
-        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
-        self.assertFalse(is_valid_ip(not_ipv6))
-        not_ipv6 = "1:2:3:4:5:6::7:8"
-        self.assertFalse(is_valid_ip(not_ipv6))
-
-    def test_is_valid_ipv4(self):
-        self.assertTrue(is_valid_ipv4("127.0.0.1"))
-        self.assertTrue(is_valid_ipv4("10.0.0.1"))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80::204:61ff:fe9d:f156"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80::204:61ff:254.157.241.86"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "fe80::"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        ipv6 = "::1"
-        self.assertFalse(is_valid_ipv4(ipv6))
-        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
-        self.assertFalse(is_valid_ipv4(not_ipv6))
-        not_ipv6 = "1:2:3:4:5:6::7:8"
-        self.assertFalse(is_valid_ipv4(not_ipv6))
-
-    def test_is_valid_ipv6(self):
-        self.assertFalse(is_valid_ipv6("127.0.0.1"))
-        self.assertFalse(is_valid_ipv6("10.0.0.1"))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80::204:61ff:fe9d:f156"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80::204:61ff:254.157.241.86"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "fe80::"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        ipv6 = "::1"
-        self.assertTrue(is_valid_ipv6(ipv6))
-        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
-        self.assertFalse(is_valid_ipv6(not_ipv6))
-        not_ipv6 = "1:2:3:4:5:6::7:8"
-        self.assertFalse(is_valid_ipv6(not_ipv6))
-
     def test_is_valid_hostname(self):
         self.assertTrue(is_valid_hostname("local"))
         self.assertTrue(is_valid_hostname("test.test.com"))
@@ -188,7 +115,7 @@ class TestUtils(unittest.TestCase):
     def test_is_local_device(self):
         # localhost shows up in whataremyips() output as "::1" for IPv6
         my_ips = ["127.0.0.1", "::1"]
-        my_port = 6000
+        my_port = 6200
         self.assertTrue(is_local_device(my_ips, my_port,
                                         "127.0.0.1", my_port))
         self.assertTrue(is_local_device(my_ips, my_port,
@@ -281,14 +208,14 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "test.test.com",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "r.test.com",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "change.test.test.com",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "change.r.test.com",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -298,7 +225,7 @@ class TestUtils(unittest.TestCase):
             'region': 2,
             'zone': 3,
             'ip': "test.test.com",
-            'port': 6000,
+            'port': 6200,
             'replication_ip': "r.test.com",
             'replication_port': 7000,
             'device': "sda3",
@@ -312,14 +239,14 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "127.0.0.1",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "127.0.0.10",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "127.0.0.2",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "127.0.0.20",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -329,7 +256,7 @@ class TestUtils(unittest.TestCase):
             'region': 2,
             'zone': 3,
             'ip': "127.0.0.1",
-            'port': 6000,
+            'port': 6200,
             'replication_ip': "127.0.0.10",
             'replication_port': 7000,
             'device': "sda3",
@@ -343,14 +270,14 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "[127.0.0.1]",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "[127.0.0.10]",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "[127.0.0.2]",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "[127.0.0.20]",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -363,21 +290,21 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "test.test.com",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "r.test.com",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "change.test.test.com",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "change.r.test.com",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
              "--change-meta", "some meta data for change"]
         expected = {
             'ip': "change.test.test.com",
-            'port': 6001,
+            'port': 6201,
             'replication_ip': "change.r.test.com",
             'replication_port': 7001,
             'device': "sdb3",
@@ -390,21 +317,21 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "127.0.0.1",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "127.0.0.10",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "127.0.0.2",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "127.0.0.20",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
              "--change-meta", "some meta data for change"]
         expected = {
             'ip': "127.0.0.2",
-            'port': 6001,
+            'port': 6201,
             'replication_ip': "127.0.0.20",
             'replication_port': 7001,
             'device': "sdb3",
@@ -417,14 +344,14 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "[127.0.0.1]",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "[127.0.0.10]",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "[127.0.0.2]",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "[127.0.0.20]",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -437,14 +364,14 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "test.test.com",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "r.test.com",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "change.test.test.com",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "change.r.test.com",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -455,14 +382,14 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(opts.region, 2)
         self.assertEqual(opts.zone, 3)
         self.assertEqual(opts.ip, "test.test.com")
-        self.assertEqual(opts.port, 6000)
+        self.assertEqual(opts.port, 6200)
         self.assertEqual(opts.replication_ip, "r.test.com")
         self.assertEqual(opts.replication_port, 7000)
         self.assertEqual(opts.device, "sda3")
         self.assertEqual(opts.meta, "some meta data")
         self.assertEqual(opts.weight, 3.14159265359)
         self.assertEqual(opts.change_ip, "change.test.test.com")
-        self.assertEqual(opts.change_port, 6001)
+        self.assertEqual(opts.change_port, 6201)
         self.assertEqual(opts.change_replication_ip, "change.r.test.com")
         self.assertEqual(opts.change_replication_port, 7001)
         self.assertEqual(opts.change_device, "sdb3")
@@ -497,7 +424,7 @@ class TestUtils(unittest.TestCase):
              "--meta", "",
              "--weight", None,
              "--change-ip", "change.test.test.com",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "change.r.test.com",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -526,14 +453,14 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--id", "1", "--region", "2", "--zone", "3",
              "--ip", "test.test.com",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "r.test.com",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359",
              "--change-ip", "change.test.test.com",
-             "--change-port", "6001",
+             "--change-port", "6201",
              "--change-replication-ip", "change.r.test.com",
              "--change-replication-port", "7001",
              "--change-device", "sdb3",
@@ -544,14 +471,14 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(opts.region, 2)
         self.assertEqual(opts.zone, 3)
         self.assertEqual(opts.ip, "test.test.com")
-        self.assertEqual(opts.port, 6000)
+        self.assertEqual(opts.port, 6200)
         self.assertEqual(opts.replication_ip, "r.test.com")
         self.assertEqual(opts.replication_port, 7000)
         self.assertEqual(opts.device, "sda3")
         self.assertEqual(opts.meta, "some meta data")
         self.assertEqual(opts.weight, 3.14159265359)
         self.assertEqual(opts.change_ip, "change.test.test.com")
-        self.assertEqual(opts.change_port, 6001)
+        self.assertEqual(opts.change_port, 6201)
         self.assertEqual(opts.change_replication_ip, "change.r.test.com")
         self.assertEqual(opts.change_replication_port, 7001)
         self.assertEqual(opts.change_device, "sdb3")
@@ -579,19 +506,19 @@ class TestUtils(unittest.TestCase):
 
     def test_build_dev_from_opts(self):
         argv = \
-            ["--region", "2", "--zone", "3",
+            ["--region", "0", "--zone", "3",
              "--ip", "test.test.com",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "r.test.com",
              "--replication-port", "7000",
              "--device", "sda3",
              "--meta", "some meta data",
              "--weight", "3.14159265359"]
         expected = {
-            'region': 2,
+            'region': 0,
             'zone': 3,
             'ip': "test.test.com",
-            'port': 6000,
+            'port': 6200,
             'replication_ip': "r.test.com",
             'replication_port': 7000,
             'device': "sda3",
@@ -605,7 +532,7 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--region", "2", "--zone", "3",
              "--ip", "[test.test.com]",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "[r.test.com]",
              "--replication-port", "7000",
              "--device", "sda3",
@@ -617,7 +544,7 @@ class TestUtils(unittest.TestCase):
         argv = \
             ["--region", "2", "--zone", "3",
              "--ip", "[test.test.com]",
-             "--port", "6000",
+             "--port", "6200",
              "--replication-ip", "[r.test.com]",
              "--replication-port", "7000",
              "--meta", "some meta data",
@@ -750,11 +677,11 @@ class TestUtils(unittest.TestCase):
 
     def test_parse_address_old_format(self):
         # Test old format
-        argv = "127.0.0.1:6000R127.0.0.1:6000/sda1_some meta data"
+        argv = "127.0.0.1:6200R127.0.0.1:6200/sda1_some meta data"
         ip, port, rest = parse_address(argv)
         self.assertEqual(ip, '127.0.0.1')
-        self.assertEqual(port, 6000)
-        self.assertEqual(rest, 'R127.0.0.1:6000/sda1_some meta data')
+        self.assertEqual(port, 6200)
+        self.assertEqual(rest, 'R127.0.0.1:6200/sda1_some meta data')
 
 
 if __name__ == '__main__':

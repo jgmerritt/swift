@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import sys
 import time
 import signal
 from re import sub
@@ -46,9 +45,10 @@ class Daemon(object):
         utils.capture_stdio(self.logger, **kwargs)
 
         def kill_children(*args):
+            self.logger.info('SIGTERM received')
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             os.killpg(0, signal.SIGTERM)
-            sys.exit()
+            os._exit(0)
 
         signal.signal(signal.SIGTERM, kill_children)
         if once:
@@ -88,13 +88,15 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
                                   log_to_console=kwargs.pop('verbose', False),
                                   log_route=section_name)
 
+    # optional nice/ionice priority scheduling
+    utils.modify_priority(conf, logger)
+
     # disable fallocate if desired
     if utils.config_true_value(conf.get('disable_fallocate', 'no')):
         utils.disable_fallocate()
     # set utils.FALLOCATE_RESERVE if desired
-    reserve = int(conf.get('fallocate_reserve', 0))
-    if reserve > 0:
-        utils.FALLOCATE_RESERVE = reserve
+    utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+        utils.config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
     # By default, disable eventlet printing stacktraces
     eventlet_debug = utils.config_true_value(conf.get('eventlet_debug', 'no'))

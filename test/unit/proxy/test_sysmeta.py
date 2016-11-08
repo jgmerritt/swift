@@ -19,6 +19,8 @@ import unittest
 import os
 from tempfile import mkdtemp
 import shutil
+
+from swift.common.middleware.copy import ServerSideCopyMiddleware
 from swift.common.storage_policy import StoragePolicy
 from swift.common.swob import Request
 from swift.common.utils import mkdirs, split_path
@@ -26,6 +28,7 @@ from swift.common.wsgi import monkey_patch_mimetools, WSGIContext
 from swift.obj import server as object_server
 from swift.proxy import server as proxy
 import swift.proxy.controllers
+from swift.proxy.controllers.base import get_object_info
 from test.unit import FakeMemcache, debug_logger, FakeRing, \
     fake_http_connect, patch_policies
 
@@ -116,15 +119,15 @@ class TestObjectSysmeta(unittest.TestCase):
 
     def _assertInHeaders(self, resp, expected):
         for key, val in expected.items():
-            self.assertTrue(key in resp.headers,
-                            'Header %s missing from %s' % (key, resp.headers))
+            self.assertIn(key, resp.headers,
+                          'Header %s missing from %s' % (key, resp.headers))
             self.assertEqual(val, resp.headers[key],
                              'Expected header %s:%s, got %s:%s'
                              % (key, val, key, resp.headers[key]))
 
     def _assertNotInHeaders(self, resp, unexpected):
         for key, val in unexpected.items():
-            self.assertFalse(key in resp.headers,
+            self.assertNotIn(key, resp.headers,
                              'Header %s not expected in %s'
                              % (key, resp.headers))
 
@@ -133,6 +136,7 @@ class TestObjectSysmeta(unittest.TestCase):
                                      logger=debug_logger('proxy-ut'),
                                      account_ring=FakeRing(replicas=1),
                                      container_ring=FakeRing(replicas=1))
+        self.copy_app = ServerSideCopyMiddleware(self.app, {})
         monkey_patch_mimetools()
         self.tmpdir = mkdtemp()
         self.testdir = os.path.join(self.tmpdir,
@@ -169,6 +173,17 @@ class TestObjectSysmeta(unittest.TestCase):
                             'x-object-meta-test1': 'meta1 changed'}
     new_meta_headers = {'x-object-meta-test3': 'meta3'}
     bad_headers = {'x-account-sysmeta-test1': 'bad1'}
+    # these transient_sysmeta headers get changed...
+    original_transient_sysmeta_headers_1 = \
+        {'x-object-transient-sysmeta-testA': 'A'}
+    # these transient_sysmeta headers get deleted...
+    original_transient_sysmeta_headers_2 = \
+        {'x-object-transient-sysmeta-testB': 'B'}
+    # these are replacement transient_sysmeta headers
+    changed_transient_sysmeta_headers = \
+        {'x-object-transient-sysmeta-testA': 'changed_A'}
+    new_transient_sysmeta_headers_1 = {'x-object-transient-sysmeta-testC': 'C'}
+    new_transient_sysmeta_headers_2 = {'x-object-transient-sysmeta-testD': 'D'}
 
     def test_PUT_sysmeta_then_GET(self):
         path = '/v1/a/c/o'
@@ -177,6 +192,7 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_meta_headers_1)
         hdrs.update(self.bad_headers)
+        hdrs.update(self.original_transient_sysmeta_headers_1)
         req = Request.blank(path, environ=env, headers=hdrs, body='x')
         resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
@@ -186,6 +202,7 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.original_sysmeta_headers_1)
         self._assertInHeaders(resp, self.original_meta_headers_1)
+        self._assertInHeaders(resp, self.original_transient_sysmeta_headers_1)
         self._assertNotInHeaders(resp, self.bad_headers)
 
     def test_PUT_sysmeta_then_HEAD(self):
@@ -195,6 +212,7 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_meta_headers_1)
         hdrs.update(self.bad_headers)
+        hdrs.update(self.original_transient_sysmeta_headers_1)
         req = Request.blank(path, environ=env, headers=hdrs, body='x')
         resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
@@ -205,6 +223,7 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.original_sysmeta_headers_1)
         self._assertInHeaders(resp, self.original_meta_headers_1)
+        self._assertInHeaders(resp, self.original_transient_sysmeta_headers_1)
         self._assertNotInHeaders(resp, self.bad_headers)
 
     def test_sysmeta_replaced_by_PUT(self):
@@ -239,7 +258,7 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.new_meta_headers)
         self._assertNotInHeaders(resp, self.original_meta_headers_2)
 
-    def _test_sysmeta_not_updated_by_POST(self):
+    def _test_sysmeta_not_updated_by_POST(self, app):
         # check sysmeta is not changed by a POST but user meta is replaced
         path = '/v1/a/c/o'
 
@@ -247,7 +266,7 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_meta_headers_1)
         req = Request.blank(path, environ=env, headers=hdrs, body='x')
-        resp = req.get_response(self.app)
+        resp = req.get_response(app)
         self._assertStatus(resp, 201)
 
         env = {'REQUEST_METHOD': 'POST'}
@@ -257,11 +276,11 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs.update(self.new_meta_headers)
         hdrs.update(self.bad_headers)
         req = Request.blank(path, environ=env, headers=hdrs)
-        resp = req.get_response(self.app)
+        resp = req.get_response(app)
         self._assertStatus(resp, 202)
 
         req = Request.blank(path, environ={})
-        resp = req.get_response(self.app)
+        resp = req.get_response(app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.original_sysmeta_headers_1)
         self._assertNotInHeaders(resp, self.new_sysmeta_headers)
@@ -274,26 +293,28 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.bad_headers)
         req = Request.blank(path, environ=env, headers=hdrs, body='x')
-        resp = req.get_response(self.app)
+        resp = req.get_response(app)
         self._assertStatus(resp, 201)
 
         req = Request.blank(path, environ={})
-        resp = req.get_response(self.app)
+        resp = req.get_response(app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
         self._assertInHeaders(resp, self.new_sysmeta_headers)
         self._assertNotInHeaders(resp, self.original_sysmeta_headers_2)
 
     def test_sysmeta_not_updated_by_POST(self):
-        self.app.object_post_as_copy = False
-        self._test_sysmeta_not_updated_by_POST()
+        # test fast-post by issuing requests to the proxy app
+        self._test_sysmeta_not_updated_by_POST(self.app)
 
     def test_sysmeta_not_updated_by_POST_as_copy(self):
-        self.app.object_post_as_copy = True
-        self._test_sysmeta_not_updated_by_POST()
+        # test post-as-copy by issuing requests to the copy middleware app
+        self.copy_app.object_post_as_copy = True
+        self._test_sysmeta_not_updated_by_POST(self.copy_app)
 
     def test_sysmeta_updated_by_COPY(self):
-        # check sysmeta is updated by a COPY in same way as user meta
+        # check sysmeta is updated by a COPY in same way as user meta by
+        # issuing requests to the copy middleware app
         path = '/v1/a/c/o'
         dest = '/c/o2'
         env = {'REQUEST_METHOD': 'PUT'}
@@ -301,8 +322,10 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs.update(self.original_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_1)
         hdrs.update(self.original_meta_headers_2)
+        hdrs.update(self.original_transient_sysmeta_headers_1)
+        hdrs.update(self.original_transient_sysmeta_headers_2)
         req = Request.blank(path, environ=env, headers=hdrs, body='x')
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 201)
 
         env = {'REQUEST_METHOD': 'COPY'}
@@ -310,10 +333,12 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.changed_meta_headers)
         hdrs.update(self.new_meta_headers)
+        hdrs.update(self.changed_transient_sysmeta_headers)
+        hdrs.update(self.new_transient_sysmeta_headers_1)
         hdrs.update(self.bad_headers)
         hdrs.update({'Destination': dest})
         req = Request.blank(path, environ=env, headers=hdrs)
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 201)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
         self._assertInHeaders(resp, self.new_sysmeta_headers)
@@ -321,10 +346,13 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.changed_meta_headers)
         self._assertInHeaders(resp, self.new_meta_headers)
         self._assertInHeaders(resp, self.original_meta_headers_2)
+        self._assertInHeaders(resp, self.changed_transient_sysmeta_headers)
+        self._assertInHeaders(resp, self.new_transient_sysmeta_headers_1)
+        self._assertInHeaders(resp, self.original_transient_sysmeta_headers_2)
         self._assertNotInHeaders(resp, self.bad_headers)
 
         req = Request.blank('/v1/a/c/o2', environ={})
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
         self._assertInHeaders(resp, self.new_sysmeta_headers)
@@ -332,10 +360,14 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.changed_meta_headers)
         self._assertInHeaders(resp, self.new_meta_headers)
         self._assertInHeaders(resp, self.original_meta_headers_2)
+        self._assertInHeaders(resp, self.changed_transient_sysmeta_headers)
+        self._assertInHeaders(resp, self.new_transient_sysmeta_headers_1)
+        self._assertInHeaders(resp, self.original_transient_sysmeta_headers_2)
         self._assertNotInHeaders(resp, self.bad_headers)
 
     def test_sysmeta_updated_by_COPY_from(self):
-        # check sysmeta is updated by a COPY in same way as user meta
+        # check sysmeta is updated by a PUT with x-copy-from in same way as
+        # user meta by issuing requests to the copy middleware app
         path = '/v1/a/c/o'
         env = {'REQUEST_METHOD': 'PUT'}
         hdrs = dict(self.original_sysmeta_headers_1)
@@ -343,7 +375,7 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs.update(self.original_meta_headers_1)
         hdrs.update(self.original_meta_headers_2)
         req = Request.blank(path, environ=env, headers=hdrs, body='x')
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 201)
 
         env = {'REQUEST_METHOD': 'PUT'}
@@ -354,7 +386,7 @@ class TestObjectSysmeta(unittest.TestCase):
         hdrs.update(self.bad_headers)
         hdrs.update({'X-Copy-From': '/c/o'})
         req = Request.blank('/v1/a/c/o2', environ=env, headers=hdrs, body='')
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 201)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
         self._assertInHeaders(resp, self.new_sysmeta_headers)
@@ -365,7 +397,7 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertNotInHeaders(resp, self.bad_headers)
 
         req = Request.blank('/v1/a/c/o2', environ={})
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
         self._assertInHeaders(resp, self.new_sysmeta_headers)
@@ -374,3 +406,84 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.new_meta_headers)
         self._assertInHeaders(resp, self.original_meta_headers_2)
         self._assertNotInHeaders(resp, self.bad_headers)
+
+    def _test_transient_sysmeta_replaced_by_PUT_or_POST(self, app):
+        # check transient_sysmeta is replaced en-masse by a POST
+        path = '/v1/a/c/o'
+
+        env = {'REQUEST_METHOD': 'PUT'}
+        hdrs = dict(self.original_transient_sysmeta_headers_1)
+        hdrs.update(self.original_transient_sysmeta_headers_2)
+        hdrs.update(self.original_meta_headers_1)
+        req = Request.blank(path, environ=env, headers=hdrs, body='x')
+        resp = req.get_response(app)
+        self._assertStatus(resp, 201)
+
+        req = Request.blank(path, environ={})
+        resp = req.get_response(app)
+        self._assertStatus(resp, 200)
+        self._assertInHeaders(resp, self.original_transient_sysmeta_headers_1)
+        self._assertInHeaders(resp, self.original_transient_sysmeta_headers_2)
+        self._assertInHeaders(resp, self.original_meta_headers_1)
+
+        info = get_object_info(req.environ, app)
+        self.assertEqual(2, len(info.get('transient_sysmeta', ())))
+        self.assertEqual({'testa': 'A', 'testb': 'B'},
+                         info['transient_sysmeta'])
+
+        # POST will replace all existing transient_sysmeta and usermeta values
+        env = {'REQUEST_METHOD': 'POST'}
+        hdrs = dict(self.changed_transient_sysmeta_headers)
+        hdrs.update(self.new_transient_sysmeta_headers_1)
+        req = Request.blank(path, environ=env, headers=hdrs)
+        resp = req.get_response(app)
+        self._assertStatus(resp, 202)
+
+        req = Request.blank(path, environ={})
+        resp = req.get_response(app)
+        self._assertStatus(resp, 200)
+        self._assertInHeaders(resp, self.changed_transient_sysmeta_headers)
+        self._assertInHeaders(resp, self.new_transient_sysmeta_headers_1)
+        self._assertNotInHeaders(resp, self.original_meta_headers_1)
+        self._assertNotInHeaders(resp,
+                                 self.original_transient_sysmeta_headers_2)
+
+        info = get_object_info(req.environ, app)
+        self.assertEqual(2, len(info.get('transient_sysmeta', ())))
+        self.assertEqual({'testa': 'changed_A', 'testc': 'C'},
+                         info['transient_sysmeta'])
+
+        # subsequent PUT replaces all transient_sysmeta and usermeta values
+        env = {'REQUEST_METHOD': 'PUT'}
+        hdrs = dict(self.new_transient_sysmeta_headers_2)
+        hdrs.update(self.original_meta_headers_2)
+        req = Request.blank(path, environ=env, headers=hdrs, body='x')
+        resp = req.get_response(app)
+        self._assertStatus(resp, 201)
+
+        req = Request.blank(path, environ={})
+        resp = req.get_response(app)
+        self._assertStatus(resp, 200)
+        self._assertInHeaders(resp, self.original_meta_headers_2)
+        self._assertInHeaders(resp, self.new_transient_sysmeta_headers_2)
+        # meta from previous POST should have gone away...
+        self._assertNotInHeaders(resp, self.changed_transient_sysmeta_headers)
+        self._assertNotInHeaders(resp, self.new_transient_sysmeta_headers_1)
+        # sanity check that meta from first PUT did not re-appear...
+        self._assertNotInHeaders(resp, self.original_meta_headers_1)
+        self._assertNotInHeaders(resp,
+                                 self.original_transient_sysmeta_headers_1)
+        self._assertNotInHeaders(resp,
+                                 self.original_transient_sysmeta_headers_2)
+
+        info = get_object_info(req.environ, app)
+        self.assertEqual(1, len(info.get('transient_sysmeta', ())))
+        self.assertEqual({'testd': 'D'}, info['transient_sysmeta'])
+
+    def test_transient_sysmeta_replaced_by_PUT_or_POST(self):
+        self._test_transient_sysmeta_replaced_by_PUT_or_POST(self.app)
+
+    def test_transient_sysmeta_replaced_by_PUT_or_POST_as_copy(self):
+        # test post-as-copy by issuing requests to the copy middleware app
+        self.copy_app.object_post_as_copy = True
+        self._test_transient_sysmeta_replaced_by_PUT_or_POST(self.copy_app)

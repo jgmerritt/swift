@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from eventlet import sleep, Timeout
-from eventlet.green import httplib, socket, urllib2
+from eventlet.green import httplib, socket
 import json
 import six
 from six.moves import range
@@ -31,6 +31,11 @@ from swift.common.http import HTTP_NOT_FOUND, HTTP_MULTIPLE_CHOICES
 from swift.common.swob import Request
 from swift.common.utils import quote
 from swift.common.wsgi import loadapp, pipeline_property
+
+if six.PY3:
+    from eventlet.green.urllib import request as urllib2
+else:
+    from eventlet.green import urllib2
 
 
 class UnexpectedResponse(Exception):
@@ -153,8 +158,7 @@ class InternalClient(object):
 
     def make_request(
             self, method, path, headers, acceptable_statuses, body_file=None):
-        """
-        Makes a request to Swift with retries.
+        """Makes a request to Swift with retries.
 
         :param method: HTTP method of request.
         :param path: Path of request.
@@ -163,7 +167,7 @@ class InternalClient(object):
         :param body_file: Body file to be passed along with request,
                           defaults to None.
 
-        :returns : Response object on success.
+        :returns: Response object on success.
 
         :raises UnexpectedResponse: Exception raised when make_request() fails
                                     to get a response with an acceptable status
@@ -213,8 +217,8 @@ class InternalClient(object):
                                     defaults to (2,).
         :param headers: extra headers to send
 
-        :returns : A dict of metadata with metadata_prefix stripped from keys.
-                   Keys will be lowercase.
+        :returns: A dict of metadata with metadata_prefix stripped from keys.
+                  Keys will be lowercase.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -367,8 +371,7 @@ class InternalClient(object):
 
     def get_account_metadata(
             self, account, metadata_prefix='', acceptable_statuses=(2,)):
-        """
-        Gets account metadata.
+        """Gets account metadata.
 
         :param account: Account on which to get the metadata.
         :param metadata_prefix: Used to filter values from the headers
@@ -377,7 +380,7 @@ class InternalClient(object):
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
 
-        :returns : Returns dict of account metadata.  Keys will be lowercase.
+        :returns: Returns dict of account metadata.  Keys will be lowercase.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -418,8 +421,7 @@ class InternalClient(object):
     # container methods
 
     def container_exists(self, account, container):
-        """
-        Checks to see if a container exists.
+        """Checks to see if a container exists.
 
         :param account: The container's account.
         :param container: Container to check.
@@ -429,7 +431,7 @@ class InternalClient(object):
         :raises Exception: Exception is raised when code fails in an
                            unexpected way.
 
-        :returns : True if container exists, false otherwise.
+        :returns: True if container exists, false otherwise.
         """
 
         path = self.make_path(account, container)
@@ -479,8 +481,7 @@ class InternalClient(object):
     def get_container_metadata(
             self, account, container, metadata_prefix='',
             acceptable_statuses=(2,)):
-        """
-        Gets container metadata.
+        """Gets container metadata.
 
         :param account: The container's account.
         :param container: Container to get metadata on.
@@ -490,7 +491,7 @@ class InternalClient(object):
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
 
-        :returns : Returns dict of container metadata.  Keys will be lowercase.
+        :returns: Returns dict of container metadata.  Keys will be lowercase.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -580,8 +581,7 @@ class InternalClient(object):
     def get_object_metadata(
             self, account, container, obj, metadata_prefix='',
             acceptable_statuses=(2,), headers=None):
-        """
-        Gets object metadata.
+        """Gets object metadata.
 
         :param account: The object's account.
         :param container: The object's container.
@@ -593,7 +593,7 @@ class InternalClient(object):
                                     defaults to (2,).
         :param headers: extra headers to send with request
 
-        :returns : Dict of object metadata.
+        :returns: Dict of object metadata.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status

@@ -25,7 +25,7 @@
 # collected. We've seen objects hang around forever otherwise.
 
 import six
-from six.moves.urllib.parse import unquote, quote
+from six.moves.urllib.parse import unquote
 
 import collections
 import itertools
@@ -47,11 +47,9 @@ from swift.common.utils import (
     GreenAsyncPile, GreenthreadSafeIterator, Timestamp,
     normalize_delete_at_timestamp, public, get_expirer_container,
     document_iters_to_http_response_body, parse_content_range,
-    quorum_size, reiterate, close_if_possible)
+    quorum_size, reiterate, close_if_possible, safe_json_loads)
 from swift.common.bufferedhttp import http_connect
-from swift.common.constraints import check_metadata, check_object_creation, \
-    check_copy_from_header, check_destination_header, \
-    check_account_format
+from swift.common.constraints import check_metadata, check_object_creation
 from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, \
     ChunkWriteTimeout, ConnectionTimeout, ResponseTimeout, \
@@ -60,33 +58,21 @@ from swift.common.exceptions import ChunkReadTimeout, \
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import (
     is_informational, is_success, is_client_error, is_server_error,
-    is_redirection, HTTP_CONTINUE, HTTP_CREATED, HTTP_MULTIPLE_CHOICES,
-    HTTP_INTERNAL_SERVER_ERROR, HTTP_SERVICE_UNAVAILABLE,
-    HTTP_INSUFFICIENT_STORAGE, HTTP_PRECONDITION_FAILED, HTTP_CONFLICT,
-    HTTP_UNPROCESSABLE_ENTITY, HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
+    is_redirection, HTTP_CONTINUE, HTTP_INTERNAL_SERVER_ERROR,
+    HTTP_SERVICE_UNAVAILABLE, HTTP_INSUFFICIENT_STORAGE,
+    HTTP_PRECONDITION_FAILED, HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY,
+    HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
 from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
                                          ECDriverError, PolicyError)
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, ResumingGetter
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
-    HTTPServerError, HTTPServiceUnavailable, Request, \
-    HTTPClientDisconnect, HTTPUnprocessableEntity, Response, HTTPException, \
+    HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
+    HTTPUnprocessableEntity, Response, HTTPException, \
     HTTPRequestedRangeNotSatisfiable, Range, HTTPInternalServerError
-from swift.common.request_helpers import is_sys_or_user_meta, is_sys_meta, \
-    remove_items, copy_header_subset
-
-
-def copy_headers_into(from_r, to_r):
-    """
-    Will copy desired headers from from_r to to_r
-    :params from_r: a swob Request or Response
-    :params to_r: a swob Request or Response
-    """
-    pass_headers = ['x-delete-at']
-    for k, v in from_r.headers.items():
-        if is_sys_or_user_meta('object', k) or k.lower() in pass_headers:
-            to_r.headers[k] = v
+from swift.common.request_helpers import update_etag_is_at_header, \
+    resolve_etag_is_at_header
 
 
 def check_content_type(req):
@@ -106,7 +92,7 @@ class ObjectControllerRouter(object):
     @classmethod
     def register(cls, policy_type):
         """
-        Decorator for Storage Policy implemenations to register
+        Decorator for Storage Policy implementations to register
         their ObjectController implementations.
 
         This also fills in a policy_type attribute on the class.
@@ -200,8 +186,7 @@ class BaseObjectController(Controller):
             self.account_name, self.container_name, self.object_name)
         node_iter = self.app.iter_nodes(obj_ring, partition)
 
-        resp = self._reroute(policy)._get_or_head_response(
-            req, node_iter, partition, policy)
+        resp = self._get_or_head_response(req, node_iter, partition, policy)
 
         if ';' in resp.headers.get('content-type', ''):
             resp.content_type = clean_content_type(
@@ -227,55 +212,38 @@ class BaseObjectController(Controller):
     @delay_denial
     def POST(self, req):
         """HTTP POST request handler."""
-        if self.app.object_post_as_copy:
-            req.method = 'PUT'
-            req.path_info = '/v1/%s/%s/%s' % (
-                self.account_name, self.container_name, self.object_name)
-            req.headers['Content-Length'] = 0
-            req.headers['X-Copy-From'] = quote('/%s/%s' % (self.container_name,
-                                               self.object_name))
-            req.environ['swift.post_as_copy'] = True
-            req.environ['swift_versioned_copy'] = True
-            resp = self.PUT(req)
-            # Older editions returned 202 Accepted on object POSTs, so we'll
-            # convert any 201 Created responses to that for compatibility with
-            # picky clients.
-            if resp.status_int != HTTP_CREATED:
-                return resp
-            return HTTPAccepted(request=req)
-        else:
-            error_response = check_metadata(req, 'object')
-            if error_response:
-                return error_response
-            container_info = self.container_info(
-                self.account_name, self.container_name, req)
-            container_partition = container_info['partition']
-            containers = container_info['nodes']
-            req.acl = container_info['write_acl']
-            if 'swift.authorize' in req.environ:
-                aresp = req.environ['swift.authorize'](req)
-                if aresp:
-                    return aresp
-            if not containers:
-                return HTTPNotFound(request=req)
+        container_info = self.container_info(
+            self.account_name, self.container_name, req)
+        container_partition = container_info['partition']
+        container_nodes = container_info['nodes']
+        req.acl = container_info['write_acl']
+        if 'swift.authorize' in req.environ:
+            aresp = req.environ['swift.authorize'](req)
+            if aresp:
+                return aresp
+        if not container_nodes:
+            return HTTPNotFound(request=req)
+        error_response = check_metadata(req, 'object')
+        if error_response:
+            return error_response
 
-            req, delete_at_container, delete_at_part, \
-                delete_at_nodes = self._config_obj_expiration(req)
+        req, delete_at_container, delete_at_part, \
+            delete_at_nodes = self._config_obj_expiration(req)
 
-            # pass the policy index to storage nodes via req header
-            policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
-                                           container_info['storage_policy'])
-            obj_ring = self.app.get_object_ring(policy_index)
-            req.headers['X-Backend-Storage-Policy-Index'] = policy_index
-            partition, nodes = obj_ring.get_nodes(
-                self.account_name, self.container_name, self.object_name)
+        # pass the policy index to storage nodes via req header
+        policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
+                                       container_info['storage_policy'])
+        obj_ring = self.app.get_object_ring(policy_index)
+        req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        partition, nodes = obj_ring.get_nodes(
+            self.account_name, self.container_name, self.object_name)
 
-            req.headers['X-Timestamp'] = Timestamp(time.time()).internal
+        req.headers['X-Timestamp'] = Timestamp(time.time()).internal
 
-            headers = self._backend_requests(
-                req, len(nodes), container_partition, containers,
-                delete_at_container, delete_at_part, delete_at_nodes)
-            return self._post_object(req, obj_ring, partition, headers)
+        headers = self._backend_requests(
+            req, len(nodes), container_partition, container_nodes,
+            delete_at_container, delete_at_part, delete_at_nodes)
+        return self._post_object(req, obj_ring, partition, headers)
 
     def _backend_requests(self, req, n_outgoing,
                           container_partition, containers,
@@ -323,71 +291,111 @@ class BaseObjectController(Controller):
 
         return headers
 
-    def _await_response(self, conn, **kwargs):
-        with Timeout(self.app.node_timeout):
-            if conn.resp:
-                return conn.resp
-            else:
-                return conn.getresponse()
-
-    def _get_conn_response(self, conn, req, logger_thread_locals, **kwargs):
+    def _get_conn_response(self, putter, path, logger_thread_locals,
+                           final_phase, **kwargs):
         self.app.logger.thread_locals = logger_thread_locals
         try:
-            resp = self._await_response(conn, **kwargs)
-            return (conn, resp)
+            resp = putter.await_response(
+                self.app.node_timeout, not final_phase)
         except (Exception, Timeout):
+            resp = None
+            if final_phase:
+                status_type = 'final'
+            else:
+                status_type = 'commit'
             self.app.exception_occurred(
-                conn.node, _('Object'),
-                _('Trying to get final status of PUT to %s') % req.path)
-        return (None, None)
+                putter.node, _('Object'),
+                _('Trying to get %(status_type)s status of PUT to %(path)s') %
+                {'status_type': status_type, 'path': path})
+        return (putter, resp)
 
-    def _get_put_responses(self, req, conns, nodes, **kwargs):
+    def _have_adequate_put_responses(self, statuses, num_nodes, min_responses):
         """
-        Collect replicated object responses.
+        Test for sufficient PUT responses from backend nodes to proceed with
+        PUT handling.
+
+        :param statuses: a list of response statuses.
+        :param num_nodes: number of backend nodes to which PUT requests may be
+                          issued.
+        :param min_responses: (optional) minimum number of nodes required to
+                              have responded with satisfactory status code.
+        :return: True if sufficient backend responses have returned a
+                 satisfactory status code.
+        """
+        raise NotImplementedError
+
+    def _get_put_responses(self, req, putters, num_nodes, final_phase=True,
+                           min_responses=None):
+        """
+        Collect object responses to a PUT request and determine if a
+        satisfactory number of nodes have returned success.  Returns
+        lists of accumulated status codes, reasons, bodies and etags.
+
+        :param req: the request
+        :param putters: list of putters for the request
+        :param num_nodes: number of nodes involved
+        :param final_phase: boolean indicating if this is the last phase
+        :param min_responses: minimum needed when not requiring quorum
+        :return: a tuple of lists of status codes, reasons, bodies and etags.
+                 The list of bodies and etags is only populated for the final
+                 phase of a PUT transaction.
         """
         statuses = []
         reasons = []
         bodies = []
         etags = set()
 
-        pile = GreenAsyncPile(len(conns))
-        for conn in conns:
-            pile.spawn(self._get_conn_response, conn,
-                       req, self.app.logger.thread_locals)
+        pile = GreenAsyncPile(len(putters))
+        for putter in putters:
+            if putter.failed:
+                continue
+            pile.spawn(self._get_conn_response, putter, req.path,
+                       self.app.logger.thread_locals, final_phase=final_phase)
 
-        def _handle_response(conn, response):
+        def _handle_response(putter, response):
             statuses.append(response.status)
             reasons.append(response.reason)
-            bodies.append(response.read())
+            if final_phase:
+                body = response.read()
+            else:
+                body = ''
+            bodies.append(body)
             if response.status == HTTP_INSUFFICIENT_STORAGE:
-                self.app.error_limit(conn.node,
+                putter.failed = True
+                self.app.error_limit(putter.node,
                                      _('ERROR Insufficient Storage'))
             elif response.status >= HTTP_INTERNAL_SERVER_ERROR:
+                putter.failed = True
                 self.app.error_occurred(
-                    conn.node,
+                    putter.node,
                     _('ERROR %(status)d %(body)s From Object Server '
                       're: %(path)s') %
                     {'status': response.status,
-                     'body': bodies[-1][:1024], 'path': req.path})
+                     'body': body[:1024], 'path': req.path})
             elif is_success(response.status):
                 etags.add(response.getheader('etag').strip('"'))
 
-        for (conn, response) in pile:
+        for (putter, response) in pile:
             if response:
-                _handle_response(conn, response)
-                if self.have_quorum(statuses, len(nodes)):
+                _handle_response(putter, response)
+                if self._have_adequate_put_responses(
+                        statuses, num_nodes, min_responses):
                     break
+            else:
+                putter.failed = True
 
         # give any pending requests *some* chance to finish
         finished_quickly = pile.waitall(self.app.post_quorum_timeout)
-        for (conn, response) in finished_quickly:
+        for (putter, response) in finished_quickly:
             if response:
-                _handle_response(conn, response)
+                _handle_response(putter, response)
 
-        while len(statuses) < len(nodes):
-            statuses.append(HTTP_SERVICE_UNAVAILABLE)
-            reasons.append('')
-            bodies.append('')
+        if final_phase:
+            while len(statuses) < num_nodes:
+                statuses.append(HTTP_SERVICE_UNAVAILABLE)
+                reasons.append('')
+                bodies.append('')
+
         return statuses, reasons, bodies, etags
 
     def _config_obj_expiration(self, req):
@@ -414,133 +422,8 @@ class BaseObjectController(Controller):
 
         return req, delete_at_container, delete_at_part, delete_at_nodes
 
-    def _handle_copy_request(self, req):
-        """
-        This method handles copying objects based on values set in the headers
-        'X-Copy-From' and 'X-Copy-From-Account'
-
-        Note that if the incomming request has some conditional headers (e.g.
-        'Range', 'If-Match'), *source* object will be evaluated for these
-        headers. i.e. if PUT with both 'X-Copy-From' and 'Range', Swift will
-        make a partial copy as a new object.
-
-        This method was added as part of the refactoring of the PUT method and
-        the functionality is expected to be moved to middleware
-        """
-        if req.environ.get('swift.orig_req_method', req.method) != 'POST':
-            req.environ.setdefault('swift.log_info', []).append(
-                'x-copy-from:%s' % req.headers['X-Copy-From'])
-        ver, acct, _rest = req.split_path(2, 3, True)
-        src_account_name = req.headers.get('X-Copy-From-Account', None)
-        if src_account_name:
-            src_account_name = check_account_format(req, src_account_name)
-        else:
-            src_account_name = acct
-        src_container_name, src_obj_name = check_copy_from_header(req)
-        source_header = '/%s/%s/%s/%s' % (
-            ver, src_account_name, src_container_name, src_obj_name)
-        source_req = req.copy_get()
-
-        # make sure the source request uses it's container_info
-        source_req.headers.pop('X-Backend-Storage-Policy-Index', None)
-        source_req.path_info = source_header
-        source_req.headers['X-Newest'] = 'true'
-        if 'swift.post_as_copy' in req.environ:
-            # We're COPYing one object over itself because of a POST; rely on
-            # the PUT for write authorization, don't require read authorization
-            source_req.environ['swift.authorize'] = lambda req: None
-            source_req.environ['swift.authorize_override'] = True
-
-        orig_obj_name = self.object_name
-        orig_container_name = self.container_name
-        orig_account_name = self.account_name
-        sink_req = Request.blank(req.path_info,
-                                 environ=req.environ, headers=req.headers)
-
-        self.object_name = src_obj_name
-        self.container_name = src_container_name
-        self.account_name = src_account_name
-
-        source_resp = self.GET(source_req)
-
-        # This gives middlewares a way to change the source; for example,
-        # this lets you COPY a SLO manifest and have the new object be the
-        # concatenation of the segments (like what a GET request gives
-        # the client), not a copy of the manifest file.
-        hook = req.environ.get(
-            'swift.copy_hook',
-            (lambda source_req, source_resp, sink_req: source_resp))
-        source_resp = hook(source_req, source_resp, sink_req)
-
-        # reset names
-        self.object_name = orig_obj_name
-        self.container_name = orig_container_name
-        self.account_name = orig_account_name
-
-        if source_resp.status_int >= HTTP_MULTIPLE_CHOICES:
-            # this is a bit of ugly code, but I'm willing to live with it
-            # until copy request handling moves to middleware
-            return source_resp, None, None, None
-        if source_resp.content_length is None:
-            # This indicates a transfer-encoding: chunked source object,
-            # which currently only happens because there are more than
-            # CONTAINER_LISTING_LIMIT segments in a segmented object. In
-            # this case, we're going to refuse to do the server-side copy.
-            raise HTTPRequestEntityTooLarge(request=req)
-        if source_resp.content_length > constraints.MAX_FILE_SIZE:
-            raise HTTPRequestEntityTooLarge(request=req)
-
-        data_source = iter(source_resp.app_iter)
-        sink_req.content_length = source_resp.content_length
-        sink_req.etag = source_resp.etag
-
-        # we no longer need the X-Copy-From header
-        del sink_req.headers['X-Copy-From']
-        if 'X-Copy-From-Account' in sink_req.headers:
-            del sink_req.headers['X-Copy-From-Account']
-        if not req.content_type_manually_set:
-            sink_req.headers['Content-Type'] = \
-                source_resp.headers['Content-Type']
-
-        fresh_meta_flag = config_true_value(
-            sink_req.headers.get('x-fresh-metadata', 'false'))
-
-        if fresh_meta_flag or 'swift.post_as_copy' in sink_req.environ:
-            # post-as-copy: ignore new sysmeta, copy existing sysmeta
-            condition = lambda k: is_sys_meta('object', k)
-            remove_items(sink_req.headers, condition)
-            copy_header_subset(source_resp, sink_req, condition)
-        else:
-            # copy/update existing sysmeta and user meta
-            copy_headers_into(source_resp, sink_req)
-            copy_headers_into(req, sink_req)
-
-        # copy over x-static-large-object for POSTs and manifest copies
-        if 'X-Static-Large-Object' in source_resp.headers and \
-                (req.params.get('multipart-manifest') == 'get' or
-                 'swift.post_as_copy' in req.environ):
-            sink_req.headers['X-Static-Large-Object'] = \
-                source_resp.headers['X-Static-Large-Object']
-
-        req = sink_req
-
-        def update_response(req, resp):
-            acct, path = source_resp.environ['PATH_INFO'].split('/', 3)[2:4]
-            resp.headers['X-Copied-From-Account'] = quote(acct)
-            resp.headers['X-Copied-From'] = quote(path)
-            if 'last-modified' in source_resp.headers:
-                resp.headers['X-Copied-From-Last-Modified'] = \
-                    source_resp.headers['last-modified']
-            copy_headers_into(req, resp)
-            return resp
-
-        # this is a bit of ugly code, but I'm willing to live with it
-        # until copy request handling moves to middleware
-        return None, req, data_source, update_response
-
     def _update_content_type(self, req):
         # Sometimes the 'content-type' header exists, but is set to None.
-        req.content_type_manually_set = True
         detect_content_type = \
             config_true_value(req.headers.get('x-detect-content-type'))
         if detect_content_type or not req.headers.get('content-type'):
@@ -549,8 +432,6 @@ class BaseObjectController(Controller):
                 'application/octet-stream'
             if detect_content_type:
                 req.headers.pop('x-detect-content-type')
-            else:
-                req.content_type_manually_set = False
 
     def _update_x_timestamp(self, req):
         # Used by container sync feature
@@ -567,12 +448,17 @@ class BaseObjectController(Controller):
             req.headers['X-Timestamp'] = Timestamp(time.time()).internal
         return None
 
-    def _check_failure_put_connections(self, conns, req, nodes, min_conns):
+    def _check_failure_put_connections(self, putters, req, min_conns):
         """
         Identify any failed connections and check minimum connection count.
+
+        :param putters: a list of Putter instances
+        :param req: request
+        :param min_conns: minimum number of putter connections required
         """
         if req.if_none_match is not None and '*' in req.if_none_match:
-            statuses = [conn.resp.status for conn in conns if conn.resp]
+            statuses = [
+                putter.resp.status for putter in putters if putter.resp]
             if HTTP_PRECONDITION_FAILED in statuses:
                 # If we find any copy of the file, it shouldn't be uploaded
                 self.app.logger.debug(
@@ -580,14 +466,14 @@ class BaseObjectController(Controller):
                     {'statuses': statuses})
                 raise HTTPPreconditionFailed(request=req)
 
-        if any(conn for conn in conns if conn.resp and
-               conn.resp.status == HTTP_CONFLICT):
+        if any(putter for putter in putters if putter.resp and
+               putter.resp.status == HTTP_CONFLICT):
             status_times = ['%(status)s (%(timestamp)s)' % {
-                'status': conn.resp.status,
+                'status': putter.resp.status,
                 'timestamp': HeaderKeyDict(
-                    conn.resp.getheaders()).get(
+                    putter.resp.getheaders()).get(
                         'X-Backend-Timestamp', 'unknown')
-            } for conn in conns if conn.resp]
+            } for putter in putters if putter.resp]
             self.app.logger.debug(
                 _('Object PUT returning 202 for 409: '
                   '%(req_timestamp)s <= %(timestamps)r'),
@@ -595,32 +481,61 @@ class BaseObjectController(Controller):
                  'timestamps': ', '.join(status_times)})
             raise HTTPAccepted(request=req)
 
-        self._check_min_conn(req, conns, min_conns)
+        self._check_min_conn(req, putters, min_conns)
 
-    def _connect_put_node(self, nodes, part, path, headers,
+    def _make_putter(self, node, part, req, headers):
+        """
+        Returns a putter object for handling streaming of object to object
+        servers.
+
+        Subclasses must implement this method.
+
+        :param node: a storage node
+        :param part: ring partition number
+        :param req: a swob Request
+        :param headers: request headers
+        :return: an instance of a Putter
+        """
+        raise NotImplementedError
+
+    def _connect_put_node(self, nodes, part, req, headers,
                           logger_thread_locals):
         """
         Make connection to storage nodes
 
-        Connects to the first working node that it finds in nodes iter
-        and sends over the request headers. Returns an HTTPConnection
-        object to handle the rest of the streaming.
-
-        This method must be implemented by each policy ObjectController.
+        Connects to the first working node that it finds in nodes iter and
+        sends over the request headers. Returns a Putter to handle the rest of
+        the streaming, or None if no working nodes were found.
 
         :param nodes: an iterator of the target storage nodes
-        :param partition: ring partition number
-        :param path: the object path to send to the storage node
+        :param part: ring partition number
+        :param req: a swob Request
         :param headers: request headers
         :param logger_thread_locals: The thread local values to be set on the
                                      self.app.logger to retain transaction
                                      logging information.
-        :return: HTTPConnection object
+        :return: an instance of a Putter
         """
-        raise NotImplementedError()
+        self.app.logger.thread_locals = logger_thread_locals
+        for node in nodes:
+            try:
+                putter = self._make_putter(node, part, req, headers)
+                self.app.set_node_timing(node, putter.connect_duration)
+                return putter
+            except InsufficientStorage:
+                self.app.error_limit(node, _('ERROR Insufficient Storage'))
+            except PutterConnectError as e:
+                self.app.error_occurred(
+                    node, _('ERROR %(status)d Expect: 100-continue '
+                            'From Object Server') % {
+                                'status': e.status})
+            except (Exception, Timeout):
+                self.app.exception_occurred(
+                    node, _('Object'),
+                    _('Expect: 100-continue on %s') % req.swift_entity_path)
 
     def _get_put_connections(self, req, nodes, partition, outgoing_headers,
-                             policy, expect):
+                             policy):
         """
         Establish connections to storage nodes for PUT request
         """
@@ -630,24 +545,31 @@ class BaseObjectController(Controller):
         pile = GreenPile(len(nodes))
 
         for nheaders in outgoing_headers:
-            if expect:
+            # RFC2616:8.2.3 disallows 100-continue without a body
+            if (req.content_length > 0) or req.is_chunked:
                 nheaders['Expect'] = '100-continue'
             pile.spawn(self._connect_put_node, node_iter, partition,
-                       req.swift_entity_path, nheaders,
-                       self.app.logger.thread_locals)
+                       req, nheaders, self.app.logger.thread_locals)
 
-        conns = [conn for conn in pile if conn]
+        putters = [putter for putter in pile if putter]
 
-        return conns
+        return putters
 
-    def _check_min_conn(self, req, conns, min_conns, msg=None):
-        msg = msg or 'Object PUT returning 503, %(conns)s/%(nodes)s ' \
-            'required connections'
+    def _check_min_conn(self, req, putters, min_conns, msg=None):
+        msg = msg or _('Object PUT returning 503, %(conns)s/%(nodes)s '
+                       'required connections')
 
-        if len(conns) < min_conns:
+        if len(putters) < min_conns:
             self.app.logger.error((msg),
-                                  {'conns': len(conns), 'nodes': min_conns})
+                                  {'conns': len(putters), 'nodes': min_conns})
             raise HTTPServiceUnavailable(request=req)
+
+    def _get_footers(self, req):
+        footers = HeaderKeyDict()
+        footer_callback = req.environ.get(
+            'swift.callback.update_footers', lambda _footer: None)
+        footer_callback(footers)
+        return footers
 
     def _store_object(self, req, data_source, nodes, partition,
                       outgoing_headers):
@@ -730,7 +652,7 @@ class BaseObjectController(Controller):
             if aresp:
                 return aresp
 
-        if not container_info['nodes']:
+        if not container_nodes:
             return HTTPNotFound(request=req)
 
         # update content type in case it is missing
@@ -744,22 +666,13 @@ class BaseObjectController(Controller):
 
         self._update_x_timestamp(req)
 
-        # check if request is a COPY of an existing object
-        source_header = req.headers.get('X-Copy-From')
-        if source_header:
-            error_response, req, data_source, update_response = \
-                self._handle_copy_request(req)
-            if error_response:
-                return error_response
-        else:
-            def reader():
-                try:
-                    return req.environ['wsgi.input'].read(
-                        self.app.client_chunk_size)
-                except (ValueError, IOError) as e:
-                    raise ChunkReadError(str(e))
-            data_source = iter(reader, '')
-            update_response = lambda req, resp: resp
+        def reader():
+            try:
+                return req.environ['wsgi.input'].read(
+                    self.app.client_chunk_size)
+            except (ValueError, IOError) as e:
+                raise ChunkReadError(str(e))
+        data_source = iter(reader, '')
 
         # check if object is set to be automatically deleted (i.e. expired)
         req, delete_at_container, delete_at_part, \
@@ -773,7 +686,7 @@ class BaseObjectController(Controller):
         # send object to storage nodes
         resp = self._store_object(
             req, data_source, nodes, partition, outgoing_headers)
-        return update_response(req, resp)
+        return resp
 
     @public
     @cors_validation
@@ -789,14 +702,14 @@ class BaseObjectController(Controller):
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
         container_partition = container_info['partition']
-        containers = container_info['nodes']
+        container_nodes = container_info['nodes']
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
                 return aresp
-        if not containers:
+        if not container_nodes:
             return HTTPNotFound(request=req)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
@@ -814,65 +727,8 @@ class BaseObjectController(Controller):
             req.headers['X-Timestamp'] = Timestamp(time.time()).internal
 
         headers = self._backend_requests(
-            req, len(nodes), container_partition, containers)
+            req, len(nodes), container_partition, container_nodes)
         return self._delete_object(req, obj_ring, partition, headers)
-
-    def _reroute(self, policy):
-        """
-        For COPY requests we need to make sure the controller instance the
-        request is routed through is the correct type for the policy.
-        """
-        if not policy:
-            raise HTTPServiceUnavailable('Unknown Storage Policy')
-        if policy.policy_type != self.policy_type:
-            controller = self.app.obj_controller_router[policy](
-                self.app, self.account_name, self.container_name,
-                self.object_name)
-        else:
-            controller = self
-        return controller
-
-    @public
-    @cors_validation
-    @delay_denial
-    def COPY(self, req):
-        """HTTP COPY request handler."""
-        if not req.headers.get('Destination'):
-            return HTTPPreconditionFailed(request=req,
-                                          body='Destination header required')
-        dest_account = self.account_name
-        if 'Destination-Account' in req.headers:
-            dest_account = req.headers.get('Destination-Account')
-            dest_account = check_account_format(req, dest_account)
-            req.headers['X-Copy-From-Account'] = self.account_name
-            self.account_name = dest_account
-            del req.headers['Destination-Account']
-        dest_container, dest_object = check_destination_header(req)
-
-        source = '/%s/%s' % (self.container_name, self.object_name)
-        self.container_name = dest_container
-        self.object_name = dest_object
-        # re-write the existing request as a PUT instead of creating a new one
-        # since this one is already attached to the posthooklogger
-        # TODO: Swift now has proxy-logging middleware instead of
-        #       posthooklogger used in before. i.e. we don't have to
-        #       keep the code depends on evnetlet.posthooks sequence, IMHO.
-        #       However, creating a new sub request might
-        #       cause the possibility to hide some bugs behindes the request
-        #       so that we should discuss whichi is suitable (new-sub-request
-        #       vs re-write-existing-request) for Swift. [kota_]
-        req.method = 'PUT'
-        req.path_info = '/v1/%s/%s/%s' % \
-                        (dest_account, dest_container, dest_object)
-        req.headers['Content-Length'] = 0
-        req.headers['X-Copy-From'] = quote(source)
-        del req.headers['Destination']
-
-        container_info = self.container_info(
-            dest_account, dest_container, req)
-        dest_policy = POLICIES.get_by_index(container_info['storage_policy'])
-
-        return self._reroute(dest_policy).PUT(req)
 
 
 @ObjectControllerRouter.register(REPL_POLICY)
@@ -886,115 +742,81 @@ class ReplicatedObjectController(BaseObjectController):
             req.swift_entity_path, concurrency)
         return resp
 
-    def _connect_put_node(self, nodes, part, path, headers,
-                          logger_thread_locals):
-        """
-        Make a connection for a replicated object.
+    def _make_putter(self, node, part, req, headers):
+        if req.environ.get('swift.callback.update_footers'):
+            putter = MIMEPutter.connect(
+                node, part, req.swift_entity_path, headers,
+                conn_timeout=self.app.conn_timeout,
+                node_timeout=self.app.node_timeout,
+                logger=self.app.logger,
+                need_multiphase=False)
+        else:
+            putter = Putter.connect(
+                node, part, req.swift_entity_path, headers,
+                conn_timeout=self.app.conn_timeout,
+                node_timeout=self.app.node_timeout,
+                logger=self.app.logger,
+                chunked=req.is_chunked)
+        return putter
 
-        Connects to the first working node that it finds in node_iter
-        and sends over the request headers. Returns an HTTPConnection
-        object to handle the rest of the streaming.
-        """
-        self.app.logger.thread_locals = logger_thread_locals
-        for node in nodes:
-            try:
-                start_time = time.time()
-                with ConnectionTimeout(self.app.conn_timeout):
-                    conn = http_connect(
-                        node['ip'], node['port'], node['device'], part, 'PUT',
-                        path, headers)
-                self.app.set_node_timing(node, time.time() - start_time)
-                with Timeout(self.app.node_timeout):
-                    resp = conn.getexpect()
-                if resp.status == HTTP_CONTINUE:
-                    conn.resp = None
-                    conn.node = node
-                    return conn
-                elif (is_success(resp.status)
-                      or resp.status in (HTTP_CONFLICT,
-                                         HTTP_UNPROCESSABLE_ENTITY)):
-                    conn.resp = resp
-                    conn.node = node
-                    return conn
-                elif headers['If-None-Match'] is not None and \
-                        resp.status == HTTP_PRECONDITION_FAILED:
-                    conn.resp = resp
-                    conn.node = node
-                    return conn
-                elif resp.status == HTTP_INSUFFICIENT_STORAGE:
-                    self.app.error_limit(node, _('ERROR Insufficient Storage'))
-                elif is_server_error(resp.status):
-                    self.app.error_occurred(
-                        node,
-                        _('ERROR %(status)d Expect: 100-continue '
-                          'From Object Server') % {
-                              'status': resp.status})
-            except (Exception, Timeout):
-                self.app.exception_occurred(
-                    node, _('Object'),
-                    _('Expect: 100-continue on %s') % path)
-
-    def _send_file(self, conn, path):
-        """Method for a file PUT coro"""
-        while True:
-            chunk = conn.queue.get()
-            if not conn.failed:
-                try:
-                    with ChunkWriteTimeout(self.app.node_timeout):
-                        conn.send(chunk)
-                except (Exception, ChunkWriteTimeout):
-                    conn.failed = True
-                    self.app.exception_occurred(
-                        conn.node, _('Object'),
-                        _('Trying to write to %s') % path)
-            conn.queue.task_done()
-
-    def _transfer_data(self, req, data_source, conns, nodes):
+    def _transfer_data(self, req, data_source, putters, nodes):
         """
         Transfer data for a replicated object.
 
         This method was added in the PUT method extraction change
         """
-        min_conns = quorum_size(len(nodes))
         bytes_transferred = 0
+
+        def send_chunk(chunk):
+            for putter in list(putters):
+                if not putter.failed:
+                    putter.send_chunk(chunk)
+                else:
+                    putter.close()
+                    putters.remove(putter)
+            self._check_min_conn(
+                req, putters, min_conns,
+                msg=_('Object PUT exceptions during send, '
+                      '%(conns)s/%(nodes)s required connections'))
+
+        min_conns = quorum_size(len(nodes))
         try:
             with ContextPool(len(nodes)) as pool:
-                for conn in conns:
-                    conn.failed = False
-                    conn.queue = Queue(self.app.put_queue_depth)
-                    pool.spawn(self._send_file, conn, req.path)
+                for putter in putters:
+                    putter.spawn_sender_greenthread(
+                        pool, self.app.put_queue_depth, self.app.node_timeout,
+                        self.app.exception_occurred)
                 while True:
                     with ChunkReadTimeout(self.app.client_timeout):
                         try:
                             chunk = next(data_source)
                         except StopIteration:
-                            if req.is_chunked:
-                                for conn in conns:
-                                    conn.queue.put('0\r\n\r\n')
                             break
                     bytes_transferred += len(chunk)
                     if bytes_transferred > constraints.MAX_FILE_SIZE:
                         raise HTTPRequestEntityTooLarge(request=req)
-                    for conn in list(conns):
-                        if not conn.failed:
-                            conn.queue.put(
-                                '%x\r\n%s\r\n' % (len(chunk), chunk)
-                                if req.is_chunked else chunk)
-                        else:
-                            conn.close()
-                            conns.remove(conn)
-                    self._check_min_conn(
-                        req, conns, min_conns,
-                        msg='Object PUT exceptions during'
-                            ' send, %(conns)s/%(nodes)s required connections')
-                for conn in conns:
-                    if conn.queue.unfinished_tasks:
-                        conn.queue.join()
-            conns = [conn for conn in conns if not conn.failed]
-            self._check_min_conn(
-                req, conns, min_conns,
-                msg='Object PUT exceptions after last send, '
-                '%(conns)s/%(nodes)s required connections')
+
+                    send_chunk(chunk)
+
+                if req.content_length and (
+                        bytes_transferred < req.content_length):
+                    req.client_disconnect = True
+                    self.app.logger.warning(
+                        _('Client disconnected without sending enough data'))
+                    self.app.logger.increment('client_disconnects')
+                    raise HTTPClientDisconnect(request=req)
+
+                trail_md = self._get_footers(req)
+                for putter in putters:
+                    # send any footers set by middleware
+                    putter.end_of_object_data(footer_metadata=trail_md)
+
+                for putter in putters:
+                    putter.wait()
+                self._check_min_conn(
+                    req, [p for p in putters if not p.failed], min_conns,
+                    msg=_('Object PUT exceptions after last send, '
+                          '%(conns)s/%(nodes)s required connections'))
         except ChunkReadTimeout as err:
             self.app.logger.warning(
                 _('ERROR Client read timeout (%ss)'), err.seconds)
@@ -1017,12 +839,9 @@ class ReplicatedObjectController(BaseObjectController):
                 _('ERROR Exception transferring data to object servers %s'),
                 {'path': req.path})
             raise HTTPInternalServerError(request=req)
-        if req.content_length and bytes_transferred < req.content_length:
-            req.client_disconnect = True
-            self.app.logger.warning(
-                _('Client disconnected without sending enough data'))
-            self.app.logger.increment('client_disconnects')
-            raise HTTPClientDisconnect(request=req)
+
+    def _have_adequate_put_responses(self, statuses, num_nodes, min_responses):
+        return self.have_quorum(statuses, num_nodes)
 
     def _store_object(self, req, data_source, nodes, partition,
                       outgoing_headers):
@@ -1039,30 +858,25 @@ class ReplicatedObjectController(BaseObjectController):
         if not nodes:
             return HTTPNotFound()
 
-        # RFC2616:8.2.3 disallows 100-continue without a body
-        if (req.content_length > 0) or req.is_chunked:
-            expect = True
-        else:
-            expect = False
-        conns = self._get_put_connections(req, nodes, partition,
-                                          outgoing_headers, policy, expect)
+        putters = self._get_put_connections(
+            req, nodes, partition, outgoing_headers, policy)
         min_conns = quorum_size(len(nodes))
         try:
             # check that a minimum number of connections were established and
             # meet all the correct conditions set in the request
-            self._check_failure_put_connections(conns, req, nodes, min_conns)
+            self._check_failure_put_connections(putters, req, min_conns)
 
             # transfer data
-            self._transfer_data(req, data_source, conns, nodes)
+            self._transfer_data(req, data_source, putters, nodes)
 
             # get responses
-            statuses, reasons, bodies, etags = self._get_put_responses(
-                req, conns, nodes)
+            statuses, reasons, bodies, etags = \
+                self._get_put_responses(req, putters, len(nodes))
         except HTTPException as resp:
             return resp
         finally:
-            for conn in conns:
-                conn.close()
+            for putter in putters:
+                putter.close()
 
         if len(etags) > 1:
             self.app.logger.error(
@@ -1444,11 +1258,11 @@ class ECAppIter(object):
                 pass
             except ChunkReadTimeout:
                 # unable to resume in GetOrHeadHandler
-                self.logger.exception("Timeout fetching fragments for %r" %
+                self.logger.exception(_("Timeout fetching fragments for %r"),
                                       self.path)
             except:  # noqa
-                self.logger.exception("Exception fetching fragments for %r" %
-                                      self.path)
+                self.logger.exception(_("Exception fetching fragments for"
+                                        " %r"), self.path)
             finally:
                 queue.resize(2)  # ensure there's room
                 queue.put(None)
@@ -1476,8 +1290,8 @@ class ECAppIter(object):
                 try:
                     segment = self.policy.pyeclib_driver.decode(fragments)
                 except ECDriverError:
-                    self.logger.exception("Error decoding fragments for %r" %
-                                          self.path)
+                    self.logger.exception(_("Error decoding fragments for"
+                                            " %r"), self.path)
                     raise
 
                 yield segment
@@ -1607,33 +1421,38 @@ DATA_ACKED = 4
 COMMIT_SENT = 5
 
 
-class ECPutter(object):
+class Putter(object):
     """
-    This is here mostly to wrap up the fact that all EC PUTs are
-    chunked because of the mime boundary footer trick and the first
-    half of the two-phase PUT conversation handling.
+    Putter for backend PUT requests.
 
-    An HTTP PUT request that supports streaming.
+    Encapsulates all the actions required to establish a connection with a
+    storage node and stream data to that node.
 
-    Probably deserves more docs than this, but meh.
+    :param conn: an HTTPConnection instance
+    :param node: dict describing storage node
+    :param resp: an HTTPResponse instance if connect() received final response
+    :param path: the object path to send to the storage node
+    :param connect_duration: time taken to initiate the HTTPConnection
+    :param logger: a Logger instance
+    :param chunked: boolean indicating if the request encoding is chunked
     """
-    def __init__(self, conn, node, resp, path, connect_duration,
-                 mime_boundary):
+    def __init__(self, conn, node, resp, path, connect_duration, logger,
+                 chunked=False):
         # Note: you probably want to call Putter.connect() instead of
         # instantiating one of these directly.
         self.conn = conn
         self.node = node
-        self.resp = resp
+        self.resp = self.final_resp = resp
         self.path = path
         self.connect_duration = connect_duration
         # for handoff nodes node_index is None
         self.node_index = node.get('index')
-        self.mime_boundary = mime_boundary
-        self.chunk_hasher = md5()
 
         self.failed = False
         self.queue = None
         self.state = NO_DATA_SENT
+        self.chunked = chunked
+        self.logger = logger
 
     def await_response(self, timeout, informational=False):
         """
@@ -1646,17 +1465,21 @@ class ECPutter(object):
         a 100 Continue response and sent up the PUT request's body, then
         we'll actually read the 2xx-5xx response off the network here.
 
+        :param timeout: time to wait for a response
+        :param informational: if True then try to get a 100-continue response,
+                              otherwise try to get a final response.
         :returns: HTTPResponse
         :raises: Timeout if the response took too long
         """
-        conn = self.conn
-        with Timeout(timeout):
-            if not conn.resp:
+        # don't do this update of self.resp if the Expect response during
+        # connect() was actually a final response
+        if not self.final_resp:
+            with Timeout(timeout):
                 if informational:
-                    self.resp = conn.getexpect()
+                    self.resp = self.conn.getexpect()
                 else:
-                    self.resp = conn.getresponse()
-            return self.resp
+                    self.resp = self.conn.getresponse()
+        return self.resp
 
     def spawn_sender_greenthread(self, pool, queue_depth, write_timeout,
                                  exception_handler):
@@ -1668,9 +1491,10 @@ class ECPutter(object):
         if self.queue.unfinished_tasks:
             self.queue.join()
 
-    def _start_mime_doc_object_body(self):
-        self.queue.put("--%s\r\nX-Document: object body\r\n\r\n" %
-                       (self.mime_boundary,))
+    def _start_object_data(self):
+        # Called immediately before the first chunk of object data is sent.
+        # Subclasses may implement custom behaviour
+        pass
 
     def send_chunk(self, chunk):
         if not chunk:
@@ -1682,30 +1506,148 @@ class ECPutter(object):
         elif self.state == DATA_SENT:
             raise ValueError("called send_chunk after end_of_object_data")
 
-        if self.state == NO_DATA_SENT and self.mime_boundary:
-            # We're sending the object plus other stuff in the same request
-            # body, all wrapped up in multipart MIME, so we'd better start
-            # off the MIME document before sending any object data.
-            self._start_mime_doc_object_body()
+        if self.state == NO_DATA_SENT:
+            self._start_object_data()
             self.state = SENDING_DATA
 
         self.queue.put(chunk)
 
-    def end_of_object_data(self, footer_metadata):
+    def end_of_object_data(self, **kwargs):
+        """
+        Call when there is no more data to send.
+        """
+        if self.state == DATA_SENT:
+            raise ValueError("called end_of_object_data twice")
+
+        self.queue.put('')
+        self.state = DATA_SENT
+
+    def _send_file(self, write_timeout, exception_handler):
+        """
+        Method for a file PUT coroutine. Takes chunks from a queue and sends
+        them down a socket.
+
+        If something goes wrong, the "failed" attribute will be set to true
+        and the exception handler will be called.
+        """
+        while True:
+            chunk = self.queue.get()
+            if not self.failed:
+                if self.chunked:
+                    to_send = "%x\r\n%s\r\n" % (len(chunk), chunk)
+                else:
+                    to_send = chunk
+                try:
+                    with ChunkWriteTimeout(write_timeout):
+                        self.conn.send(to_send)
+                except (Exception, ChunkWriteTimeout):
+                    self.failed = True
+                    exception_handler(self.node, _('Object'),
+                                      _('Trying to write to %s') % self.path)
+
+            self.queue.task_done()
+
+    def close(self):
+        # release reference to response to ensure connection really does close,
+        # see bug https://bugs.launchpad.net/swift/+bug/1594739
+        self.resp = self.final_resp = None
+        self.conn.close()
+
+    @classmethod
+    def _make_connection(cls, node, part, path, headers, conn_timeout,
+                         node_timeout):
+        start_time = time.time()
+        with ConnectionTimeout(conn_timeout):
+            conn = http_connect(node['ip'], node['port'], node['device'],
+                                part, 'PUT', path, headers)
+        connect_duration = time.time() - start_time
+
+        with ResponseTimeout(node_timeout):
+            resp = conn.getexpect()
+
+        if resp.status == HTTP_INSUFFICIENT_STORAGE:
+            raise InsufficientStorage
+
+        if is_server_error(resp.status):
+            raise PutterConnectError(resp.status)
+
+        final_resp = None
+        if (is_success(resp.status) or
+                resp.status in (HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY) or
+                (headers.get('If-None-Match', None) is not None and
+                 resp.status == HTTP_PRECONDITION_FAILED)):
+            final_resp = resp
+
+        return conn, resp, final_resp, connect_duration
+
+    @classmethod
+    def connect(cls, node, part, path, headers, conn_timeout, node_timeout,
+                logger=None, chunked=False, **kwargs):
+        """
+        Connect to a backend node and send the headers.
+
+        :returns: Putter instance
+
+        :raises: ConnectionTimeout if initial connection timed out
+        :raises: ResponseTimeout if header retrieval timed out
+        :raises: InsufficientStorage on 507 response from node
+        :raises: PutterConnectError on non-507 server error response from node
+        """
+        conn, expect_resp, final_resp, connect_duration = cls._make_connection(
+            node, part, path, headers, conn_timeout, node_timeout)
+        return cls(conn, node, final_resp, path, connect_duration, logger,
+                   chunked=chunked)
+
+
+class MIMEPutter(Putter):
+    """
+    Putter for backend PUT requests that use MIME.
+
+    This is here mostly to wrap up the fact that all multipart PUTs are
+    chunked because of the mime boundary footer trick and the first
+    half of the two-phase PUT conversation handling.
+
+    An HTTP PUT request that supports streaming.
+    """
+    def __init__(self, conn, node, resp, req, connect_duration,
+                 logger, mime_boundary, multiphase=False):
+        super(MIMEPutter, self).__init__(conn, node, resp, req,
+                                         connect_duration, logger)
+        # Note: you probably want to call MimePutter.connect() instead of
+        # instantiating one of these directly.
+        self.chunked = True  # MIME requests always send chunked body
+        self.mime_boundary = mime_boundary
+        self.multiphase = multiphase
+
+    def _start_object_data(self):
+        # We're sending the object plus other stuff in the same request
+        # body, all wrapped up in multipart MIME, so we'd better start
+        # off the MIME document before sending any object data.
+        self.queue.put("--%s\r\nX-Document: object body\r\n\r\n" %
+                       (self.mime_boundary,))
+
+    def end_of_object_data(self, footer_metadata=None):
         """
         Call when there is no more data to send.
 
+        Overrides superclass implementation to send any footer metadata
+        after object data.
+
         :param footer_metadata: dictionary of metadata items
+                                to be sent as footers.
         """
         if self.state == DATA_SENT:
             raise ValueError("called end_of_object_data twice")
         elif self.state == NO_DATA_SENT and self.mime_boundary:
-            self._start_mime_doc_object_body()
+            self._start_object_data()
 
         footer_body = json.dumps(footer_metadata)
         footer_md5 = md5(footer_body).hexdigest()
 
         tail_boundary = ("--%s" % (self.mime_boundary,))
+        if not self.multiphase:
+            # this will be the last part sent
+            tail_boundary = tail_boundary + "--"
 
         message_parts = [
             ("\r\n--%s\r\n" % self.mime_boundary),
@@ -1725,6 +1667,9 @@ class ECPutter(object):
         Call when there are > quorum 2XX responses received.  Send commit
         confirmations to all object nodes to finalize the PUT.
         """
+        if not self.multiphase:
+            raise ValueError(
+                "called send_commit_confirmation but multiphase is False")
         if self.state == COMMIT_SENT:
             raise ValueError("called send_commit_confirmation twice")
 
@@ -1744,79 +1689,49 @@ class ECPutter(object):
         self.queue.put('')
         self.state = COMMIT_SENT
 
-    def _send_file(self, write_timeout, exception_handler):
-        """
-        Method for a file PUT coro. Takes chunks from a queue and sends them
-        down a socket.
-
-        If something goes wrong, the "failed" attribute will be set to true
-        and the exception handler will be called.
-        """
-        while True:
-            chunk = self.queue.get()
-            if not self.failed:
-                to_send = "%x\r\n%s\r\n" % (len(chunk), chunk)
-                try:
-                    with ChunkWriteTimeout(write_timeout):
-                        self.conn.send(to_send)
-                except (Exception, ChunkWriteTimeout):
-                    self.failed = True
-                    exception_handler(self.conn.node, _('Object'),
-                                      _('Trying to write to %s') % self.path)
-            self.queue.task_done()
-
     @classmethod
-    def connect(cls, node, part, path, headers, conn_timeout, node_timeout,
-                chunked=False, expected_frag_archive_size=None):
+    def connect(cls, node, part, req, headers, conn_timeout, node_timeout,
+                logger=None, need_multiphase=True, **kwargs):
         """
         Connect to a backend node and send the headers.
 
-        :returns: Putter instance
+        Override superclass method to notify object of need for support for
+        multipart body with footers and optionally multiphase commit, and
+        verify object server's capabilities.
 
-        :raises: ConnectionTimeout if initial connection timed out
-        :raises: ResponseTimeout if header retrieval timed out
-        :raises: InsufficientStorage on 507 response from node
-        :raises: PutterConnectError on non-507 server error response from node
+        :param need_multiphase: if True then multiphase support is required of
+                                the object server
         :raises: FooterNotSupported if need_metadata_footer is set but
                  backend node can't process footers
-        :raises: MultiphasePUTNotSupported if need_multiphase_support is
-                 set but backend node can't handle multiphase PUT
+        :raises: MultiphasePUTNotSupported if need_multiphase is set but
+                 backend node can't handle multiphase PUT
         """
         mime_boundary = "%.64x" % random.randint(0, 16 ** 64)
         headers = HeaderKeyDict(headers)
+        # when using a multipart mime request to backend the actual
+        # content-length is not equal to the object content size, so move the
+        # object content size to X-Backend-Obj-Content-Length if that has not
+        # already been set by the EC PUT path.
+        headers.setdefault('X-Backend-Obj-Content-Length',
+                           headers.pop('Content-Length', None))
         # We're going to be adding some unknown amount of data to the
         # request, so we can't use an explicit content length, and thus
         # we must use chunked encoding.
         headers['Transfer-Encoding'] = 'chunked'
         headers['Expect'] = '100-continue'
 
-        # make sure this isn't there
-        headers.pop('Content-Length')
-        headers['X-Backend-Obj-Content-Length'] = expected_frag_archive_size
-
         headers['X-Backend-Obj-Multipart-Mime-Boundary'] = mime_boundary
 
         headers['X-Backend-Obj-Metadata-Footer'] = 'yes'
 
-        headers['X-Backend-Obj-Multiphase-Commit'] = 'yes'
+        if need_multiphase:
+            headers['X-Backend-Obj-Multiphase-Commit'] = 'yes'
 
-        start_time = time.time()
-        with ConnectionTimeout(conn_timeout):
-            conn = http_connect(node['ip'], node['port'], node['device'],
-                                part, 'PUT', path, headers)
-        connect_duration = time.time() - start_time
+        conn, expect_resp, final_resp, connect_duration = cls._make_connection(
+            node, part, req, headers, conn_timeout, node_timeout)
 
-        with ResponseTimeout(node_timeout):
-            resp = conn.getexpect()
-
-        if resp.status == HTTP_INSUFFICIENT_STORAGE:
-            raise InsufficientStorage
-
-        if is_server_error(resp.status):
-            raise PutterConnectError(resp.status)
-
-        if is_informational(resp.status):
-            continue_headers = HeaderKeyDict(resp.getheaders())
+        if is_informational(expect_resp.status):
+            continue_headers = HeaderKeyDict(expect_resp.getheaders())
             can_send_metadata_footer = config_true_value(
                 continue_headers.get('X-Obj-Metadata-Footer', 'no'))
             can_handle_multiphase_put = config_true_value(
@@ -1825,18 +1740,11 @@ class ECPutter(object):
             if not can_send_metadata_footer:
                 raise FooterNotSupported()
 
-            if not can_handle_multiphase_put:
+            if need_multiphase and not can_handle_multiphase_put:
                 raise MultiphasePUTNotSupported()
 
-        conn.node = node
-        conn.resp = None
-        if is_success(resp.status) or resp.status == HTTP_CONFLICT:
-            conn.resp = resp
-        elif (headers.get('If-None-Match', None) is not None and
-              resp.status == HTTP_PRECONDITION_FAILED):
-            conn.resp = resp
-
-        return cls(conn, node, resp, path, connect_duration, mime_boundary)
+        return cls(conn, node, final_resp, req, connect_duration, logger,
+                   mime_boundary, multiphase=need_multiphase)
 
 
 def chunk_transformer(policy, nstreams):
@@ -1901,7 +1809,7 @@ def chunk_transformer(policy, nstreams):
 def trailing_metadata(policy, client_obj_hasher,
                       bytes_transferred_from_client,
                       fragment_archive_index):
-    return {
+    return HeaderKeyDict({
         # etag and size values are being added twice here.
         # The container override header is used to update the container db
         # with these values as they represent the correct etag and size for
@@ -1910,6 +1818,11 @@ def trailing_metadata(policy, client_obj_hasher,
         'X-Object-Sysmeta-EC-Etag': client_obj_hasher.hexdigest(),
         'X-Object-Sysmeta-EC-Content-Length':
         str(bytes_transferred_from_client),
+        # older style x-backend-container-update-override-* headers are used
+        # here (rather than x-object-sysmeta-container-update-override-*
+        # headers) for backwards compatibility: the request may be to an object
+        # server that has not yet been upgraded to accept the newer style
+        # x-object-sysmeta-container-update-override- headers.
         'X-Backend-Container-Update-Override-Etag':
         client_obj_hasher.hexdigest(),
         'X-Backend-Container-Update-Override-Size':
@@ -1919,12 +1832,265 @@ def trailing_metadata(policy, client_obj_hasher,
         # AKA "what is this thing?"
         'X-Object-Sysmeta-EC-Scheme': policy.ec_scheme_description,
         'X-Object-Sysmeta-EC-Segment-Size': str(policy.ec_segment_size),
-    }
+    })
+
+
+class ECGetResponseBucket(object):
+    """
+    A helper class to encapsulate the properties of buckets in which fragment
+    getters and alternate nodes are collected.
+    """
+    def __init__(self, policy, timestamp_str):
+        """
+        :param policy: an instance of ECStoragePolicy
+        :param timestamp_str: a string representation of a timestamp
+        """
+        self.policy = policy
+        self.timestamp_str = timestamp_str
+        self.gets = collections.defaultdict(list)
+        self.alt_nodes = collections.defaultdict(list)
+        self._durable = False
+        self.status = self.headers = None
+
+    def set_durable(self):
+        self._durable = True
+
+    def add_response(self, getter, parts_iter):
+        if not self.gets:
+            self.status = getter.last_status
+            # stash first set of backend headers, which will be used to
+            # populate a client response
+            # TODO: each bucket is for a single *data* timestamp, but sources
+            # in the same bucket may have different *metadata* timestamps if
+            # some backends have more recent .meta files than others. Currently
+            # we just use the last received metadata headers - this behavior is
+            # ok and is consistent with a replication policy GET which
+            # similarly does not attempt to find the backend with the most
+            # recent metadata. We could alternatively choose to the *newest*
+            # metadata headers for self.headers by selecting the source with
+            # the latest X-Timestamp.
+            self.headers = getter.last_headers
+        elif (getter.last_headers.get('X-Object-Sysmeta-Ec-Etag') !=
+              self.headers.get('X-Object-Sysmeta-Ec-Etag')):
+            # Fragments at the same timestamp with different etags are never
+            # expected. If somehow it happens then ignore those fragments
+            # to avoid mixing fragments that will not reconstruct otherwise
+            # an exception from pyeclib is almost certain. This strategy leaves
+            # a possibility that a set of consistent frags will be gathered.
+            raise ValueError("ETag mismatch")
+
+        frag_index = getter.last_headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+        frag_index = int(frag_index) if frag_index is not None else None
+        self.gets[frag_index].append((getter, parts_iter))
+
+    def get_responses(self):
+        """
+        Return a list of all useful sources. Where there are multiple sources
+        associated with the same frag_index then only one is included.
+
+        :return: a list of sources, each source being a tuple of form
+                (ResumingGetter, iter)
+        """
+        all_sources = []
+        for frag_index, sources in self.gets.items():
+            if frag_index is None:
+                # bad responses don't have a frag_index (and fake good
+                # responses from some unit tests)
+                all_sources.extend(sources)
+            else:
+                all_sources.extend(sources[:1])
+        return all_sources
+
+    def add_alternate_nodes(self, node, frag_indexes):
+        for frag_index in frag_indexes:
+            self.alt_nodes[frag_index].append(node)
+
+    @property
+    def shortfall(self):
+        # A non-durable bucket always has a shortfall of at least 1
+        result = self.policy.ec_ndata - len(self.get_responses())
+        return max(result, 0 if self._durable else 1)
+
+    @property
+    def shortfall_with_alts(self):
+        # The shortfall that we expect to have if we were to send requests
+        # for frags on the alt nodes.
+        alts = set(self.alt_nodes.keys()).difference(set(self.gets.keys()))
+        result = self.policy.ec_ndata - (len(self.get_responses()) + len(alts))
+        return max(result, 0 if self._durable else 1)
+
+    def __str__(self):
+        # return a string summarising bucket state, useful for debugging.
+        return '<%s, %s, %s, %s(%s), %s>' \
+               % (self.timestamp_str, self.status, self._durable,
+                  self.shortfall, self.shortfall_with_alts, len(self.gets))
+
+
+class ECGetResponseCollection(object):
+    """
+    Manages all successful EC GET responses gathered by ResumingGetters.
+
+    A response comprises a tuple of (<getter instance>, <parts iterator>). All
+    responses having the same data timestamp are placed in an
+    ECGetResponseBucket for that timestamp. The buckets are stored in the
+    'buckets' dict which maps timestamp-> bucket.
+
+    This class encapsulates logic for selecting the best bucket from the
+    collection, and for choosing alternate nodes.
+    """
+    def __init__(self, policy):
+        """
+        :param policy: an instance of ECStoragePolicy
+        """
+        self.policy = policy
+        self.buckets = {}
+        self.node_iter_count = 0
+
+    def _get_bucket(self, timestamp_str):
+        """
+        :param timestamp_str: a string representation of a timestamp
+        :return: ECGetResponseBucket for given timestamp
+        """
+        return self.buckets.setdefault(
+            timestamp_str, ECGetResponseBucket(self.policy, timestamp_str))
+
+    def add_response(self, get, parts_iter):
+        """
+        Add a response to the collection.
+
+        :param get: An instance of
+                    :class:`~swift.proxy.controllers.base.ResumingGetter`
+        :param parts_iter: An iterator over response body parts
+        :raises ValueError: if the response etag or status code values do not
+            match any values previously received for the same timestamp
+        """
+        headers = get.last_headers
+        # Add the response to the appropriate bucket keyed by data file
+        # timestamp. Fall back to using X-Backend-Timestamp as key for object
+        # servers that have not been upgraded.
+        t_data_file = headers.get('X-Backend-Data-Timestamp')
+        t_obj = headers.get('X-Backend-Timestamp', headers.get('X-Timestamp'))
+        self._get_bucket(t_data_file or t_obj).add_response(get, parts_iter)
+
+        # The node may also have alternate fragments indexes (possibly at
+        # different timestamps). For each list of alternate fragments indexes,
+        # find the bucket for their data file timestamp and add the node and
+        # list to that bucket's alternate nodes.
+        frag_sets = safe_json_loads(headers.get('X-Backend-Fragments')) or {}
+        for t_frag, frag_set in frag_sets.items():
+            self._get_bucket(t_frag).add_alternate_nodes(get.node, frag_set)
+        # If the response includes a durable timestamp then mark that bucket as
+        # durable. Note that this may be a different bucket than the one this
+        # response got added to, and that we may never go and get a durable
+        # frag from this node; it is sufficient that we have been told that a
+        # durable frag exists, somewhere, at t_durable.
+        t_durable = headers.get('X-Backend-Durable-Timestamp')
+        if not t_durable and not t_data_file:
+            # obj server not upgraded so assume this response's frag is durable
+            t_durable = t_obj
+        if t_durable:
+            self._get_bucket(t_durable).set_durable()
+
+    def _sort_buckets(self):
+        def key_fn(bucket):
+            # Returns a tuple to use for sort ordering:
+            # buckets with no shortfall sort higher,
+            # otherwise buckets with lowest shortfall_with_alts sort higher,
+            # finally buckets with newer timestamps sort higher.
+            return (bucket.shortfall <= 0,
+                    (not (bucket.shortfall <= 0) and
+                     (-1 * bucket.shortfall_with_alts)),
+                    bucket.timestamp_str)
+
+        return sorted(self.buckets.values(), key=key_fn, reverse=True)
+
+    @property
+    def best_bucket(self):
+        """
+        Return the best bucket in the collection.
+
+        The "best" bucket is the newest timestamp with sufficient getters, or
+        the closest to having a sufficient getters, unless it is bettered by a
+        bucket with potential alternate nodes.
+
+        :return: An instance of :class:`~ECGetResponseBucket` or None if there
+                 are no buckets in the collection.
+        """
+        sorted_buckets = self._sort_buckets()
+        if sorted_buckets:
+            return sorted_buckets[0]
+        return None
+
+    def _get_frag_prefs(self):
+        # Construct the current frag_prefs list, with best_bucket prefs first.
+        frag_prefs = []
+
+        for bucket in self._sort_buckets():
+            if bucket.timestamp_str:
+                exclusions = [fi for fi in bucket.gets if fi is not None]
+                prefs = {'timestamp': bucket.timestamp_str,
+                         'exclude': exclusions}
+                frag_prefs.append(prefs)
+
+        return frag_prefs
+
+    def get_extra_headers(self):
+        frag_prefs = self._get_frag_prefs()
+        return {'X-Backend-Fragment-Preferences': json.dumps(frag_prefs)}
+
+    def _get_alternate_nodes(self):
+        if self.node_iter_count <= self.policy.ec_ndata:
+            # It makes sense to wait before starting to use alternate nodes,
+            # because if we find sufficient frags on *distinct* nodes then we
+            # spread work across mode nodes. There's no formal proof that
+            # waiting for ec_ndata GETs is the right answer, but it seems
+            # reasonable to try *at least* that many primary nodes before
+            # resorting to alternate nodes.
+            return None
+
+        bucket = self.best_bucket
+        if (bucket is None) or (bucket.shortfall <= 0):
+            return None
+
+        alt_frags = set(bucket.alt_nodes.keys())
+        got_frags = set(bucket.gets.keys())
+        wanted_frags = list(alt_frags.difference(got_frags))
+
+        # We may have the same frag_index on more than one node so shuffle to
+        # avoid using the same frag_index consecutively, since we may not get a
+        # response from the last node provided before being asked to provide
+        # another node.
+        random.shuffle(wanted_frags)
+
+        for frag_index in wanted_frags:
+            nodes = bucket.alt_nodes.get(frag_index)
+            if nodes:
+                return nodes
+        return None
+
+    def has_alternate_node(self):
+        return True if self._get_alternate_nodes() else False
+
+    def provide_alternate_node(self):
+        """
+        Callback function that is installed in a NodeIter. Called on every call
+        to NodeIter.next(), which means we can track the number of nodes to
+        which GET requests have been made and selectively inject an alternate
+        node, if we have one.
+
+        :return: A dict describing a node to which the next GET request
+                 should be made.
+        """
+        self.node_iter_count += 1
+        nodes = self._get_alternate_nodes()
+        if nodes:
+            return nodes.pop(0).copy()
 
 
 @ObjectControllerRouter.register(EC_POLICY)
 class ECObjectController(BaseObjectController):
-    def _fragment_GET_request(self, req, node_iter, partition, policy):
+    def _fragment_GET_request(self, req, node_iter, partition, policy,
+                              header_provider=None):
         """
         Makes a GET request for a fragment.
         """
@@ -1935,7 +2101,7 @@ class ECObjectController(BaseObjectController):
                                 partition, req.swift_entity_path,
                                 backend_headers,
                                 client_chunk_size=policy.fragment_size,
-                                newest=False)
+                                newest=False, header_provider=header_provider)
         return (getter, getter.response_parts_iter(req))
 
     def _convert_range(self, req, policy):
@@ -1991,8 +2157,7 @@ class ECObjectController(BaseObjectController):
         return range_specs
 
     def _get_or_head_response(self, req, node_iter, partition, policy):
-        req.headers.setdefault("X-Backend-Etag-Is-At",
-                               "X-Object-Sysmeta-Ec-Etag")
+        update_etag_is_at_header(req, "X-Object-Sysmeta-Ec-Etag")
 
         if req.method == 'HEAD':
             # no fancy EC decoding here, just one plain old HEAD request to
@@ -2002,101 +2167,142 @@ class ECObjectController(BaseObjectController):
             resp = self.GETorHEAD_base(
                 req, _('Object'), node_iter, partition,
                 req.swift_entity_path, concurrency)
-        else:  # GET request
-            orig_range = None
-            range_specs = []
-            if req.range:
-                orig_range = req.range
-                range_specs = self._convert_range(req, policy)
+            self._fix_response(req, resp)
+            return resp
 
-            safe_iter = GreenthreadSafeIterator(node_iter)
-            # Sending the request concurrently to all nodes, and responding
-            # with the first response isn't something useful for EC as all
-            # nodes contain different fragments. Also EC has implemented it's
-            # own specific implementation of concurrent gets to ec_ndata nodes.
-            # So we don't need to  worry about plumbing and sending a
-            # concurrency value to ResumingGetter.
-            with ContextPool(policy.ec_ndata) as pool:
-                pile = GreenAsyncPile(pool)
-                for _junk in range(policy.ec_ndata):
-                    pile.spawn(self._fragment_GET_request,
-                               req, safe_iter, partition,
-                               policy)
+        # GET request
+        orig_range = None
+        range_specs = []
+        if req.range:
+            orig_range = req.range
+            range_specs = self._convert_range(req, policy)
 
-                bad_gets = []
-                etag_buckets = collections.defaultdict(list)
-                best_etag = None
-                for get, parts_iter in pile:
-                    if is_success(get.last_status):
-                        etag = HeaderKeyDict(
-                            get.last_headers)['X-Object-Sysmeta-Ec-Etag']
-                        etag_buckets[etag].append((get, parts_iter))
-                        if etag != best_etag and (
-                                len(etag_buckets[etag]) >
-                                len(etag_buckets[best_etag])):
-                            best_etag = etag
-                    else:
-                        bad_gets.append((get, parts_iter))
-                    matching_response_count = max(
-                        len(etag_buckets[best_etag]), len(bad_gets))
-                    if (policy.ec_ndata - matching_response_count >
-                            pile._pending) and node_iter.nodes_left > 0:
-                        # we need more matching responses to reach ec_ndata
-                        # than we have pending gets, as long as we still have
-                        # nodes in node_iter we can spawn another
-                        pile.spawn(self._fragment_GET_request, req,
-                                   safe_iter, partition, policy)
+        safe_iter = GreenthreadSafeIterator(node_iter)
+        # Sending the request concurrently to all nodes, and responding
+        # with the first response isn't something useful for EC as all
+        # nodes contain different fragments. Also EC has implemented it's
+        # own specific implementation of concurrent gets to ec_ndata nodes.
+        # So we don't need to  worry about plumbing and sending a
+        # concurrency value to ResumingGetter.
+        with ContextPool(policy.ec_ndata) as pool:
+            pile = GreenAsyncPile(pool)
+            buckets = ECGetResponseCollection(policy)
+            node_iter.set_node_provider(buckets.provide_alternate_node)
+            # include what may well be an empty X-Backend-Fragment-Preferences
+            # header from the buckets.get_extra_headers to let the object
+            # server know that it is ok to return non-durable fragments
+            for _junk in range(policy.ec_ndata):
+                pile.spawn(self._fragment_GET_request,
+                           req, safe_iter, partition,
+                           policy, buckets.get_extra_headers)
 
-            req.range = orig_range
-            if len(etag_buckets[best_etag]) >= policy.ec_ndata:
-                # headers can come from any of the getters
-                resp_headers = HeaderKeyDict(
-                    etag_buckets[best_etag][0][0].source_headers[-1])
-                resp_headers.pop('Content-Range', None)
-                eccl = resp_headers.get('X-Object-Sysmeta-Ec-Content-Length')
-                obj_length = int(eccl) if eccl is not None else None
-
-                # This is only true if we didn't get a 206 response, but
-                # that's the only time this is used anyway.
-                fa_length = int(resp_headers['Content-Length'])
-                app_iter = ECAppIter(
-                    req.swift_entity_path,
-                    policy,
-                    [iterator for getter, iterator in etag_buckets[best_etag]],
-                    range_specs, fa_length, obj_length,
-                    self.app.logger)
-                resp = Response(
-                    request=req,
-                    headers=resp_headers,
-                    conditional_response=True,
-                    app_iter=app_iter)
+            bad_bucket = ECGetResponseBucket(policy, None)
+            bad_bucket.set_durable()
+            best_bucket = None
+            extra_requests = 0
+            # max_extra_requests is an arbitrary hard limit for spawning extra
+            # getters in case some unforeseen scenario, or a misbehaving object
+            # server, causes us to otherwise make endless requests e.g. if an
+            # object server were to ignore frag_prefs and always respond with
+            # a frag that is already in a bucket.
+            max_extra_requests = 2 * policy.ec_nparity + policy.ec_ndata
+            for get, parts_iter in pile:
+                if get.last_status is None:
+                    # We may have spawned getters that find the node iterator
+                    # has been exhausted. Ignore them.
+                    # TODO: turns out that node_iter.nodes_left can bottom
+                    # out at >0 when number of devs in ring is < 2* replicas,
+                    # which definitely happens in tests and results in status
+                    # of None. We should fix that but keep this guard because
+                    # there is also a race between testing nodes_left/spawning
+                    # a getter and an existing getter calling next(node_iter).
+                    continue
                 try:
-                    app_iter.kickoff(req, resp)
-                except HTTPException as err_resp:
-                    # catch any HTTPException response here so that we can
-                    # process response headers uniformly in _fix_response
-                    resp = err_resp
-            else:
-                statuses = []
-                reasons = []
-                bodies = []
-                headers = []
-                for getter, body_parts_iter in bad_gets:
-                    statuses.extend(getter.statuses)
-                    reasons.extend(getter.reasons)
-                    bodies.extend(getter.bodies)
-                    headers.extend(getter.source_headers)
-                resp = self.best_response(
-                    req, statuses, reasons, bodies, 'Object',
-                    headers=headers)
-        self._fix_response(resp)
+                    if is_success(get.last_status):
+                        # 2xx responses are managed by a response collection
+                        buckets.add_response(get, parts_iter)
+                    else:
+                        # all other responses are lumped into a single bucket
+                        bad_bucket.add_response(get, parts_iter)
+                except ValueError as err:
+                    self.app.logger.error(
+                        _("Problem with fragment response: %s"), err)
+                shortfall = bad_bucket.shortfall
+                best_bucket = buckets.best_bucket
+                if best_bucket:
+                    shortfall = min(best_bucket.shortfall, shortfall)
+                if (extra_requests < max_extra_requests and
+                        shortfall > pile._pending and
+                        (node_iter.nodes_left > 0 or
+                         buckets.has_alternate_node())):
+                    # we need more matching responses to reach ec_ndata
+                    # than we have pending gets, as long as we still have
+                    # nodes in node_iter we can spawn another
+                    extra_requests += 1
+                    pile.spawn(self._fragment_GET_request, req,
+                               safe_iter, partition, policy,
+                               buckets.get_extra_headers)
+
+        req.range = orig_range
+        if best_bucket and best_bucket.shortfall <= 0:
+            # headers can come from any of the getters
+            resp_headers = best_bucket.headers
+            resp_headers.pop('Content-Range', None)
+            eccl = resp_headers.get('X-Object-Sysmeta-Ec-Content-Length')
+            obj_length = int(eccl) if eccl is not None else None
+
+            # This is only true if we didn't get a 206 response, but
+            # that's the only time this is used anyway.
+            fa_length = int(resp_headers['Content-Length'])
+            app_iter = ECAppIter(
+                req.swift_entity_path,
+                policy,
+                [parts_iter for
+                 _getter, parts_iter in best_bucket.get_responses()],
+                range_specs, fa_length, obj_length,
+                self.app.logger)
+            resp = Response(
+                request=req,
+                headers=resp_headers,
+                conditional_response=True,
+                app_iter=app_iter)
+            try:
+                app_iter.kickoff(req, resp)
+            except HTTPException as err_resp:
+                # catch any HTTPException response here so that we can
+                # process response headers uniformly in _fix_response
+                resp = err_resp
+        else:
+            # TODO: we can get here if all buckets are successful but none
+            # have ec_ndata getters, so bad_bucket may have no gets and we will
+            # return a 503 when a 404 may be more appropriate. We can also get
+            # here with less than ec_ndata 416's and may then return a 416
+            # which is also questionable because a non-range get for same
+            # object would return 404 or 503.
+            statuses = []
+            reasons = []
+            bodies = []
+            headers = []
+            for getter, _parts_iter in bad_bucket.get_responses():
+                statuses.extend(getter.statuses)
+                reasons.extend(getter.reasons)
+                bodies.extend(getter.bodies)
+                headers.extend(getter.source_headers)
+            resp = self.best_response(
+                req, statuses, reasons, bodies, 'Object',
+                headers=headers)
+        self._fix_response(req, resp)
         return resp
 
-    def _fix_response(self, resp):
+    def _fix_response(self, req, resp):
         # EC fragment archives each have different bytes, hence different
         # etags. However, they all have the original object's etag stored in
         # sysmeta, so we copy that here (if it exists) so the client gets it.
         resp.headers['Etag'] = resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+        # We're about to invoke conditional response checking so set the
+        # correct conditional etag from wherever X-Backend-Etag-Is-At points,
+        # if it exists at all.
+        resp._conditional_etag = resolve_etag_is_at_header(req, resp.headers)
         if (is_success(resp.status_int) or is_redirection(resp.status_int) or
                 resp.status_int == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE):
             resp.accept_ranges = 'bytes'
@@ -2105,66 +2311,13 @@ class ECObjectController(BaseObjectController):
                 'X-Object-Sysmeta-Ec-Content-Length')
             resp.fix_conditional_response()
 
-    def _connect_put_node(self, node_iter, part, path, headers,
-                          logger_thread_locals):
-        """
-        Make a connection for a erasure encoded object.
-
-        Connects to the first working node that it finds in node_iter and sends
-        over the request headers. Returns a Putter to handle the rest of the
-        streaming, or None if no working nodes were found.
-        """
-        # the object server will get different bytes, so these
-        # values do not apply (Content-Length might, in general, but
-        # in the specific case of replication vs. EC, it doesn't).
-        client_cl = headers.pop('Content-Length', None)
-        headers.pop('Etag', None)
-
-        expected_frag_size = None
-        if client_cl:
-            policy_index = int(headers.get('X-Backend-Storage-Policy-Index'))
-            policy = POLICIES.get_by_index(policy_index)
-            # TODO: PyECLib <= 1.2.0 looks to return the segment info
-            # different from the input for aligned data efficiency but
-            # Swift never does. So calculate the fragment length Swift
-            # will actually send to object sever by making two different
-            # get_segment_info calls (until PyECLib fixed).
-            # policy.fragment_size makes the call using segment size,
-            # and the next call is to get info for the last segment
-
-            # get number of fragments except the tail - use truncation //
-            num_fragments = int(client_cl) // policy.ec_segment_size
-            expected_frag_size = policy.fragment_size * num_fragments
-
-            # calculate the tail fragment_size by hand and add it to
-            # expected_frag_size
-            last_segment_size = int(client_cl) % policy.ec_segment_size
-            if last_segment_size:
-                last_info = policy.pyeclib_driver.get_segment_info(
-                    last_segment_size, policy.ec_segment_size)
-                expected_frag_size += last_info['fragment_size']
-
-        self.app.logger.thread_locals = logger_thread_locals
-        for node in node_iter:
-            try:
-                putter = ECPutter.connect(
-                    node, part, path, headers,
-                    conn_timeout=self.app.conn_timeout,
-                    node_timeout=self.app.node_timeout,
-                    expected_frag_archive_size=expected_frag_size)
-                self.app.set_node_timing(node, putter.connect_duration)
-                return putter
-            except InsufficientStorage:
-                self.app.error_limit(node, _('ERROR Insufficient Storage'))
-            except PutterConnectError as e:
-                self.app.error_occurred(
-                    node, _('ERROR %(status)d Expect: 100-continue '
-                            'From Object Server') % {
-                                'status': e.status})
-            except (Exception, Timeout):
-                self.app.exception_occurred(
-                    node, _('Object'),
-                    _('Expect: 100-continue on %s') % path)
+    def _make_putter(self, node, part, req, headers):
+        return MIMEPutter.connect(
+            node, part, req.swift_entity_path, headers,
+            conn_timeout=self.app.conn_timeout,
+            node_timeout=self.app.node_timeout,
+            logger=self.app.logger,
+            need_multiphase=True)
 
     def _determine_chunk_destinations(self, putters):
         """
@@ -2212,8 +2365,16 @@ class ECObjectController(BaseObjectController):
         bytes_transferred = 0
         chunk_transform = chunk_transformer(policy, len(nodes))
         chunk_transform.send(None)
+        chunk_hashers = collections.defaultdict(md5)
 
         def send_chunk(chunk):
+            # Note: there's two different hashers in here. etag_hasher is
+            # hashing the original object so that we can validate the ETag
+            # that the client sent (and etag_hasher is None if the client
+            # didn't send one). The hasher in chunk_hashers is hashing the
+            # fragment archive being sent to the client; this lets us guard
+            # against data corruption on the network between proxy and
+            # object server.
             if etag_hasher:
                 etag_hasher.update(chunk)
             backend_chunks = chunk_transform.send(chunk)
@@ -2223,15 +2384,18 @@ class ECObjectController(BaseObjectController):
                 return
 
             for putter in list(putters):
-                backend_chunk = backend_chunks[chunk_index[putter]]
+                ci = chunk_index[putter]
+                backend_chunk = backend_chunks[ci]
                 if not putter.failed:
-                    putter.chunk_hasher.update(backend_chunk)
+                    chunk_hashers[ci].update(backend_chunk)
                     putter.send_chunk(backend_chunk)
                 else:
+                    putter.close()
                     putters.remove(putter)
             self._check_min_conn(
-                req, putters, min_conns, msg='Object PUT exceptions during'
-                ' send, %(conns)s/%(nodes)s required connections')
+                req, putters, min_conns,
+                msg=_('Object PUT exceptions during send, '
+                      '%(conns)s/%(nodes)s required connections'))
 
         try:
             with ContextPool(len(putters)) as pool:
@@ -2274,14 +2438,26 @@ class ECObjectController(BaseObjectController):
 
                 send_chunk('')  # flush out any buffered data
 
+                footers = self._get_footers(req)
+                received_etag = footers.get(
+                    'etag', '').strip('"')
+                if (computed_etag and received_etag and
+                   computed_etag != received_etag):
+                    raise HTTPUnprocessableEntity(request=req)
+
+                # Remove any EC reserved metadata names from footers
+                footers = {(k, v) for k, v in footers.items()
+                           if not k.lower().startswith('x-object-sysmeta-ec-')}
                 for putter in putters:
+                    ci = chunk_index[putter]
+                    # Update any footers set by middleware with EC footers
                     trail_md = trailing_metadata(
                         policy, etag_hasher,
-                        bytes_transferred,
-                        chunk_index[putter])
-                    trail_md['Etag'] = \
-                        putter.chunk_hasher.hexdigest()
-                    putter.end_of_object_data(trail_md)
+                        bytes_transferred, ci)
+                    trail_md.update(footers)
+                    # Etag footer must always be hash of what we sent
+                    trail_md['Etag'] = chunk_hashers[ci].hexdigest()
+                    putter.end_of_object_data(footer_metadata=trail_md)
 
                 for putter in putters:
                     putter.wait()
@@ -2292,12 +2468,12 @@ class ECObjectController(BaseObjectController):
                 # object data and metadata commit and is a necessary
                 # condition to be met before starting 2nd PUT phase
                 final_phase = False
-                need_quorum = True
-                statuses, reasons, bodies, _junk, quorum = \
+                statuses, reasons, bodies, _junk = \
                     self._get_put_responses(
-                        req, putters, len(nodes), final_phase,
-                        min_conns, need_quorum=need_quorum)
-                if not quorum:
+                        req, putters, len(nodes), final_phase=final_phase,
+                        min_responses=min_conns)
+                if not self.have_quorum(
+                        statuses, len(nodes), quorum=min_conns):
                     self.app.logger.error(
                         _('Not enough object servers ack\'ed (got %d)'),
                         statuses.count(HTTP_CONTINUE))
@@ -2355,7 +2531,7 @@ class ECObjectController(BaseObjectController):
         """
         Given a list of statuses from several requests, determine if a
         satisfactory number of nodes have responded with 1xx or 2xx statuses to
-        deem the transaction for a succssful response to the client.
+        deem the transaction for a successful response to the client.
 
         :param statuses: list of statuses returned so far
         :param min_responses: minimal pass criterion for number of successes
@@ -2380,109 +2556,15 @@ class ECObjectController(BaseObjectController):
         return self._have_adequate_responses(
             statuses, min_responses, is_informational)
 
-    def _await_response(self, conn, final_phase):
-        return conn.await_response(
-            self.app.node_timeout, not final_phase)
-
-    def _get_conn_response(self, conn, req, logger_thread_locals,
-                           final_phase, **kwargs):
-        self.app.logger.thread_locals = logger_thread_locals
-        try:
-            resp = self._await_response(conn, final_phase=final_phase,
-                                        **kwargs)
-        except (Exception, Timeout):
-            resp = None
-            if final_phase:
-                status_type = 'final'
-            else:
-                status_type = 'commit'
-            self.app.exception_occurred(
-                conn.node, _('Object'),
-                _('Trying to get %(status_type)s status of PUT to %(path)s') %
-                {'status_type': status_type, 'path': req.path})
-        return (conn, resp)
-
-    def _get_put_responses(self, req, putters, num_nodes, final_phase,
-                           min_responses, need_quorum=True):
-        """
-        Collect erasure coded object responses.
-
-        Collect object responses to a PUT request and determine if
-        satisfactory number of nodes have returned success.  Return
-        statuses, quorum result if indicated by 'need_quorum' and
-        etags if this is a final phase or a multiphase PUT transaction.
-
-        :param req: the request
-        :param putters: list of putters for the request
-        :param num_nodes: number of nodes involved
-        :param final_phase: boolean indicating if this is the last phase
-        :param min_responses: minimum needed when not requiring quorum
-        :param need_quorum: boolean indicating if quorum is required
-        """
-        statuses = []
-        reasons = []
-        bodies = []
-        etags = set()
-
-        pile = GreenAsyncPile(len(putters))
-        for putter in putters:
-            if putter.failed:
-                continue
-            pile.spawn(self._get_conn_response, putter, req,
-                       self.app.logger.thread_locals, final_phase=final_phase)
-
-        def _handle_response(putter, response):
-            statuses.append(response.status)
-            reasons.append(response.reason)
-            if final_phase:
-                body = response.read()
-            else:
-                body = ''
-            bodies.append(body)
-            if response.status == HTTP_INSUFFICIENT_STORAGE:
-                putter.failed = True
-                self.app.error_limit(putter.node,
-                                     _('ERROR Insufficient Storage'))
-            elif response.status >= HTTP_INTERNAL_SERVER_ERROR:
-                putter.failed = True
-                self.app.error_occurred(
-                    putter.node,
-                    _('ERROR %(status)d %(body)s From Object Server '
-                      're: %(path)s') %
-                    {'status': response.status,
-                     'body': body[:1024], 'path': req.path})
-            elif is_success(response.status):
-                etags.add(response.getheader('etag').strip('"'))
-
-        quorum = False
-        for (putter, response) in pile:
-            if response:
-                _handle_response(putter, response)
-                if self._have_adequate_successes(statuses, min_responses):
-                    break
-            else:
-                putter.failed = True
-
-        # give any pending requests *some* chance to finish
-        finished_quickly = pile.waitall(self.app.post_quorum_timeout)
-        for (putter, response) in finished_quickly:
-            if response:
-                _handle_response(putter, response)
-
-        if need_quorum:
-            if final_phase:
-                while len(statuses) < num_nodes:
-                    statuses.append(HTTP_SERVICE_UNAVAILABLE)
-                    reasons.append('')
-                    bodies.append('')
-            else:
-                # intermediate response phase - set return value to true only
-                # if there are responses having same value of *any* status
-                # except 5xx
-                if self.have_quorum(statuses, num_nodes, quorum=min_responses):
-                    quorum = True
-
-        return statuses, reasons, bodies, etags, quorum
+    def _have_adequate_put_responses(self, statuses, num_nodes, min_responses):
+        # For an EC PUT we require a quorum of responses with success statuses
+        # in order to move on to next phase of PUT request handling without
+        # having to wait for *all* responses.
+        # TODO: this implies that in the first phase of the backend PUTs when
+        # we are actually expecting 1xx responses that we will end up waiting
+        # for *all* responses. That seems inefficient since we only need a
+        # quorum of 1xx responses to proceed.
+        return self._have_adequate_successes(statuses, min_responses)
 
     def _store_object(self, req, data_source, nodes, partition,
                       outgoing_headers):
@@ -2491,6 +2573,35 @@ class ECObjectController(BaseObjectController):
         """
         policy_index = int(req.headers.get('X-Backend-Storage-Policy-Index'))
         policy = POLICIES.get_by_index(policy_index)
+
+        expected_frag_size = None
+        if req.content_length:
+            # TODO: PyECLib <= 1.2.0 looks to return the segment info
+            # different from the input for aligned data efficiency but
+            # Swift never does. So calculate the fragment length Swift
+            # will actually send to object sever by making two different
+            # get_segment_info calls (until PyECLib fixed).
+            # policy.fragment_size makes the call using segment size,
+            # and the next call is to get info for the last segment
+
+            # get number of fragments except the tail - use truncation //
+            num_fragments = req.content_length // policy.ec_segment_size
+            expected_frag_size = policy.fragment_size * num_fragments
+
+            # calculate the tail fragment_size by hand and add it to
+            # expected_frag_size
+            last_segment_size = req.content_length % policy.ec_segment_size
+            if last_segment_size:
+                last_info = policy.pyeclib_driver.get_segment_info(
+                    last_segment_size, policy.ec_segment_size)
+                expected_frag_size += last_info['fragment_size']
+        for headers in outgoing_headers:
+            headers['X-Backend-Obj-Content-Length'] = expected_frag_size
+            # the object server will get different bytes, so these
+            # values do not apply.
+            headers.pop('Content-Length', None)
+            headers.pop('Etag', None)
+
         # Since the request body sent from client -> proxy is not
         # the same as the request body sent proxy -> object, we
         # can't rely on the object-server to do the etag checking -
@@ -2499,35 +2610,34 @@ class ECObjectController(BaseObjectController):
 
         min_conns = policy.quorum
         putters = self._get_put_connections(
-            req, nodes, partition, outgoing_headers,
-            policy, expect=True)
+            req, nodes, partition, outgoing_headers, policy)
 
         try:
             # check that a minimum number of connections were established and
             # meet all the correct conditions set in the request
-            self._check_failure_put_connections(putters, req, nodes, min_conns)
+            self._check_failure_put_connections(putters, req, min_conns)
 
             self._transfer_data(req, policy, data_source, putters,
                                 nodes, min_conns, etag_hasher)
-            final_phase = True
-            need_quorum = False
-            # The .durable file will propagate in a replicated fashion; if
-            # one exists, the reconstructor will spread it around.
+            # The durable state will propagate in a replicated fashion; if
+            # one fragment is durable then the reconstructor will spread the
+            # durable status around.
             # In order to avoid successfully writing an object, but refusing
             # to serve it on a subsequent GET because don't have enough
             # durable data fragments - we require the same number of durable
             # writes as quorum fragment writes.  If object servers are in the
             # future able to serve their non-durable fragment archives we may
             # be able to reduce this quorum count if needed.
-            min_conns = policy.quorum
-            putters = [p for p in putters if not p.failed]
-            # ignore response etags, and quorum boolean
-            statuses, reasons, bodies, _etags, _quorum = \
+            # ignore response etags
+            statuses, reasons, bodies, _etags = \
                 self._get_put_responses(req, putters, len(nodes),
-                                        final_phase, min_conns,
-                                        need_quorum=need_quorum)
+                                        final_phase=True,
+                                        min_responses=min_conns)
         except HTTPException as resp:
             return resp
+        finally:
+            for putter in putters:
+                putter.close()
 
         etag = etag_hasher.hexdigest()
         resp = self.best_response(req, statuses, reasons, bodies,

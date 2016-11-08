@@ -37,26 +37,26 @@ addition::
 
         "rounds": [
             [
-                ["add", "r1z2-10.20.30.40:6000/sda", 8000],
-                ["add", "r1z2-10.20.30.40:6000/sdb", 8000],
-                ["add", "r1z2-10.20.30.40:6000/sdc", 8000],
-                ["add", "r1z2-10.20.30.40:6000/sdd", 8000],
+                ["add", "r1z2-10.20.30.40:6200/sda", 8000],
+                ["add", "r1z2-10.20.30.40:6200/sdb", 8000],
+                ["add", "r1z2-10.20.30.40:6200/sdc", 8000],
+                ["add", "r1z2-10.20.30.40:6200/sdd", 8000],
 
-                ["add", "r1z2-10.20.30.41:6000/sda", 8000],
-                ["add", "r1z2-10.20.30.41:6000/sdb", 8000],
-                ["add", "r1z2-10.20.30.41:6000/sdc", 8000],
-                ["add", "r1z2-10.20.30.41:6000/sdd", 8000],
+                ["add", "r1z2-10.20.30.41:6200/sda", 8000],
+                ["add", "r1z2-10.20.30.41:6200/sdb", 8000],
+                ["add", "r1z2-10.20.30.41:6200/sdc", 8000],
+                ["add", "r1z2-10.20.30.41:6200/sdd", 8000],
 
-                ["add", "r1z2-10.20.30.43:6000/sda", 8000],
-                ["add", "r1z2-10.20.30.43:6000/sdb", 8000],
-                ["add", "r1z2-10.20.30.43:6000/sdc", 8000],
-                ["add", "r1z2-10.20.30.43:6000/sdd", 8000],
+                ["add", "r1z2-10.20.30.43:6200/sda", 8000],
+                ["add", "r1z2-10.20.30.43:6200/sdb", 8000],
+                ["add", "r1z2-10.20.30.43:6200/sdc", 8000],
+                ["add", "r1z2-10.20.30.43:6200/sdd", 8000],
 
-                ["add", "r1z2-10.20.30.44:6000/sda", 8000],
-                ["add", "r1z2-10.20.30.44:6000/sdb", 8000],
-                ["add", "r1z2-10.20.30.44:6000/sdc", 8000]
+                ["add", "r1z2-10.20.30.44:6200/sda", 8000],
+                ["add", "r1z2-10.20.30.44:6200/sdb", 8000],
+                ["add", "r1z2-10.20.30.44:6200/sdc", 8000]
             ], [
-                ["add", "r1z2-10.20.30.44:6000/sdd", 1000]
+                ["add", "r1z2-10.20.30.44:6200/sdd", 1000]
             ], [
                 ["set_weight", 15, 2000]
             ], [
@@ -294,7 +294,7 @@ def run_scenario(scenario):
     }
 
     for round_index, commands in enumerate(scenario['rounds']):
-        print "Round %d" % (round_index + 1)
+        print("Round %d" % (round_index + 1))
 
         for command in commands:
             key = command.pop(0)
@@ -307,17 +307,16 @@ def run_scenario(scenario):
         rebalance_number = 1
         parts_moved, old_balance, removed_devs = rb.rebalance(seed=seed)
         rb.pretend_min_part_hours_passed()
-        print "\tRebalance 1: moved %d parts, balance is %.6f, \
-                %d removed devs" % (
-            parts_moved, old_balance, removed_devs)
+        print("\tRebalance 1: moved %d parts, balance is %.6f, %d removed "
+              "devs" % (parts_moved, old_balance, removed_devs))
 
         while True:
             rebalance_number += 1
             parts_moved, new_balance, removed_devs = rb.rebalance(seed=seed)
             rb.pretend_min_part_hours_passed()
-            print "\tRebalance %d: moved %d parts, balance is %.6f, \
-                    %d removed devs" % (
-                rebalance_number, parts_moved, new_balance, removed_devs)
+            print("\tRebalance %d: moved %d parts, balance is %.6f, "
+                  "%d removed devs" % (rebalance_number, parts_moved,
+                                       new_balance, removed_devs))
             if parts_moved == 0 and removed_devs == 0:
                 break
             if abs(new_balance - old_balance) < 1 and not (

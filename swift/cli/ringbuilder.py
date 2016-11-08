@@ -39,7 +39,7 @@ from swift.common.ring.utils import validate_args, \
     parse_builder_ring_filename_args, parse_search_value, \
     parse_search_values_from_opts, parse_change_values_from_opts, \
     dispersion_report, parse_add_value
-from swift.common.utils import lock_parent_directory
+from swift.common.utils import lock_parent_directory, is_valid_ipv6
 
 MAJOR_VERSION = 1
 MINOR_VERSION = 3
@@ -181,7 +181,8 @@ def _parse_add_values(argvish):
     return parsed_devs
 
 
-def _set_weight_values(devs, weight):
+def check_devs(devs, input_question, opts, abort_msg):
+
     if not devs:
         print('Search value matched 0 devices.\n'
               'The on-disk ring builder is unchanged.')
@@ -191,10 +192,17 @@ def _set_weight_values(devs, weight):
         print('Matched more than one device:')
         for dev in devs:
             print('    %s' % format_device(dev))
-        if input('Are you sure you want to update the weight for '
-                 'these %s devices? (y/N) ' % len(devs)) != 'y':
-            print('Aborting device modifications')
+        if not opts.yes and input(input_question) != 'y':
+            print(abort_msg)
             exit(EXIT_ERROR)
+
+
+def _set_weight_values(devs, weight, opts):
+
+    input_question = 'Are you sure you want to update the weight for these ' \
+                     '%s devices? (y/N) ' % len(devs)
+    abort_msg = 'Aborting device modifications'
+    check_devs(devs, input_question, opts, abort_msg)
 
     for dev in devs:
         builder.set_dev_weight(dev['id'], weight)
@@ -222,7 +230,7 @@ def _parse_set_weight_values(argvish):
                 devs.extend(builder.search_devs(
                     parse_search_value(devstr)) or [])
                 weight = float(weightstr)
-                _set_weight_values(devs, weight)
+                _set_weight_values(devs, weight, opts)
         else:
             if len(args) != 1:
                 print(Commands.set_weight.__doc__.strip())
@@ -231,27 +239,18 @@ def _parse_set_weight_values(argvish):
             devs.extend(builder.search_devs(
                 parse_search_values_from_opts(opts)) or [])
             weight = float(args[0])
-            _set_weight_values(devs, weight)
+            _set_weight_values(devs, weight, opts)
     except ValueError as e:
         print(e)
         exit(EXIT_ERROR)
 
 
-def _set_info_values(devs, change):
+def _set_info_values(devs, change, opts):
 
-    if not devs:
-        print("Search value matched 0 devices.\n"
-              "The on-disk ring builder is unchanged.")
-        exit(EXIT_ERROR)
-
-    if len(devs) > 1:
-        print('Matched more than one device:')
-        for dev in devs:
-            print('    %s' % format_device(dev))
-        if input('Are you sure you want to update the info for '
-                 'these %s devices? (y/N) ' % len(devs)) != 'y':
-            print('Aborting device modifications')
-            exit(EXIT_ERROR)
+    input_question = 'Are you sure you want to update the info for these ' \
+                     '%s devices? (y/N) ' % len(devs)
+    abort_msg = 'Aborting device modifications'
+    check_devs(devs, input_question, opts, abort_msg)
 
     for dev in devs:
         orig_dev_string = format_device(dev)
@@ -274,6 +273,33 @@ def _set_info_values(devs, change):
                                        format_device(dev)))
 
 
+def calculate_change_value(change_value, change, v_name, v_name_port):
+    ip = ''
+    if change_value and change_value[0].isdigit():
+        i = 1
+        while (i < len(change_value) and
+               change_value[i] in '0123456789.'):
+            i += 1
+        ip = change_value[:i]
+        change_value = change_value[i:]
+    elif change_value and change_value.startswith('['):
+        i = 1
+        while i < len(change_value) and change_value[i] != ']':
+            i += 1
+        i += 1
+        ip = change_value[:i].lstrip('[').rstrip(']')
+        change_value = change_value[i:]
+    if ip:
+        change[v_name] = validate_and_normalize_ip(ip)
+    if change_value.startswith(':'):
+        i = 1
+        while i < len(change_value) and change_value[i].isdigit():
+            i += 1
+        change[v_name_port] = int(change_value[1:i])
+        change_value = change_value[i:]
+    return change_value
+
+
 def _parse_set_info_values(argvish):
 
     new_cmd_format, opts, args = validate_args(argvish)
@@ -292,56 +318,15 @@ def _parse_set_info_values(argvish):
         for search_value, change_value in searches_and_changes:
             devs = builder.search_devs(parse_search_value(search_value))
             change = {}
-            ip = ''
-            if change_value and change_value[0].isdigit():
-                i = 1
-                while (i < len(change_value) and
-                       change_value[i] in '0123456789.'):
-                    i += 1
-                ip = change_value[:i]
-                change_value = change_value[i:]
-            elif change_value and change_value.startswith('['):
-                i = 1
-                while i < len(change_value) and change_value[i] != ']':
-                    i += 1
-                i += 1
-                ip = change_value[:i].lstrip('[').rstrip(']')
-                change_value = change_value[i:]
-            if ip:
-                change['ip'] = validate_and_normalize_ip(ip)
-            if change_value.startswith(':'):
-                i = 1
-                while i < len(change_value) and change_value[i].isdigit():
-                    i += 1
-                change['port'] = int(change_value[1:i])
-                change_value = change_value[i:]
+
+            change_value = calculate_change_value(change_value, change,
+                                                  'ip', 'port')
+
             if change_value.startswith('R'):
                 change_value = change_value[1:]
-                replication_ip = ''
-                if change_value and change_value[0].isdigit():
-                    i = 1
-                    while (i < len(change_value) and
-                           change_value[i] in '0123456789.'):
-                        i += 1
-                    replication_ip = change_value[:i]
-                    change_value = change_value[i:]
-                elif change_value and change_value.startswith('['):
-                    i = 1
-                    while i < len(change_value) and change_value[i] != ']':
-                        i += 1
-                    i += 1
-                    replication_ip = \
-                        change_value[:i].lstrip('[').rstrip(']')
-                    change_value = change_value[i:]
-                if replication_ip:
-                    change['replication_ip'] = \
-                        validate_and_normalize_ip(replication_ip)
-                if change_value.startswith(':'):
-                    i = 1
-                    while i < len(change_value) and change_value[i].isdigit():
-                        i += 1
-                    change['replication_port'] = int(change_value[1:i])
-                    change_value = change_value[i:]
+                change_value = calculate_change_value(change_value, change,
+                                                      'replication_ip',
+                                                      'replication_port')
             if change_value.startswith('/'):
                 i = 1
                 while i < len(change_value) and change_value[i] != '_':
@@ -354,11 +339,11 @@ def _parse_set_info_values(argvish):
             if change_value or not change:
                 raise ValueError('Invalid set info change value: %s' %
                                  repr(argvish[1]))
-            _set_info_values(devs, change)
+            _set_info_values(devs, change, opts)
     else:
         devs = builder.search_devs(parse_search_values_from_opts(opts))
         change = parse_change_values_from_opts(opts)
-        _set_info_values(devs, change)
+        _set_info_values(devs, change, opts)
 
 
 def _parse_remove_values(argvish):
@@ -382,10 +367,62 @@ def _parse_remove_values(argvish):
             devs.extend(builder.search_devs(
                 parse_search_values_from_opts(opts)))
 
-        return devs
+        return (devs, opts)
     except ValueError as e:
         print(e)
         exit(EXIT_ERROR)
+
+
+def _make_display_device_table(builder):
+    ip_width = 10
+    port_width = 4
+    rep_ip_width = 14
+    rep_port_width = 4
+    ip_ipv6 = rep_ipv6 = False
+    for dev in builder._iter_devs():
+        if is_valid_ipv6(dev['ip']):
+            ip_ipv6 = True
+        if is_valid_ipv6(dev['replication_ip']):
+            rep_ipv6 = True
+        ip_width = max(len(dev['ip']), ip_width)
+        rep_ip_width = max(len(dev['replication_ip']), rep_ip_width)
+        port_width = max(len(str(dev['port'])), port_width)
+        rep_port_width = max(len(str(dev['replication_port'])),
+                             rep_port_width)
+    if ip_ipv6:
+        ip_width += 2
+    if rep_ipv6:
+        rep_ip_width += 2
+    header_line = ('Devices:%5s %6s %4s %' + str(ip_width)
+                   + 's:%-' + str(port_width) + 's %' +
+                   str(rep_ip_width) + 's:%-' + str(rep_port_width) +
+                   's %5s %6s %10s %7s %5s %s') % (
+                       'id', 'region', 'zone', 'ip address',
+                       'port', 'replication ip', 'port', 'name',
+                       'weight', 'partitions', 'balance', 'flags',
+                       'meta')
+
+    def print_dev_f(dev, balance_per_dev=0.00, flags=''):
+        def get_formated_ip(key):
+            value = dev[key]
+            if ':' in value:
+                value = '[%s]' % value
+            return value
+        dev_ip = get_formated_ip('ip')
+        dev_replication_ip = get_formated_ip('replication_ip')
+        format_string = ''.join(['%13d %6d %4d ',
+                                 '%', str(ip_width), 's:%-',
+                                 str(port_width), 'd ', '%',
+                                 str(rep_ip_width), 's', ':%-',
+                                 str(rep_port_width), 'd %5s %6.02f'
+                                 ' %10s %7.02f %5s %s'])
+        args = (dev['id'], dev['region'], dev['zone'], dev_ip, dev['port'],
+                dev_replication_ip, dev['replication_port'], dev['device'],
+                dev['weight'], dev['parts'], balance_per_dev, flags,
+                dev['meta'])
+        print(format_string % args)
+
+    return header_line, print_dev_f
 
 
 class Commands(object):
@@ -422,9 +459,12 @@ swift-ring-builder <builder_file> create <part_power> <replicas>
     def default():
         """
 swift-ring-builder <builder_file>
-    Shows information about the ring and the devices within.
-    Flags:
-        DEL - marked for removal and will be removed next rebalance.
+    Shows information about the ring and the devices within. Output
+    includes a table that describes the report parameters (id, region,
+    port, flags, etc).
+    flags: possible values are 'DEL' and ''
+        DEL - indicates that the device is marked for removal from
+              ring and will be removed in next rebalance.
         """
         print('%s, build version %d' % (builder_file, builder.version))
         regions = 0
@@ -470,18 +510,11 @@ swift-ring-builder <builder_file>
 
         if builder.devs:
             balance_per_dev = builder._build_balance_per_dev()
-            print('Devices:    id  region  zone      ip address  port  '
-                  'replication ip  replication port      name '
-                  'weight partitions balance flags meta')
+            header_line, print_dev_f = _make_display_device_table(builder)
+            print(header_line)
             for dev in builder._iter_devs():
                 flags = 'DEL' if dev in builder._remove_devs else ''
-                print('         %5d %7d %5d %15s %5d %15s %17d %9s %6.02f '
-                      '%10s %7.02f %5s %s' %
-                      (dev['id'], dev['region'], dev['zone'], dev['ip'],
-                       dev['port'], dev['replication_ip'],
-                       dev['replication_port'], dev['device'], dev['weight'],
-                       dev['parts'], balance_per_dev[dev['id']], flags,
-                       dev['meta']))
+                print_dev_f(dev, balance_per_dev[dev['id']], flags)
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -641,6 +674,7 @@ swift-ring-builder <builder_file> add
         """
 swift-ring-builder <builder_file> set_weight <search-value> <weight>
     [<search-value> <weight] ...
+    [--yes]
 
 or
 
@@ -648,6 +682,7 @@ swift-ring-builder <builder_file> set_weight
     --region <region> --zone <zone> --ip <ip or hostname> --port <port>
     --replication-ip <r_ip or r_hostname> --replication-port <r_port>
     --device <device_name> --meta <meta> --weight <weight>
+    [--yes]
 
     Where <r_ip>, <r_hostname> and <r_port> are replication ip, hostname
     and port.
@@ -656,6 +691,8 @@ swift-ring-builder <builder_file> set_weight
     Resets the devices' weights. No partitions will be reassigned to or from
     the device until after running 'rebalance'. This is so you can make
     multiple device changes and rebalance them all just once.
+
+    Option --yes assume a yes response to all questions.
         """
         # if len(argv) < 5 or len(argv) % 2 != 1:
         if len(argv) < 5:
@@ -675,6 +712,7 @@ swift-ring-builder <builder_file> set_weight
 swift-ring-builder <builder_file> set_info
     <search-value> <ip>:<port>[R<r_ip>:<r_port>]/<device_name>_<meta>
     [<search-value> <ip>:<port>[R<r_ip>:<r_port>]/<device_name>_<meta>] ...
+    [--yes]
 
 or
 
@@ -687,6 +725,7 @@ swift-ring-builder <builder_file> set_info
     --change-replication-port <r_port>
     --change-device <device_name>
     --change-meta <meta>
+    [--yes]
 
     Where <r_ip>, <r_hostname> and <r_port> are replication ip, hostname
     and port.
@@ -699,6 +738,8 @@ swift-ring-builder <builder_file> set_info
     <ip>:<port>/<device_name>_<meta> parameter; just give what you
     want to change. For instance set_info d74 _"snet: 5.6.7.8" would
     just update the meta data for device id 74.
+
+    Option --yes assume a yes response to all questions.
         """
         if len(argv) < 5:
             print(Commands.set_info.__doc__.strip())
@@ -719,13 +760,15 @@ swift-ring-builder <builder_file> set_info
     def remove():
         """
 swift-ring-builder <builder_file> remove <search-value> [search-value ...]
+    [--yes]
 
 or
 
-swift-ring-builder <builder_file> search
+swift-ring-builder <builder_file> remove
     --region <region> --zone <zone> --ip <ip or hostname> --port <port>
     --replication-ip <r_ip or r_hostname> --replication-port <r_port>
     --device <device_name> --meta <meta> --weight <weight>
+    [--yes]
 
     Where <r_ip>, <r_hostname> and <r_port> are replication ip, hostname
     and port.
@@ -737,6 +780,8 @@ swift-ring-builder <builder_file> search
     remove command. This will not take effect until after running 'rebalance'.
     This is so you can make multiple device changes and rebalance them all just
     once.
+
+    Option --yes assume a yes response to all questions.
         """
         if len(argv) < 4:
             print(Commands.remove.__doc__.strip())
@@ -744,21 +789,12 @@ swift-ring-builder <builder_file> search
             print(parse_search_value.__doc__.strip())
             exit(EXIT_ERROR)
 
-        devs = _parse_remove_values(argv[3:])
+        devs, opts = _parse_remove_values(argv[3:])
 
-        if not devs:
-            print('Search value matched 0 devices.\n'
-                  'The on-disk ring builder is unchanged.')
-            exit(EXIT_ERROR)
-
-        if len(devs) > 1:
-            print('Matched more than one device:')
-            for dev in devs:
-                print('    %s' % format_device(dev))
-            if input('Are you sure you want to remove these %s '
-                     'devices? (y/N) ' % len(devs)) != 'y':
-                print('Aborting device removals')
-                exit(EXIT_ERROR)
+        input_question = 'Are you sure you want to remove these ' \
+                         '%s devices? (y/N) ' % len(devs)
+        abort_msg = 'Aborting device removals'
+        check_devs(devs, input_question, opts, abort_msg)
 
         for dev in devs:
             try:
@@ -904,7 +940,7 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
     --verbose option will display dispersion graph broken down by tier
 
     You can filter which tiers are evaluated to drill down using a regex
-    in the optional search_filter arguemnt.  i.e.
+    in the optional search_filter argument.  i.e.
 
         swift-ring-builder <builder_file> dispersion "r\d+z\d+$" -v
 

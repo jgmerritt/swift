@@ -145,7 +145,7 @@ class LockTimeout(MessageTimeout):
     pass
 
 
-class ThreadPoolDead(SwiftException):
+class RingLoadError(SwiftException):
     pass
 
 
@@ -208,6 +208,10 @@ class MimeInvalid(SwiftException):
 
 
 class APIVersionError(SwiftException):
+    pass
+
+
+class EncryptionException(SwiftException):
     pass
 
 

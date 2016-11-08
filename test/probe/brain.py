@@ -142,11 +142,16 @@ class BrainSplitter(object):
         """
         put container with next storage policy
         """
-        policy = next(self.policies)
+
         if policy_index is not None:
             policy = POLICIES.get_by_index(int(policy_index))
             if not policy:
                 raise ValueError('Unknown policy with index %s' % policy)
+        elif not self.policy:
+            policy = next(self.policies)
+        else:
+            policy = self.policy
+
         headers = {'X-Storage-Policy': policy.name}
         client.put_container(self.url, self.token, self.container_name,
                              headers=headers)
@@ -159,12 +164,12 @@ class BrainSplitter(object):
         client.delete_container(self.url, self.token, self.container_name)
 
     @command
-    def put_object(self, headers=None):
+    def put_object(self, headers=None, contents=None):
         """
-        issue put for zero byte test object
+        issue put for test object
         """
         client.put_object(self.url, self.token, self.container_name,
-                          self.object_name, headers=headers)
+                          self.object_name, headers=headers, contents=contents)
 
     @command
     def delete_object(self):

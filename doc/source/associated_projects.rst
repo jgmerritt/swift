@@ -93,6 +93,8 @@ Storage Backends (DiskFile API implementations)
 
 Developer Tools
 ---------------
+* `SAIO bash scripts <https://github.com/ntata/swift-setup-scripts.git>`_ -
+  Well commented simple bash scripts for Swift all in one setup.
 * `vagrant-swift-all-in-one
   <https://github.com/swiftstack/vagrant-swift-all-in-one>`_ - Quickly setup a
   standard development environment using Vagrant and Chef cookbooks in an
@@ -107,11 +109,11 @@ Other
 
 * `Glance <https://github.com/openstack/glance>`_ - Provides services for discovering, registering, and retrieving virtual machine images (for OpenStack Compute [Nova], for example).
 * `Better Staticweb <https://github.com/CloudVPS/better-staticweb>`_ - Makes swift containers accessible by default.
-* `Swiftsync <https://github.com/stackforge/swiftsync>`_ - A massive syncer between two swift clusters.
 * `Django Swiftbrowser <https://github.com/cschwede/django-swiftbrowser>`_ - Simple Django web app to access OpenStack Swift.
 * `Swift-account-stats <https://github.com/enovance/swift-account-stats>`_ - Swift-account-stats is a tool to report statistics on Swift usage at tenant and global levels.
-* `PyECLib <https://bitbucket.org/kmgreen2/pyeclib>`_ - High Level Erasure Code library used by Swift
-* `liberasurecode <http://www.bytebucket.org/tsg-/liberasurecode>`_ - Low Level Erasure Code library used by PyECLib
+* `PyECLib <https://github.com/openstack/pyeclib>`_ - High Level Erasure Code library used by Swift
+* `liberasurecode <https://github.com/openstack/liberasurecode>`_ - Low Level Erasure Code library used by PyECLib
 * `Swift Browser <https://github.com/zerovm/swift-browser>`_ - JavaScript interface for Swift
 * `swift-ui <https://github.com/fanatic/swift-ui>`_ - OpenStack Swift web browser
 * `Swift Durability Calculator <https://github.com/enovance/swift-durability-calculator>`_ - Data Durability Calculation Tool for Swift
+* `swiftbackmeup <https://github.com/redhat-cip/swiftbackmeup>`_ -  Utility that allows one to create backups and upload them to OpenStack Swift

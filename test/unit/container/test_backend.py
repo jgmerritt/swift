@@ -560,8 +560,8 @@ class TestContainerBroker(unittest.TestCase):
 
     def _test_put_object_multiple_encoded_timestamps(self, broker):
         ts = (Timestamp(t) for t in itertools.count(int(time())))
-        broker.initialize(ts.next().internal, 0)
-        t = [ts.next() for _ in range(9)]
+        broker.initialize(next(ts).internal, 0)
+        t = [next(ts) for _ in range(9)]
 
         # Create initial object
         broker.put_object('obj_name', t[0].internal, 123,
@@ -630,8 +630,8 @@ class TestContainerBroker(unittest.TestCase):
 
     def _test_put_object_multiple_explicit_timestamps(self, broker):
         ts = (Timestamp(t) for t in itertools.count(int(time())))
-        broker.initialize(ts.next().internal, 0)
-        t = [ts.next() for _ in range(11)]
+        broker.initialize(next(ts).internal, 0)
+        t = [next(ts) for _ in range(11)]
 
         # Create initial object
         broker.put_object('obj_name', t[0].internal, 123,
@@ -735,10 +735,10 @@ class TestContainerBroker(unittest.TestCase):
         # timestamp as last-modified time
         ts = (Timestamp(t) for t in itertools.count(int(time())))
         broker = ContainerBroker(':memory:', account='a', container='c')
-        broker.initialize(ts.next().internal, 0)
+        broker.initialize(next(ts).internal, 0)
 
         # simple 'single' timestamp case
-        t0 = ts.next()
+        t0 = next(ts)
         broker.put_object('obj1', t0.internal, 0, 'text/plain', 'hash1')
         listing = broker.list_objects_iter(100, '', None, None, '')
         self.assertEqual(len(listing), 1)
@@ -746,7 +746,7 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(listing[0][1], t0.internal)
 
         # content-type and metadata are updated at t1
-        t1 = ts.next()
+        t1 = next(ts)
         t_encoded = encode_timestamps(t0, t1, t1)
         broker.put_object('obj1', t_encoded, 0, 'text/plain', 'hash1')
         listing = broker.list_objects_iter(100, '', None, None, '')
@@ -755,10 +755,10 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(listing[0][1], t1.internal)
 
         # used later
-        t2 = ts.next()
+        t2 = next(ts)
 
         # metadata is updated at t3
-        t3 = ts.next()
+        t3 = next(ts)
         t_encoded = encode_timestamps(t0, t1, t3)
         broker.put_object('obj1', t_encoded, 0, 'text/plain', 'hash1')
         listing = broker.list_objects_iter(100, '', None, None, '')
@@ -775,7 +775,7 @@ class TestContainerBroker(unittest.TestCase):
         self.assertEqual(listing[0][1], t3.internal)
 
         # all parts updated at t4, last-modified should be t4
-        t4 = ts.next()
+        t4 = next(ts)
         t_encoded = encode_timestamps(t4, t4, t4)
         broker.put_object('obj1', t_encoded, 0, 'text/plain', 'hash1')
         listing = broker.list_objects_iter(100, '', None, None, '')
@@ -795,8 +795,8 @@ class TestContainerBroker(unittest.TestCase):
         if isinstance(self, ContainerBrokerMigrationMixin):
             real_storage_policy_index = \
                 broker.get_info()['storage_policy_index']
-            policy = filter(lambda p: p.idx == real_storage_policy_index,
-                            POLICIES)[0]
+            policy = [p for p in POLICIES
+                      if p.idx == real_storage_policy_index][0]
         broker.put_object('correct_o', next(ts), 123, 'text/plain',
                           '5af83e3196bf99f440f31f2e1a6c9afe',
                           storage_policy_index=policy.idx)
@@ -823,8 +823,8 @@ class TestContainerBroker(unittest.TestCase):
         if isinstance(self, ContainerBrokerMigrationMixin):
             real_storage_policy_index = \
                 broker.get_info()['storage_policy_index']
-            policy = filter(lambda p: p.idx == real_storage_policy_index,
-                            POLICIES)[0]
+            policy = [p for p in POLICIES
+                      if p.idx == real_storage_policy_index][0]
         broker.put_object('correct_o', next(ts), 123, 'text/plain',
                           '5af83e3196bf99f440f31f2e1a6c9afe',
                           storage_policy_index=policy.idx)
@@ -847,8 +847,8 @@ class TestContainerBroker(unittest.TestCase):
         if isinstance(self, ContainerBrokerMigrationMixin):
             real_storage_policy_index = \
                 broker.get_info()['storage_policy_index']
-            policy = filter(lambda p: p.idx == real_storage_policy_index,
-                            POLICIES)[0]
+            policy = [p for p in POLICIES
+                      if p.idx == real_storage_policy_index][0]
         policy_stats = broker.get_policy_stats()
         expected = {policy.idx: {'bytes_used': 0, 'object_count': 0}}
         self.assertEqual(policy_stats, expected)

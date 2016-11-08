@@ -19,7 +19,7 @@ from swift.common.middleware import keystoneauth
 from swift.common.swob import Request, Response
 from swift.common.http import HTTP_FORBIDDEN
 from swift.common.utils import split_path
-from swift.proxy.controllers.base import _get_cache_key
+from swift.proxy.controllers.base import get_cache_key
 from test.unit import FakeLogger
 
 UNKNOWN_ID = keystoneauth.UNKNOWN_ID
@@ -251,8 +251,8 @@ class SwiftAuth(unittest.TestCase):
         account = get_account_for_tenant(self.test_auth, proj_id)
         path = '/v1/' + account
         # fake cached account info
-        _, info_key = _get_cache_key(account, None)
-        env = {info_key: {'status': 0, 'sysmeta': {}},
+        info_key = get_cache_key(account)
+        env = {'swift.infocache': {info_key: {'status': 0, 'sysmeta': {}}},
                'keystone.token_info': _fake_token_info(version='3')}
         req = Request.blank(path, environ=env, headers=headers)
         req.method = 'POST'
@@ -280,8 +280,8 @@ class SwiftAuth(unittest.TestCase):
         account = get_account_for_tenant(self.test_auth, proj_id)
         path = '/v1/' + account
         # fake cached account info
-        _, info_key = _get_cache_key(account, None)
-        env = {info_key: {'status': 0, 'sysmeta': {}},
+        info_key = get_cache_key(account)
+        env = {'swift.infocache': {info_key: {'status': 0, 'sysmeta': {}}},
                'keystone.token_info': _fake_token_info(version='3')}
         req = Request.blank(path, environ=env, headers=headers)
         req.method = 'POST'
@@ -301,9 +301,9 @@ class SwiftAuth(unittest.TestCase):
         headers = get_identity_headers(tenant_id=proj_id, role='admin')
         account = get_account_for_tenant(self.test_auth, proj_id)
         path = '/v1/' + account
-        _, info_key = _get_cache_key(account, None)
+        info_key = get_cache_key(account)
         # v2 token
-        env = {info_key: {'status': 0, 'sysmeta': {}},
+        env = {'swift.infocache': {info_key: {'status': 0, 'sysmeta': {}}},
                'keystone.token_info': _fake_token_info(version='2')}
         req = Request.blank(path, environ=env, headers=headers)
         req.method = 'POST'
@@ -323,9 +323,9 @@ class SwiftAuth(unittest.TestCase):
                                        role='reselleradmin')
         account = get_account_for_tenant(self.test_auth, proj_id)
         path = '/v1/' + account
-        _, info_key = _get_cache_key(account, None)
+        info_key = get_cache_key(account)
         # v2 token
-        env = {info_key: {'status': 0, 'sysmeta': {}},
+        env = {'swift.infocache': {info_key: {'status': 0, 'sysmeta': {}}},
                'keystone.token_info': _fake_token_info(version='2')}
         req = Request.blank(path, environ=env, headers=headers)
         req.method = 'POST'
@@ -381,8 +381,8 @@ class ServiceTokenFunctionality(unittest.TestCase):
                                        role=user_role,
                                        service_role=service_role)
         (version, account, _junk, _junk) = split_path(path, 2, 4, True)
-        _, info_key = _get_cache_key(account, None)
-        env = {info_key: {'status': 0, 'sysmeta': {}},
+        info_key = get_cache_key(account)
+        env = {'swift.infocache': {info_key: {'status': 0, 'sysmeta': {}}},
                'keystone.token_info': _fake_token_info(version='2')}
         if environ:
             env.update(environ)
@@ -550,7 +550,8 @@ class BaseTestAuthorize(unittest.TestCase):
         if not identity:
             identity = self._get_identity()
         return get_account_for_tenant(self.test_auth,
-                                      identity['HTTP_X_TENANT_ID'])
+                                      identity.get('HTTP_X_PROJECT_ID') or
+                                      identity.get('HTTP_X_TENANT_ID'))
 
     def _get_identity(self, tenant_id='tenant_id', tenant_name='tenant_name',
                       user_id='user_id', user_name='user_name', roles=None,
@@ -564,12 +565,19 @@ class BaseTestAuthorize(unittest.TestCase):
                 'HTTP_X_USER_NAME': user_name,
                 'HTTP_X_USER_DOMAIN_NAME': user_domain_name,
                 'HTTP_X_USER_DOMAIN_ID': user_domain_id,
-                'HTTP_X_TENANT_ID': tenant_id,
-                'HTTP_X_TENANT_NAME': tenant_name,
+                'HTTP_X_PROJECT_ID': tenant_id,
+                'HTTP_X_PROJECT_NAME': tenant_name,
                 'HTTP_X_PROJECT_DOMAIN_ID': project_domain_id,
                 'HTTP_X_PROJECT_DOMAIN_NAME': project_domain_name,
                 'HTTP_X_ROLES': roles,
                 'HTTP_X_IDENTITY_STATUS': 'Confirmed'}
+
+    def _get_identity_for_v2(self, **kwargs):
+        identity = self._get_identity(**kwargs)
+        for suffix in ['ID', 'NAME']:
+            identity['HTTP_X_TENANT_{0}'.format(suffix)] = identity.pop(
+                'HTTP_X_PROJECT_{0}'.format(suffix))
+        return identity
 
     def _get_env_id(self, tenant_id='tenant_id', tenant_name='tenant_name',
                     user_id='user_id', user_name='user_name', roles=[],
@@ -595,9 +603,11 @@ class TestAuthorize(BaseTestAuthorize):
         if not path:
             path = '/v1/%s/c' % account
         # fake cached account info
-        _, info_key = _get_cache_key(account, None)
-        default_env = {'REMOTE_USER': identity['HTTP_X_TENANT_ID'],
-                       info_key: {'status': 200, 'sysmeta': {}}}
+        info_key = get_cache_key(account)
+        default_env = {
+            'REMOTE_USER': (identity.get('HTTP_X_PROJECT_ID') or
+                            identity.get('HTTP_X_TENANT_ID')),
+            'swift.infocache': {info_key: {'status': 200, 'sysmeta': {}}}}
         default_env.update(identity)
         if env:
             default_env.update(env)
@@ -688,7 +698,7 @@ class TestAuthorize(BaseTestAuthorize):
         self._check_authenticate(identity=identity, acl=acl)
 
     def test_authorize_succeeds_for_tenant_name_user_in_roles(self):
-        identity = self._get_identity()
+        identity = self._get_identity_for_v2()
         user_name = identity['HTTP_X_USER_NAME']
         user_id = identity['HTTP_X_USER_ID']
         tenant_name = identity['HTTP_X_TENANT_NAME']
@@ -696,13 +706,31 @@ class TestAuthorize(BaseTestAuthorize):
             acl = '%s:%s' % (tenant_name, user)
             self._check_authenticate(identity=identity, acl=acl)
 
-    def test_authorize_succeeds_for_tenant_id_user_in_roles(self):
+    def test_authorize_succeeds_for_project_name_user_in_roles(self):
         identity = self._get_identity()
+        user_name = identity['HTTP_X_USER_NAME']
+        user_id = identity['HTTP_X_USER_ID']
+        project_name = identity['HTTP_X_PROJECT_NAME']
+        for user in [user_id, user_name, '*']:
+            acl = '%s:%s' % (project_name, user)
+            self._check_authenticate(identity=identity, acl=acl)
+
+    def test_authorize_succeeds_for_tenant_id_user_in_roles(self):
+        identity = self._get_identity_for_v2()
         user_name = identity['HTTP_X_USER_NAME']
         user_id = identity['HTTP_X_USER_ID']
         tenant_id = identity['HTTP_X_TENANT_ID']
         for user in [user_id, user_name, '*']:
             acl = '%s:%s' % (tenant_id, user)
+            self._check_authenticate(identity=identity, acl=acl)
+
+    def test_authorize_succeeds_for_project_id_user_in_roles(self):
+        identity = self._get_identity()
+        user_name = identity['HTTP_X_USER_NAME']
+        user_id = identity['HTTP_X_USER_ID']
+        project_id = identity['HTTP_X_PROJECT_ID']
+        for user in [user_id, user_name, '*']:
+            acl = '%s:%s' % (project_id, user)
             self._check_authenticate(identity=identity, acl=acl)
 
     def test_authorize_succeeds_for_wildcard_tenant_user_in_roles(self):
@@ -843,8 +871,8 @@ class TestAuthorize(BaseTestAuthorize):
         self.assertEqual(authorize_resp, None)
 
     def test_names_disallowed_in_acls_outside_default_domain(self):
-        id = self._get_identity(user_domain_id='non-default',
-                                project_domain_id='non-default')
+        id = self._get_identity_for_v2(user_domain_id='non-default',
+                                       project_domain_id='non-default')
         env = {'keystone.token_info': _fake_token_info(version='3')}
         acl = '%s:%s' % (id['HTTP_X_TENANT_NAME'], id['HTTP_X_USER_NAME'])
         self._check_authenticate(acl=acl, identity=id, env=env,
@@ -858,9 +886,23 @@ class TestAuthorize(BaseTestAuthorize):
         acl = '%s:%s' % (id['HTTP_X_TENANT_ID'], id['HTTP_X_USER_ID'])
         self._check_authenticate(acl=acl, identity=id, env=env)
 
+        id = self._get_identity(user_domain_id='non-default',
+                                project_domain_id='non-default')
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env,
+                                 exception=HTTP_FORBIDDEN)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env,
+                                 exception=HTTP_FORBIDDEN)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env,
+                                 exception=HTTP_FORBIDDEN)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+
     def test_names_allowed_in_acls_inside_default_domain(self):
-        id = self._get_identity(user_domain_id='default',
-                                project_domain_id='default')
+        id = self._get_identity_for_v2(user_domain_id='default',
+                                       project_domain_id='default')
         env = {'keystone.token_info': _fake_token_info(version='3')}
         acl = '%s:%s' % (id['HTTP_X_TENANT_NAME'], id['HTTP_X_USER_NAME'])
         self._check_authenticate(acl=acl, identity=id, env=env)
@@ -869,14 +911,25 @@ class TestAuthorize(BaseTestAuthorize):
         acl = '%s:%s' % (id['HTTP_X_TENANT_ID'], id['HTTP_X_USER_NAME'])
         self._check_authenticate(acl=acl, identity=id, env=env)
         acl = '%s:%s' % (id['HTTP_X_TENANT_ID'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+
+        id = self._get_identity(user_domain_id='default',
+                                project_domain_id='default')
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_ID'])
         self._check_authenticate(acl=acl, identity=id, env=env)
 
     def test_names_allowed_in_acls_inside_default_domain_with_config(self):
         conf = {'allow_names_in_acls': 'yes'}
         self.test_auth = keystoneauth.filter_factory(conf)(FakeApp())
         self.test_auth.logger = FakeLogger()
-        id = self._get_identity(user_domain_id='default',
-                                project_domain_id='default')
+        id = self._get_identity_for_v2(user_domain_id='default',
+                                       project_domain_id='default')
         env = {'keystone.token_info': _fake_token_info(version='3')}
         acl = '%s:%s' % (id['HTTP_X_TENANT_NAME'], id['HTTP_X_USER_NAME'])
         self._check_authenticate(acl=acl, identity=id, env=env)
@@ -887,12 +940,23 @@ class TestAuthorize(BaseTestAuthorize):
         acl = '%s:%s' % (id['HTTP_X_TENANT_ID'], id['HTTP_X_USER_ID'])
         self._check_authenticate(acl=acl, identity=id, env=env)
 
+        id = self._get_identity(user_domain_id='default',
+                                project_domain_id='default')
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+
     def test_names_disallowed_in_acls_inside_default_domain(self):
         conf = {'allow_names_in_acls': 'false'}
         self.test_auth = keystoneauth.filter_factory(conf)(FakeApp())
         self.test_auth.logger = FakeLogger()
-        id = self._get_identity(user_domain_id='default',
-                                project_domain_id='default')
+        id = self._get_identity_for_v2(user_domain_id='default',
+                                       project_domain_id='default')
         env = {'keystone.token_info': _fake_token_info(version='3')}
         acl = '%s:%s' % (id['HTTP_X_TENANT_NAME'], id['HTTP_X_USER_NAME'])
         self._check_authenticate(acl=acl, identity=id, env=env,
@@ -904,6 +968,20 @@ class TestAuthorize(BaseTestAuthorize):
         self._check_authenticate(acl=acl, identity=id, env=env,
                                  exception=HTTP_FORBIDDEN)
         acl = '%s:%s' % (id['HTTP_X_TENANT_ID'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env)
+
+        id = self._get_identity(user_domain_id='default',
+                                project_domain_id='default')
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env,
+                                 exception=HTTP_FORBIDDEN)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_NAME'], id['HTTP_X_USER_ID'])
+        self._check_authenticate(acl=acl, identity=id, env=env,
+                                 exception=HTTP_FORBIDDEN)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_NAME'])
+        self._check_authenticate(acl=acl, identity=id, env=env,
+                                 exception=HTTP_FORBIDDEN)
+        acl = '%s:%s' % (id['HTTP_X_PROJECT_ID'], id['HTTP_X_USER_ID'])
         self._check_authenticate(acl=acl, identity=id, env=env)
 
     def test_keystone_identity(self):
@@ -984,9 +1062,9 @@ class TestAuthorize(BaseTestAuthorize):
     def test_get_project_domain_id(self):
         sysmeta = {}
         info = {'sysmeta': sysmeta}
-        _, info_key = _get_cache_key('AUTH_1234', None)
+        info_key = get_cache_key('AUTH_1234')
         env = {'PATH_INFO': '/v1/AUTH_1234',
-               info_key: info}
+               'swift.infocache': {info_key: info}}
 
         # account does not exist
         info['status'] = 404
@@ -1028,8 +1106,9 @@ class TestIsNameAllowedInACL(BaseTestAuthorize):
 
         # pretend account exists
         info = {'status': 200, 'sysmeta': sysmeta}
-        _, info_key = _get_cache_key(account, None)
-        req = Request.blank(path, environ={info_key: info})
+        info_key = get_cache_key(account)
+        req = Request.blank(path,
+                            environ={'swift.infocache': {info_key: info}})
 
         if scoped == 'account':
             project_name = 'account_name'
@@ -1214,8 +1293,8 @@ class TestSetProjectDomain(BaseTestAuthorize):
         if sysmeta_project_domain_id:
             sysmeta['project-domain-id'] = sysmeta_project_domain_id
         info = {'status': status, 'sysmeta': sysmeta}
-        _, info_key = _get_cache_key(account, None)
-        env = {info_key: info}
+        info_key = get_cache_key(account)
+        env = {'swift.infocache': {info_key: info}}
 
         # create fake env identity
         env_id = self._get_env_id(tenant_id=req_project_id,

@@ -38,7 +38,7 @@ Installing dependencies
         sudo apt-get update
         sudo apt-get install curl gcc memcached rsync sqlite3 xfsprogs \
                              git-core libffi-dev python-setuptools \
-                             liberasurecode-dev
+                             liberasurecode-dev libssl-dev
         sudo apt-get install python-coverage python-dev python-nose \
                              python-xattr python-eventlet \
                              python-greenlet python-pastedeploy \
@@ -50,7 +50,7 @@ Installing dependencies
         sudo yum update
         sudo yum install curl gcc memcached rsync sqlite xfsprogs git-core \
                          libffi-devel xinetd liberasurecode-devel \
-                         python-setuptools \
+                         openssl-devel python-setuptools \
                          python-coverage python-devel python-nose \
                          pyxattr python-eventlet \
                          python-greenlet python-paste-deploy \
@@ -591,3 +591,17 @@ doesn't work, here are some good starting places to look for issues:
    you check that you can ``GET`` account, use ``sudo service memcached status``
    and check if memcache is running. If memcache is not running, start it using
    ``sudo service memcached start``. Once memcache is running, rerun ``GET`` account.
+
+------------
+Known Issues
+------------
+
+Listed here are some "gotcha's" that you may run into when using or testing your SAIO:
+
+#. fallocate_reserve - in most cases a SAIO doesn't have a very large XFS partition
+   so having fallocate enabled and fallocate_reserve set can cause issues, specifically
+   when trying to run the functional tests. For this reason fallocate has been turned
+   off on the object-servers in the SAIO. If you want to play with the fallocate_reserve
+   settings then know that functional tests will fail unless you change the max_file_size
+   constraint to something more reasonable then the default (5G). Ideally you'd make
+   it 1/4 of your XFS file system size so the tests can pass.

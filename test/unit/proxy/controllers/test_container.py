@@ -58,7 +58,7 @@ class TestContainerController(TestRingBase):
                 proxy_server.ContainerController):
 
             def account_info(controller, *args, **kwargs):
-                patch_path = 'swift.proxy.controllers.base.get_info'
+                patch_path = 'swift.proxy.controllers.base.get_account_info'
                 with mock.patch(patch_path) as mock_get_info:
                     mock_get_info.return_value = dict(self.account_info)
                     return super(FakeAccountInfoContainerController,
@@ -95,16 +95,20 @@ class TestContainerController(TestRingBase):
                              'Expected %s but got %s. Failed case: %s' %
                              (expected, resp.status_int, str(responses)))
 
-    def test_container_info_in_response_env(self):
+    def test_container_info_got_cached(self):
         controller = proxy_server.ContainerController(self.app, 'a', 'c')
         with mock.patch('swift.proxy.controllers.base.http_connect',
                         fake_http_connect(200, 200, body='')):
             req = Request.blank('/v1/a/c', {'PATH_INFO': '/v1/a/c'})
             resp = controller.HEAD(req)
         self.assertEqual(2, resp.status_int // 100)
-        self.assertTrue("swift.container/a/c" in resp.environ)
-        self.assertEqual(headers_to_container_info(resp.headers),
-                         resp.environ['swift.container/a/c'])
+        # Make sure it's in both swift.infocache and memcache
+        self.assertIn("container/a/c", resp.environ['swift.infocache'])
+        self.assertEqual(
+            headers_to_container_info(resp.headers),
+            resp.environ['swift.infocache']['container/a/c'])
+        from_memcache = self.app.memcache.get('container/a/c')
+        self.assertTrue(from_memcache)
 
     def test_swift_owner(self):
         owner_headers = {
@@ -118,7 +122,7 @@ class TestContainerController(TestRingBase):
             resp = controller.HEAD(req)
         self.assertEqual(2, resp.status_int // 100)
         for key in owner_headers:
-            self.assertTrue(key not in resp.headers)
+            self.assertNotIn(key, resp.headers)
 
         req = Request.blank('/v1/a/c', environ={'swift_owner': True})
         with mock.patch('swift.proxy.controllers.base.http_connect',
@@ -126,7 +130,7 @@ class TestContainerController(TestRingBase):
             resp = controller.HEAD(req)
         self.assertEqual(2, resp.status_int // 100)
         for key in owner_headers:
-            self.assertTrue(key in resp.headers)
+            self.assertIn(key, resp.headers)
 
     def test_sys_meta_headers_PUT(self):
         # check that headers in sys meta namespace make it through
@@ -146,9 +150,9 @@ class TestContainerController(TestRingBase):
                         fake_http_connect(200, 200, give_connect=callback)):
             controller.PUT(req)
         self.assertEqual(context['method'], 'PUT')
-        self.assertTrue(sys_meta_key in context['headers'])
+        self.assertIn(sys_meta_key, context['headers'])
         self.assertEqual(context['headers'][sys_meta_key], 'foo')
-        self.assertTrue(user_meta_key in context['headers'])
+        self.assertIn(user_meta_key, context['headers'])
         self.assertEqual(context['headers'][user_meta_key], 'bar')
         self.assertNotEqual(context['headers']['x-timestamp'], '1.0')
 
@@ -169,9 +173,9 @@ class TestContainerController(TestRingBase):
                         fake_http_connect(200, 200, give_connect=callback)):
             controller.POST(req)
         self.assertEqual(context['method'], 'POST')
-        self.assertTrue(sys_meta_key in context['headers'])
+        self.assertIn(sys_meta_key, context['headers'])
         self.assertEqual(context['headers'][sys_meta_key], 'foo')
-        self.assertTrue(user_meta_key in context['headers'])
+        self.assertIn(user_meta_key, context['headers'])
         self.assertEqual(context['headers'][user_meta_key], 'bar')
         self.assertNotEqual(context['headers']['x-timestamp'], '1.0')
 
@@ -278,16 +282,16 @@ class TestContainerController4Replicas(TestContainerController):
             ((201, 201, 201, 201), 201),
             ((201, 201, 201, 404), 201),
             ((201, 201, 201, 503), 201),
-            ((201, 201, 404, 404), 503),
-            ((201, 201, 404, 503), 503),
-            ((201, 201, 503, 503), 503),
+            ((201, 201, 404, 404), 201),
+            ((201, 201, 404, 503), 201),
+            ((201, 201, 503, 503), 201),
             ((201, 404, 404, 404), 404),
-            ((201, 404, 404, 503), 503),
+            ((201, 404, 404, 503), 404),
             ((201, 404, 503, 503), 503),
             ((201, 503, 503, 503), 503),
             ((404, 404, 404, 404), 404),
             ((404, 404, 404, 503), 404),
-            ((404, 404, 503, 503), 503),
+            ((404, 404, 503, 503), 404),
             ((404, 503, 503, 503), 503),
             ((503, 503, 503, 503), 503)
         ]
@@ -298,16 +302,16 @@ class TestContainerController4Replicas(TestContainerController):
             ((204, 204, 204, 204), 204),
             ((204, 204, 204, 404), 204),
             ((204, 204, 204, 503), 204),
-            ((204, 204, 404, 404), 503),
-            ((204, 204, 404, 503), 503),
-            ((204, 204, 503, 503), 503),
+            ((204, 204, 404, 404), 204),
+            ((204, 204, 404, 503), 204),
+            ((204, 204, 503, 503), 204),
             ((204, 404, 404, 404), 404),
-            ((204, 404, 404, 503), 503),
+            ((204, 404, 404, 503), 404),
             ((204, 404, 503, 503), 503),
             ((204, 503, 503, 503), 503),
             ((404, 404, 404, 404), 404),
             ((404, 404, 404, 503), 404),
-            ((404, 404, 503, 503), 503),
+            ((404, 404, 503, 503), 404),
             ((404, 503, 503, 503), 503),
             ((503, 503, 503, 503), 503)
         ]
@@ -318,16 +322,16 @@ class TestContainerController4Replicas(TestContainerController):
             ((204, 204, 204, 204), 204),
             ((204, 204, 204, 404), 204),
             ((204, 204, 204, 503), 204),
-            ((204, 204, 404, 404), 503),
-            ((204, 204, 404, 503), 503),
-            ((204, 204, 503, 503), 503),
+            ((204, 204, 404, 404), 204),
+            ((204, 204, 404, 503), 204),
+            ((204, 204, 503, 503), 204),
             ((204, 404, 404, 404), 404),
-            ((204, 404, 404, 503), 503),
+            ((204, 404, 404, 503), 404),
             ((204, 404, 503, 503), 503),
             ((204, 503, 503, 503), 503),
             ((404, 404, 404, 404), 404),
             ((404, 404, 404, 503), 404),
-            ((404, 404, 503, 503), 503),
+            ((404, 404, 503, 503), 404),
             ((404, 503, 503, 503), 503),
             ((503, 503, 503, 503), 503)
         ]

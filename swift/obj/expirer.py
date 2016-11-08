@@ -77,15 +77,17 @@ class ObjectExpirer(Daemon):
         """
         if final:
             elapsed = time() - self.report_first_time
-            self.logger.info(_('Pass completed in %ds; %d objects expired') %
-                             (elapsed, self.report_objects))
+            self.logger.info(_('Pass completed in %(time)ds; '
+                               '%(objects)d objects expired') % {
+                             'time': elapsed, 'objects': self.report_objects})
             dump_recon_cache({'object_expiration_pass': elapsed,
                               'expired_last_pass': self.report_objects},
                              self.rcache, self.logger)
         elif time() - self.report_last_time >= self.report_interval:
             elapsed = time() - self.report_first_time
-            self.logger.info(_('Pass so far %ds; %d objects expired') %
-                             (elapsed, self.report_objects))
+            self.logger.info(_('Pass so far %(time)ds; '
+                               '%(objects)d objects expired') % {
+                             'time': elapsed, 'objects': self.report_objects})
             self.report_last_time = time()
 
     def iter_cont_objs_to_expire(self):
@@ -168,8 +170,10 @@ class ObjectExpirer(Daemon):
             self.logger.debug('Run begin')
             containers, objects = \
                 self.swift.get_account_info(self.expiring_objects_account)
-            self.logger.info(_('Pass beginning; %s possible containers; %s '
-                               'possible objects') % (containers, objects))
+            self.logger.info(_('Pass beginning; '
+                               '%(containers)s possible containers; '
+                               '%(objects)s possible objects') % {
+                             'containers': containers, 'objects': objects})
 
             for container, obj in self.iter_cont_objs_to_expire():
                 containers_to_delete.add(container)
@@ -248,7 +252,7 @@ class ObjectExpirer(Daemon):
 
         if self.processes and self.process >= self.processes:
             raise ValueError(
-                'process must be less than or equal to processes')
+                'process must be less than processes')
 
     def delete_object(self, actual_obj, timestamp, container, obj):
         start_time = time()
@@ -256,7 +260,8 @@ class ObjectExpirer(Daemon):
             try:
                 self.delete_actual_object(actual_obj, timestamp)
             except UnexpectedResponse as err:
-                if err.resp.status_int != HTTP_NOT_FOUND:
+                if err.resp.status_int not in {HTTP_NOT_FOUND,
+                                               HTTP_PRECONDITION_FAILED}:
                     raise
                 if float(timestamp) > time() - self.reclaim_age:
                     # we'll have to retry the DELETE later
@@ -295,5 +300,6 @@ class ObjectExpirer(Daemon):
         """
         path = '/v1/' + urllib.parse.quote(actual_obj.lstrip('/'))
         self.swift.make_request('DELETE', path,
-                                {'X-If-Delete-At': str(timestamp)},
-                                (2, HTTP_PRECONDITION_FAILED))
+                                {'X-If-Delete-At': str(timestamp),
+                                 'X-Timestamp': str(timestamp)},
+                                (2,))

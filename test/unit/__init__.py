@@ -32,6 +32,10 @@ import eventlet
 from eventlet.green import socket
 from tempfile import mkdtemp
 from shutil import rmtree
+import signal
+import json
+
+
 from swift.common.utils import Timestamp, NOTICE
 from test import get_config
 from swift.common import utils
@@ -49,6 +53,7 @@ import six.moves.cPickle as pickle
 from gzip import GzipFile
 import mock as mocklib
 import inspect
+from nose import SkipTest
 
 EMPTY_ETAG = md5().hexdigest()
 
@@ -221,7 +226,8 @@ class FakeRing(Ring):
         for x in range(self.replicas):
             ip = '10.0.0.%s' % x
             port = self._base_port + x
-            self._devs.append({
+            # round trip through json to ensure unicode like real rings
+            self._devs.append(json.loads(json.dumps({
                 'ip': ip,
                 'replication_ip': ip,
                 'port': port,
@@ -230,7 +236,7 @@ class FakeRing(Ring):
                 'zone': x % 3,
                 'region': x % 2,
                 'id': x,
-            })
+            })))
 
     @property
     def replica_count(self):
@@ -256,9 +262,9 @@ def write_fake_ring(path, *devs):
     Pretty much just a two node, two replica, 2 part power ring...
     """
     dev1 = {'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
-            'port': 6000}
+            'port': 6200}
     dev2 = {'id': 0, 'zone': 0, 'device': 'sdb1', 'ip': '127.0.0.1',
-            'port': 6000}
+            'port': 6200}
 
     dev1_updates, dev2_updates = devs or ({}, {})
 
@@ -278,7 +284,7 @@ class FabricatedRing(Ring):
     your tests needs.
     """
 
-    def __init__(self, replicas=6, devices=8, nodes=4, port=6000,
+    def __init__(self, replicas=6, devices=8, nodes=4, port=6200,
                  part_power=4):
         self.devices = devices
         self.nodes = nodes
@@ -848,7 +854,7 @@ def fake_http_connect(*code_iter, **kwargs):
 
         def __init__(self, status, etag=None, body='', timestamp='1',
                      headers=None, expect_headers=None, connection_id=None,
-                     give_send=None):
+                     give_send=None, give_expect=None):
             if not isinstance(status, FakeStatus):
                 status = FakeStatus(status)
             self._status = status
@@ -864,6 +870,8 @@ def fake_http_connect(*code_iter, **kwargs):
             self.timestamp = timestamp
             self.connection_id = connection_id
             self.give_send = give_send
+            self.give_expect = give_expect
+            self.closed = False
             if 'slow' in kwargs and isinstance(kwargs['slow'], list):
                 try:
                     self._next_sleep = kwargs['slow'].pop(0)
@@ -884,6 +892,8 @@ def fake_http_connect(*code_iter, **kwargs):
             return self
 
         def getexpect(self):
+            if self.give_expect:
+                self.give_expect(self)
             expect_status = self._status.get_expect_status()
             headers = dict(self.expect_headers)
             if expect_status == 409:
@@ -951,9 +961,9 @@ def fake_http_connect(*code_iter, **kwargs):
             self.body = self.body[amt:]
             return rv
 
-        def send(self, amt=None):
+        def send(self, data=None):
             if self.give_send:
-                self.give_send(self.connection_id, amt)
+                self.give_send(self, data)
             am_slow, value = self.get_slow()
             if am_slow:
                 if self.received < 4:
@@ -964,7 +974,7 @@ def fake_http_connect(*code_iter, **kwargs):
             return HeaderKeyDict(self.getheaders()).get(name, default)
 
         def close(self):
-            pass
+            self.closed = True
 
     timestamps_iter = iter(kwargs.get('timestamps') or ['1'] * len(code_iter))
     etag_iter = iter(kwargs.get('etags') or [None] * len(code_iter))
@@ -1017,7 +1027,8 @@ def fake_http_connect(*code_iter, **kwargs):
             body = next(body_iter)
         return FakeConn(status, etag, body=body, timestamp=timestamp,
                         headers=headers, expect_headers=expect_headers,
-                        connection_id=i, give_send=kwargs.get('give_send'))
+                        connection_id=i, give_send=kwargs.get('give_send'),
+                        give_expect=kwargs.get('give_expect'))
 
     connect.code_iter = code_iter
 
@@ -1052,3 +1063,58 @@ def mocked_http_conn(*args, **kwargs):
 
 def make_timestamp_iter():
     return iter(Timestamp(t) for t in itertools.count(int(time.time())))
+
+
+class Timeout(object):
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, self._exit)
+        signal.alarm(self.seconds)
+
+    def __exit__(self, type, value, traceback):
+        signal.alarm(0)
+
+    def _exit(self, signum, frame):
+        class TimeoutException(Exception):
+            pass
+        raise TimeoutException
+
+
+def requires_o_tmpfile_support(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not utils.o_tmpfile_supported():
+            raise SkipTest('Requires O_TMPFILE support')
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def encode_frag_archive_bodies(policy, body):
+    """
+    Given a stub body produce a list of complete frag_archive bodies as
+    strings in frag_index order.
+
+    :param policy: a StoragePolicy instance, with policy_type EC_POLICY
+    :param body: a string, the body to encode into frag archives
+
+    :returns: list of strings, the complete frag_archive bodies for the given
+              plaintext
+    """
+    segment_size = policy.ec_segment_size
+    # split up the body into buffers
+    chunks = [body[x:x + segment_size]
+              for x in range(0, len(body), segment_size)]
+    # encode the buffers into fragment payloads
+    fragment_payloads = []
+    for chunk in chunks:
+        fragments = policy.pyeclib_driver.encode(chunk)
+        if not fragments:
+            break
+        fragment_payloads.append(fragments)
+
+    # join up the fragment payloads per node
+    ec_archive_bodies = [''.join(frags)
+                         for frags in zip(*fragment_payloads)]
+    return ec_archive_bodies

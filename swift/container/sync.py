@@ -215,7 +215,7 @@ class ContainerSync(Daemon):
                                                      ring_name='container')
         bind_ip = conf.get('bind_ip', '0.0.0.0')
         self._myips = whataremyips(bind_ip)
-        self._myport = int(conf.get('bind_port', 6001))
+        self._myport = int(conf.get('bind_port', 6201))
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
         self.conn_timeout = float(conf.get('conn_timeout', 5))
@@ -237,8 +237,9 @@ class ContainerSync(Daemon):
             if err.errno != errno.ENOENT:
                 raise
             raise SystemExit(
-                _('Unable to load internal client from config: %r (%s)') %
-                (internal_client_conf_path, err))
+                _('Unable to load internal client from config: '
+                  '%(conf)r (%(error)s)')
+                % {'conf': internal_client_conf_path, 'error': err})
 
     def run_forever(self, *args, **kwargs):
         """
@@ -428,8 +429,6 @@ class ContainerSync(Daemon):
                         sync_stage_time = time()
                     self.container_syncs += 1
                     self.logger.increment('syncs')
-                except Exception as ex:
-                    raise ex
                 finally:
                     self.container_report(start_at, sync_stage_time,
                                           sync_point1,

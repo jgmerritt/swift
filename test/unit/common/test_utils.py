@@ -15,7 +15,7 @@
 
 """Tests for swift.common.utils"""
 from __future__ import print_function
-from test.unit import temptree
+from test.unit import temptree, debug_logger
 
 import ctypes
 import contextlib
@@ -30,7 +30,6 @@ import mock
 import random
 import re
 import socket
-import stat
 import sys
 import json
 import math
@@ -43,7 +42,6 @@ from textwrap import dedent
 
 import tempfile
 import time
-import traceback
 import unittest
 import fcntl
 import shutil
@@ -55,15 +53,17 @@ from tempfile import TemporaryFile, NamedTemporaryFile, mkdtemp
 from netifaces import AF_INET6
 from mock import MagicMock, patch
 from six.moves.configparser import NoSectionError, NoOptionError
+from uuid import uuid4
 
 from swift.common.exceptions import Timeout, MessageTimeout, \
     ConnectionTimeout, LockTimeout, ReplicationLockTimeout, \
-    MimeInvalid, ThreadPoolDead
+    MimeInvalid
 from swift.common import utils
+from swift.common.utils import is_valid_ip, is_valid_ipv4, is_valid_ipv6
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.swob import Request, Response
-from test.unit import FakeLogger
+from test.unit import FakeLogger, requires_o_tmpfile_support
 
 threading = eventlet.patcher.original('threading')
 
@@ -1377,6 +1377,28 @@ class TestUtils(unittest.TestCase):
         finally:
             rmtree(testdir_base)
 
+    def test_dump_recon_cache_set_owner(self):
+        testdir_base = mkdtemp()
+        testcache_file = os.path.join(testdir_base, 'cache.recon')
+        logger = utils.get_logger(None, 'server', log_route='server')
+        try:
+            submit_dict = {'key1': {'value1': 1, 'value2': 2}}
+
+            _ret = lambda: None
+            _ret.pw_uid = 100
+            _mock_getpwnam = MagicMock(return_value=_ret)
+            _mock_chown = mock.Mock()
+
+            with patch('os.chown', _mock_chown), \
+                    patch('pwd.getpwnam', _mock_getpwnam):
+                utils.dump_recon_cache(submit_dict, testcache_file,
+                                       logger, set_owner="swift")
+
+            _mock_getpwnam.assert_called_once_with("swift")
+            self.assertEqual(_mock_chown.call_args[0][1], 100)
+        finally:
+            rmtree(testdir_base)
+
     def test_dump_recon_cache_permission_denied(self):
         testdir_base = mkdtemp()
         testcache_file = os.path.join(testdir_base, 'cache.recon')
@@ -1667,12 +1689,12 @@ class TestUtils(unittest.TestCase):
             log_msg = strip_value(sio)
             self.assertTrue('txn' in log_msg)
             self.assertTrue('12345' in log_msg)
-            # test no txn on info message
+            # test txn in info message
             self.assertEqual(logger.txn_id, '12345')
             logger.info('test')
             log_msg = strip_value(sio)
-            self.assertTrue('txn' not in log_msg)
-            self.assertTrue('12345' not in log_msg)
+            self.assertTrue('txn' in log_msg)
+            self.assertTrue('12345' in log_msg)
             # test txn already in message
             self.assertEqual(logger.txn_id, '12345')
             logger.warning('test 12345 test')
@@ -1709,6 +1731,78 @@ class TestUtils(unittest.TestCase):
     def test_storage_directory(self):
         self.assertEqual(utils.storage_directory('objects', '1', 'ABCDEF'),
                          'objects/1/DEF/ABCDEF')
+
+    def test_is_valid_ip(self):
+        self.assertTrue(is_valid_ip("127.0.0.1"))
+        self.assertTrue(is_valid_ip("10.0.0.1"))
+        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "fe80::204:61ff:fe9d:f156"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "fe80::204:61ff:254.157.241.86"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "fe80::"
+        self.assertTrue(is_valid_ip(ipv6))
+        ipv6 = "::1"
+        self.assertTrue(is_valid_ip(ipv6))
+        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
+        self.assertFalse(is_valid_ip(not_ipv6))
+        not_ipv6 = "1:2:3:4:5:6::7:8"
+        self.assertFalse(is_valid_ip(not_ipv6))
+
+    def test_is_valid_ipv4(self):
+        self.assertTrue(is_valid_ipv4("127.0.0.1"))
+        self.assertTrue(is_valid_ipv4("10.0.0.1"))
+        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "fe80::204:61ff:fe9d:f156"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "fe80::204:61ff:254.157.241.86"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "fe80::"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        ipv6 = "::1"
+        self.assertFalse(is_valid_ipv4(ipv6))
+        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
+        self.assertFalse(is_valid_ipv4(not_ipv6))
+        not_ipv6 = "1:2:3:4:5:6::7:8"
+        self.assertFalse(is_valid_ipv4(not_ipv6))
+
+    def test_is_valid_ipv6(self):
+        self.assertFalse(is_valid_ipv6("127.0.0.1"))
+        self.assertFalse(is_valid_ipv6("10.0.0.1"))
+        ipv6 = "fe80:0000:0000:0000:0204:61ff:fe9d:f156"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "fe80:0:0:0:204:61ff:fe9d:f156"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "fe80::204:61ff:fe9d:f156"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "fe80:0000:0000:0000:0204:61ff:254.157.241.86"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "fe80:0:0:0:0204:61ff:254.157.241.86"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "fe80::204:61ff:254.157.241.86"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "fe80::"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        ipv6 = "::1"
+        self.assertTrue(is_valid_ipv6(ipv6))
+        not_ipv6 = "3ffe:0b00:0000:0001:0000:0000:000a"
+        self.assertFalse(is_valid_ipv6(not_ipv6))
+        not_ipv6 = "1:2:3:4:5:6::7:8"
+        self.assertFalse(is_valid_ipv6(not_ipv6))
 
     def test_expand_ipv6(self):
         expanded_ipv6 = "fe80::204:61ff:fe9d:f156"
@@ -2504,13 +2598,23 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertFalse(utils.streq_const_time('a', 'aaaaa'))
         self.assertFalse(utils.streq_const_time('ABC123', 'abc123'))
 
-    def test_replication_quorum_size(self):
+    def test_quorum_size(self):
+        expected_sizes = {1: 1,
+                          2: 1,
+                          3: 2,
+                          4: 2,
+                          5: 3}
+        got_sizes = dict([(n, utils.quorum_size(n))
+                          for n in expected_sizes])
+        self.assertEqual(expected_sizes, got_sizes)
+
+    def test_majority_size(self):
         expected_sizes = {1: 1,
                           2: 2,
                           3: 2,
                           4: 3,
                           5: 3}
-        got_sizes = dict([(n, utils.quorum_size(n))
+        got_sizes = dict([(n, utils.majority_size(n))
                           for n in expected_sizes])
         self.assertEqual(expected_sizes, got_sizes)
 
@@ -2583,6 +2687,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         class StatVFS(object):
             f_frsize = 1024
             f_bavail = 1
+            f_blocks = 100
 
         def fstatvfs(fd):
             return StatVFS()
@@ -2592,102 +2697,192 @@ cluster_dfw1 = http://dfw1.host/v1/
         try:
             fallocate = utils.FallocateWrapper(noop=True)
             utils.os.fstatvfs = fstatvfs
+
+            # Make sure setting noop, which disables fallocate, also stops the
+            # fallocate_reserve check.
+            # Set the fallocate_reserve to 99% and request an object that is
+            # about 50% the size. With fallocate_reserve off this will succeed.
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('99%')
+            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(500)), 0)
+
+            # Setting noop to False after the constructor allows us to use
+            # a noop fallocate syscall and still test fallocate_reserve.
+            fallocate.noop = False
+
             # Want 1023 reserved, have 1024 * 1 free, so succeeds
-            utils.FALLOCATE_RESERVE = 1023
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1023')
             StatVFS.f_frsize = 1024
             StatVFS.f_bavail = 1
             self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(0)), 0)
             # Want 1023 reserved, have 512 * 2 free, so succeeds
-            utils.FALLOCATE_RESERVE = 1023
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1023')
             StatVFS.f_frsize = 512
             StatVFS.f_bavail = 2
             self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(0)), 0)
             # Want 1024 reserved, have 1024 * 1 free, so fails
-            utils.FALLOCATE_RESERVE = 1024
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1024')
             StatVFS.f_frsize = 1024
             StatVFS.f_bavail = 1
-            exc = None
-            try:
+
+            with self.assertRaises(OSError) as catcher:
                 fallocate(0, 1, 0, ctypes.c_uint64(0))
-            except OSError as err:
-                exc = err
-            self.assertEqual(str(exc),
-                             '[Errno 28] FALLOCATE_RESERVE fail 1024 <= 1024')
-            self.assertEqual(err.errno, errno.ENOSPC)
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
             # Want 1024 reserved, have 512 * 2 free, so fails
-            utils.FALLOCATE_RESERVE = 1024
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1024')
             StatVFS.f_frsize = 512
             StatVFS.f_bavail = 2
-            exc = None
-            try:
+            with self.assertRaises(OSError) as catcher:
                 fallocate(0, 1, 0, ctypes.c_uint64(0))
-            except OSError as err:
-                exc = err
-            self.assertEqual(str(exc),
-                             '[Errno 28] FALLOCATE_RESERVE fail 1024 <= 1024')
-            self.assertEqual(err.errno, errno.ENOSPC)
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 1024'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
             # Want 2048 reserved, have 1024 * 1 free, so fails
-            utils.FALLOCATE_RESERVE = 2048
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('2048')
             StatVFS.f_frsize = 1024
             StatVFS.f_bavail = 1
-            exc = None
-            try:
+            with self.assertRaises(OSError) as catcher:
                 fallocate(0, 1, 0, ctypes.c_uint64(0))
-            except OSError as err:
-                exc = err
-            self.assertEqual(str(exc),
-                             '[Errno 28] FALLOCATE_RESERVE fail 1024 <= 2048')
-            self.assertEqual(err.errno, errno.ENOSPC)
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 2048'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
             # Want 2048 reserved, have 512 * 2 free, so fails
-            utils.FALLOCATE_RESERVE = 2048
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('2048')
             StatVFS.f_frsize = 512
             StatVFS.f_bavail = 2
-            exc = None
-            try:
+            with self.assertRaises(OSError) as catcher:
                 fallocate(0, 1, 0, ctypes.c_uint64(0))
-            except OSError as err:
-                exc = err
-            self.assertEqual(str(exc),
-                             '[Errno 28] FALLOCATE_RESERVE fail 1024 <= 2048')
-            self.assertEqual(err.errno, errno.ENOSPC)
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 1024 <= 2048'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
             # Want 1023 reserved, have 1024 * 1 free, but file size is 1, so
             # fails
-            utils.FALLOCATE_RESERVE = 1023
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1023')
             StatVFS.f_frsize = 1024
             StatVFS.f_bavail = 1
-            exc = None
-            try:
+            with self.assertRaises(OSError) as catcher:
                 fallocate(0, 1, 0, ctypes.c_uint64(1))
-            except OSError as err:
-                exc = err
-            self.assertEqual(str(exc),
-                             '[Errno 28] FALLOCATE_RESERVE fail 1023 <= 1023')
-            self.assertEqual(err.errno, errno.ENOSPC)
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 1023 <= 1023'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
             # Want 1022 reserved, have 1024 * 1 free, and file size is 1, so
             # succeeds
-            utils.FALLOCATE_RESERVE = 1022
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1022')
             StatVFS.f_frsize = 1024
             StatVFS.f_bavail = 1
             self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(1)), 0)
-            # Want 1023 reserved, have 1024 * 1 free, and file size is 0, so
-            # succeeds
-            utils.FALLOCATE_RESERVE = 1023
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(0)), 0)
-            # Want 1024 reserved, have 1024 * 1 free, and even though
-            # file size is 0, since we're under the reserve, fails
-            utils.FALLOCATE_RESERVE = 1024
-            StatVFS.f_frsize = 1024
-            StatVFS.f_bavail = 1
-            exc = None
-            try:
+
+            # Want 1% reserved, have 100 bytes * 2/100 free, and file size is
+            # 99, so succeeds
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1%')
+            StatVFS.f_frsize = 100
+            StatVFS.f_bavail = 2
+            StatVFS.f_blocks = 100
+            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(99)), 0)
+
+            # Want 2% reserved, have 50 bytes * 2/50 free, and file size is 49,
+            # so succeeds
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('2%')
+            StatVFS.f_frsize = 50
+            StatVFS.f_bavail = 2
+            StatVFS.f_blocks = 50
+            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(49)), 0)
+
+            # Want 100% reserved, have  100 * 100/100 free, and file size is 0,
+            # so fails.
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('100%')
+            StatVFS.f_frsize = 100
+            StatVFS.f_bavail = 100
+            StatVFS.f_blocks = 100
+            with self.assertRaises(OSError) as catcher:
                 fallocate(0, 1, 0, ctypes.c_uint64(0))
-            except OSError as err:
-                exc = err
-            self.assertEqual(str(exc),
-                             '[Errno 28] FALLOCATE_RESERVE fail 1024 <= 1024')
-            self.assertEqual(err.errno, errno.ENOSPC)
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 100.0 <= 100.0'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
+            # Want 1% reserved, have 100 * 2/100 free, and file size is 101,
+            # so fails.
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('1%')
+            StatVFS.f_frsize = 100
+            StatVFS.f_bavail = 2
+            StatVFS.f_blocks = 100
+            with self.assertRaises(OSError) as catcher:
+                fallocate(0, 1, 0, ctypes.c_uint64(101))
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 0.99 <= 1.0'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
+            # is 100, so fails
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('98%')
+            StatVFS.f_frsize = 100
+            StatVFS.f_bavail = 99
+            StatVFS.f_blocks = 100
+            with self.assertRaises(OSError) as catcher:
+                fallocate(0, 1, 0, ctypes.c_uint64(100))
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 98.0 <= 98.0'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
+            # Want 2% reserved, have 1000 bytes * 21/1000 free, and file size
+            # is 999, so succeeds.
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('2%')
+            StatVFS.f_frsize = 1000
+            StatVFS.f_bavail = 21
+            StatVFS.f_blocks = 1000
+            self.assertEqual(fallocate(0, 1, 0, ctypes.c_uint64(999)), 0)
+
+            # Want 2% resereved, have 1000 bytes * 21/1000 free, and file size
+            # is 1000, so fails.
+            utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
+                utils.config_fallocate_value('2%')
+            StatVFS.f_frsize = 1000
+            StatVFS.f_bavail = 21
+            StatVFS.f_blocks = 1000
+            with self.assertRaises(OSError) as catcher:
+                fallocate(0, 1, 0, ctypes.c_uint64(1000))
+            self.assertEqual(
+                str(catcher.exception),
+                '[Errno %d] FALLOCATE_RESERVE fail 2.0 <= 2.0'
+                % errno.ENOSPC)
+            self.assertEqual(catcher.exception.errno, errno.ENOSPC)
+
         finally:
             utils.FALLOCATE_RESERVE = orig_FALLOCATE_RESERVE
             utils.os.fstatvfs = orig_fstatvfs
@@ -2766,6 +2961,44 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(ts, None)
         ts = utils.get_trans_id_time('tx1df4ff4f55ea45f7b2ec2-almostright')
         self.assertEqual(ts, None)
+
+    def test_config_fallocate_value(self):
+        fallocate_value, is_percent = utils.config_fallocate_value('10%')
+        self.assertEqual(fallocate_value, 10)
+        self.assertTrue(is_percent)
+        fallocate_value, is_percent = utils.config_fallocate_value('10')
+        self.assertEqual(fallocate_value, 10)
+        self.assertFalse(is_percent)
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('ab%')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: ab% is an invalid value for '
+                                   'fallocate_reserve.')
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('ab')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: ab is an invalid value for '
+                                   'fallocate_reserve.')
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('1%%')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: 1%% is an invalid value for '
+                                   'fallocate_reserve.')
+        try:
+            fallocate_value, is_percent = utils.config_fallocate_value('10.0')
+        except ValueError as err:
+            exc = err
+        self.assertEqual(str(exc), 'Error: 10.0 is an invalid value for '
+                                   'fallocate_reserve.')
+        fallocate_value, is_percent = utils.config_fallocate_value('10.5%')
+        self.assertEqual(fallocate_value, 10.5)
+        self.assertTrue(is_percent)
+        fallocate_value, is_percent = utils.config_fallocate_value('10.000%')
+        self.assertEqual(fallocate_value, 10.000)
+        self.assertTrue(is_percent)
 
     def test_tpool_reraise(self):
         with patch.object(utils.tpool, 'execute', lambda f: f()):
@@ -3073,6 +3306,24 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(listing_dict['content_type'],
                          'text/plain;hello="world"')
 
+    def test_extract_swift_bytes(self):
+        scenarios = {
+            # maps input value -> expected returned tuple
+            '': ('', None),
+            'text/plain': ('text/plain', None),
+            'text/plain; other=thing': ('text/plain;other=thing', None),
+            'text/plain; swift_bytes=123': ('text/plain', '123'),
+            'text/plain; other=thing;swift_bytes=123':
+                ('text/plain;other=thing', '123'),
+            'text/plain; swift_bytes=123; other=thing':
+                ('text/plain;other=thing', '123'),
+            'text/plain; swift_bytes=123; swift_bytes=456':
+                ('text/plain', '456'),
+            'text/plain; swift_bytes=123; other=thing;swift_bytes=456':
+                ('text/plain;other=thing', '456')}
+        for test_value, expected in scenarios.items():
+            self.assertEqual(expected, utils.extract_swift_bytes(test_value))
+
     def test_clean_content_type(self):
         subtests = {
             '': '', 'text/plain': 'text/plain',
@@ -3295,6 +3546,175 @@ cluster_dfw1 = http://dfw1.host/v1/
         finally:
             if tempdir:
                 shutil.rmtree(tempdir)
+
+    def test_modify_priority(self):
+        pid = os.getpid()
+        logger = debug_logger()
+        called = {}
+
+        def _fake_setpriority(*args):
+            called['setpriority'] = args
+
+        def _fake_syscall(*args):
+            called['syscall'] = args
+
+        with patch('swift.common.utils._libc_setpriority',
+                   _fake_setpriority), \
+                patch('swift.common.utils._posix_syscall', _fake_syscall):
+            called = {}
+            # not set / default
+            utils.modify_priority({}, logger)
+            self.assertEqual(called, {})
+            called = {}
+            # just nice
+            utils.modify_priority({'nice_priority': '1'}, logger)
+            self.assertEqual(called, {'setpriority': (0, pid, 1)})
+            called = {}
+            # just ionice class uses default priority 0
+            utils.modify_priority({'ionice_class': 'IOPRIO_CLASS_RT'}, logger)
+            self.assertEqual(called, {'syscall': (251, 1, pid, 1 << 13)})
+            called = {}
+            # just ionice priority is ignored
+            utils.modify_priority({'ionice_priority': '4'}, logger)
+            self.assertEqual(called, {})
+            called = {}
+            # bad ionice class
+            utils.modify_priority({'ionice_class': 'class_foo'}, logger)
+            self.assertEqual(called, {})
+            called = {}
+            # ionice class & priority
+            utils.modify_priority({
+                'ionice_class': 'IOPRIO_CLASS_BE',
+                'ionice_priority': '4',
+            }, logger)
+            self.assertEqual(called, {'syscall': (251, 1, pid, 2 << 13 | 4)})
+            called = {}
+            # all
+            utils.modify_priority({
+                'nice_priority': '-15',
+                'ionice_class': 'IOPRIO_CLASS_IDLE',
+                'ionice_priority': '6',
+            }, logger)
+            self.assertEqual(called, {
+                'setpriority': (0, pid, -15),
+                'syscall': (251, 1, pid, 3 << 13 | 6),
+            })
+
+    def test__NR_ioprio_set(self):
+        with patch('os.uname', return_value=('', '', '', '', 'x86_64')), \
+                patch('platform.architecture', return_value=('64bit', '')):
+            self.assertEqual(251, utils.NR_ioprio_set())
+
+        with patch('os.uname', return_value=('', '', '', '', 'x86_64')), \
+                patch('platform.architecture', return_value=('32bit', '')):
+            self.assertRaises(OSError, utils.NR_ioprio_set)
+
+        with patch('os.uname', return_value=('', '', '', '', 'alpha')), \
+                patch('platform.architecture', return_value=('64bit', '')):
+            self.assertRaises(OSError, utils.NR_ioprio_set)
+
+    @requires_o_tmpfile_support
+    def test_link_fd_to_path_linkat_success(self):
+        tempdir = mkdtemp(dir='/tmp')
+        fd = os.open(tempdir, utils.O_TMPFILE | os.O_WRONLY)
+        data = "I'm whatever Gotham needs me to be"
+        _m_fsync_dir = mock.Mock()
+        try:
+            os.write(fd, data)
+            # fd is O_WRONLY
+            self.assertRaises(OSError, os.read, fd, 1)
+            file_path = os.path.join(tempdir, uuid4().hex)
+            with mock.patch('swift.common.utils.fsync_dir', _m_fsync_dir):
+                    utils.link_fd_to_path(fd, file_path, 1)
+            with open(file_path, 'r') as f:
+                self.assertEqual(f.read(), data)
+            self.assertEqual(_m_fsync_dir.call_count, 2)
+        finally:
+            os.close(fd)
+            shutil.rmtree(tempdir)
+
+    @requires_o_tmpfile_support
+    def test_link_fd_to_path_target_exists(self):
+        tempdir = mkdtemp(dir='/tmp')
+        # Create and write to a file
+        fd, path = tempfile.mkstemp(dir=tempdir)
+        os.write(fd, "hello world")
+        os.fsync(fd)
+        os.close(fd)
+        self.assertTrue(os.path.exists(path))
+
+        fd = os.open(tempdir, utils.O_TMPFILE | os.O_WRONLY)
+        try:
+            os.write(fd, "bye world")
+            os.fsync(fd)
+            utils.link_fd_to_path(fd, path, 0, fsync=False)
+            # Original file now should have been over-written
+            with open(path, 'r') as f:
+                self.assertEqual(f.read(), "bye world")
+        finally:
+            os.close(fd)
+            shutil.rmtree(tempdir)
+
+    @requires_o_tmpfile_support
+    def test_link_fd_to_path_errno_not_EEXIST_or_ENOENT(self):
+        _m_linkat = mock.Mock(
+            side_effect=IOError(errno.EACCES, os.strerror(errno.EACCES)))
+        with mock.patch('swift.common.utils.linkat', _m_linkat):
+            try:
+                utils.link_fd_to_path(0, '/path', 1)
+            except IOError as err:
+                self.assertEqual(err.errno, errno.EACCES)
+            else:
+                self.fail("Expecting IOError exception")
+        self.assertTrue(_m_linkat.called)
+
+    @requires_o_tmpfile_support
+    def test_linkat_race_dir_not_exists(self):
+        tempdir = mkdtemp(dir='/tmp')
+        target_dir = os.path.join(tempdir, uuid4().hex)
+        target_path = os.path.join(target_dir, uuid4().hex)
+        os.mkdir(target_dir)
+        fd = os.open(target_dir, utils.O_TMPFILE | os.O_WRONLY)
+        # Simulating directory deletion by other backend process
+        os.rmdir(target_dir)
+        self.assertFalse(os.path.exists(target_dir))
+        try:
+            utils.link_fd_to_path(fd, target_path, 1)
+            self.assertTrue(os.path.exists(target_dir))
+            self.assertTrue(os.path.exists(target_path))
+        finally:
+            os.close(fd)
+            shutil.rmtree(tempdir)
+
+    def test_safe_json_loads(self):
+        expectations = {
+            None: None,
+            '': None,
+            0: None,
+            1: None,
+            '"asdf"': 'asdf',
+            '[]': [],
+            '{}': {},
+            "{'foo': 'bar'}": None,
+            '{"foo": "bar"}': {'foo': 'bar'},
+        }
+
+        failures = []
+        for value, expected in expectations.items():
+            try:
+                result = utils.safe_json_loads(value)
+            except Exception as e:
+                # it's called safe, if it blows up the test blows up
+                self.fail('%r caused safe method to throw %r!' % (
+                    value, e))
+            try:
+                self.assertEqual(expected, result)
+            except AssertionError:
+                failures.append('%r => %r (expected %r)' % (
+                    value, result, expected))
+        if failures:
+            self.fail('Invalid results from pure function:\n%s' %
+                      '\n'.join(failures))
 
 
 class ResellerConfReader(unittest.TestCase):
@@ -4717,165 +5137,6 @@ class TestStatsdLoggingDelegation(unittest.TestCase):
                 self.assertEqual(called, [12345])
 
 
-class TestThreadPool(unittest.TestCase):
-
-    def setUp(self):
-        self.tp = None
-
-    def tearDown(self):
-        if self.tp:
-            self.tp.terminate()
-
-    def _pipe_count(self):
-        # Counts the number of pipes that this process owns.
-        fd_dir = "/proc/%d/fd" % os.getpid()
-
-        def is_pipe(path):
-            try:
-                stat_result = os.stat(path)
-                return stat.S_ISFIFO(stat_result.st_mode)
-            except OSError:
-                return False
-
-        return len([fd for fd in os.listdir(fd_dir)
-                    if is_pipe(os.path.join(fd_dir, fd))])
-
-    def _thread_id(self):
-        return threading.current_thread().ident
-
-    def _capture_args(self, *args, **kwargs):
-        return {'args': args, 'kwargs': kwargs}
-
-    def _raise_valueerror(self):
-        return int('fishcakes')
-
-    def test_run_in_thread_with_threads(self):
-        tp = self.tp = utils.ThreadPool(1)
-
-        my_id = self._thread_id()
-        other_id = tp.run_in_thread(self._thread_id)
-        self.assertNotEqual(my_id, other_id)
-
-        result = tp.run_in_thread(self._capture_args, 1, 2, bert='ernie')
-        self.assertEqual(result, {'args': (1, 2),
-                                  'kwargs': {'bert': 'ernie'}})
-
-        caught = False
-        try:
-            tp.run_in_thread(self._raise_valueerror)
-        except ValueError:
-            caught = True
-        self.assertTrue(caught)
-
-    def test_force_run_in_thread_with_threads(self):
-        # with nthreads > 0, force_run_in_thread looks just like run_in_thread
-        tp = self.tp = utils.ThreadPool(1)
-
-        my_id = self._thread_id()
-        other_id = tp.force_run_in_thread(self._thread_id)
-        self.assertNotEqual(my_id, other_id)
-
-        result = tp.force_run_in_thread(self._capture_args, 1, 2, bert='ernie')
-        self.assertEqual(result, {'args': (1, 2),
-                                  'kwargs': {'bert': 'ernie'}})
-        self.assertRaises(ValueError, tp.force_run_in_thread,
-                          self._raise_valueerror)
-
-    def test_run_in_thread_without_threads(self):
-        # with zero threads, run_in_thread doesn't actually do so
-        tp = utils.ThreadPool(0)
-
-        my_id = self._thread_id()
-        other_id = tp.run_in_thread(self._thread_id)
-        self.assertEqual(my_id, other_id)
-
-        result = tp.run_in_thread(self._capture_args, 1, 2, bert='ernie')
-        self.assertEqual(result, {'args': (1, 2),
-                                  'kwargs': {'bert': 'ernie'}})
-        self.assertRaises(ValueError, tp.run_in_thread,
-                          self._raise_valueerror)
-
-    def test_force_run_in_thread_without_threads(self):
-        # with zero threads, force_run_in_thread uses eventlet.tpool
-        tp = utils.ThreadPool(0)
-
-        my_id = self._thread_id()
-        other_id = tp.force_run_in_thread(self._thread_id)
-        self.assertNotEqual(my_id, other_id)
-
-        result = tp.force_run_in_thread(self._capture_args, 1, 2, bert='ernie')
-        self.assertEqual(result, {'args': (1, 2),
-                                  'kwargs': {'bert': 'ernie'}})
-        self.assertRaises(ValueError, tp.force_run_in_thread,
-                          self._raise_valueerror)
-
-    def test_preserving_stack_trace_from_thread(self):
-        def gamma():
-            return 1 / 0  # ZeroDivisionError
-
-        def beta():
-            return gamma()
-
-        def alpha():
-            return beta()
-
-        tp = self.tp = utils.ThreadPool(1)
-        try:
-            tp.run_in_thread(alpha)
-        except ZeroDivisionError:
-            # NB: format is (filename, line number, function name, text)
-            tb_func = [elem[2] for elem
-                       in traceback.extract_tb(sys.exc_info()[2])]
-        else:
-            self.fail("Expected ZeroDivisionError")
-
-        self.assertEqual(tb_func[-1], "gamma")
-        self.assertEqual(tb_func[-2], "beta")
-        self.assertEqual(tb_func[-3], "alpha")
-        # omit the middle; what's important is that the start and end are
-        # included, not the exact names of helper methods
-        self.assertEqual(tb_func[1], "run_in_thread")
-        self.assertEqual(tb_func[0], "test_preserving_stack_trace_from_thread")
-
-    def test_terminate(self):
-        initial_thread_count = threading.activeCount()
-        initial_pipe_count = self._pipe_count()
-
-        tp = utils.ThreadPool(4)
-        # do some work to ensure any lazy initialization happens
-        tp.run_in_thread(os.path.join, 'foo', 'bar')
-        tp.run_in_thread(os.path.join, 'baz', 'quux')
-
-        # 4 threads in the ThreadPool, plus one pipe for IPC; this also
-        # serves as a sanity check that we're actually allocating some
-        # resources to free later
-        self.assertEqual(initial_thread_count, threading.activeCount() - 4)
-        self.assertEqual(initial_pipe_count, self._pipe_count() - 2)
-
-        tp.terminate()
-        self.assertEqual(initial_thread_count, threading.activeCount())
-        self.assertEqual(initial_pipe_count, self._pipe_count())
-
-    def test_cant_run_after_terminate(self):
-        tp = utils.ThreadPool(0)
-        tp.terminate()
-        self.assertRaises(ThreadPoolDead, tp.run_in_thread, lambda: 1)
-        self.assertRaises(ThreadPoolDead, tp.force_run_in_thread, lambda: 1)
-
-    def test_double_terminate_doesnt_crash(self):
-        tp = utils.ThreadPool(0)
-        tp.terminate()
-        tp.terminate()
-
-        tp = utils.ThreadPool(1)
-        tp.terminate()
-        tp.terminate()
-
-    def test_terminate_no_threads_doesnt_crash(self):
-        tp = utils.ThreadPool(0)
-        tp.terminate()
-
-
 class TestAuditLocationGenerator(unittest.TestCase):
 
     def test_drive_tree_access(self):
@@ -5266,6 +5527,98 @@ class TestLRUCache(unittest.TestCase):
         self.assertEqual(f.size(), 4)
 
 
+class TestSpliterator(unittest.TestCase):
+    def test_string(self):
+        input_chunks = ["coun", "ter-", "b", "ra", "nch-mater",
+                        "nit", "y-fungusy", "-nummular"]
+        si = utils.Spliterator(input_chunks)
+
+        self.assertEqual(''.join(si.take(8)), "counter-")
+        self.assertEqual(''.join(si.take(7)), "branch-")
+        self.assertEqual(''.join(si.take(10)), "maternity-")
+        self.assertEqual(''.join(si.take(8)), "fungusy-")
+        self.assertEqual(''.join(si.take(8)), "nummular")
+
+    def test_big_input_string(self):
+        input_chunks = ["iridium"]
+        si = utils.Spliterator(input_chunks)
+
+        self.assertEqual(''.join(si.take(2)), "ir")
+        self.assertEqual(''.join(si.take(1)), "i")
+        self.assertEqual(''.join(si.take(2)), "di")
+        self.assertEqual(''.join(si.take(1)), "u")
+        self.assertEqual(''.join(si.take(1)), "m")
+
+    def test_chunk_boundaries(self):
+        input_chunks = ["soylent", "green", "is", "people"]
+        si = utils.Spliterator(input_chunks)
+
+        self.assertEqual(''.join(si.take(7)), "soylent")
+        self.assertEqual(''.join(si.take(5)), "green")
+        self.assertEqual(''.join(si.take(2)), "is")
+        self.assertEqual(''.join(si.take(6)), "people")
+
+    def test_no_empty_strings(self):
+        input_chunks = ["soylent", "green", "is", "people"]
+        si = utils.Spliterator(input_chunks)
+
+        outputs = (list(si.take(7))     # starts and ends on chunk boundary
+                   + list(si.take(2))   # spans two chunks
+                   + list(si.take(3))   # begins but does not end chunk
+                   + list(si.take(2))   # ends but does not begin chunk
+                   + list(si.take(6)))  # whole chunk + EOF
+        self.assertNotIn('', outputs)
+
+    def test_running_out(self):
+        input_chunks = ["not much"]
+        si = utils.Spliterator(input_chunks)
+
+        self.assertEqual(''.join(si.take(4)), "not ")
+        self.assertEqual(''.join(si.take(99)), "much")  # short
+        self.assertEqual(''.join(si.take(4)), "")
+        self.assertEqual(''.join(si.take(4)), "")
+
+    def test_overlap(self):
+        input_chunks = ["one fish", "two fish", "red fish", "blue fish"]
+
+        si = utils.Spliterator(input_chunks)
+        t1 = si.take(20)  # longer than first chunk
+        self.assertLess(len(next(t1)), 20)  # it's not exhausted
+
+        t2 = si.take(20)
+        self.assertRaises(ValueError, next, t2)
+
+    def test_closing(self):
+        input_chunks = ["abcd", "efg", "hij"]
+
+        si = utils.Spliterator(input_chunks)
+        it = si.take(3)  # shorter than first chunk
+        self.assertEqual(next(it), 'abc')
+        it.close()
+        self.assertEqual(list(si.take(20)), ['d', 'efg', 'hij'])
+
+        si = utils.Spliterator(input_chunks)
+        self.assertEqual(list(si.take(1)), ['a'])
+        it = si.take(1)  # still shorter than first chunk
+        self.assertEqual(next(it), 'b')
+        it.close()
+        self.assertEqual(list(si.take(20)), ['cd', 'efg', 'hij'])
+
+        si = utils.Spliterator(input_chunks)
+        it = si.take(6)  # longer than first chunk, shorter than first + second
+        self.assertEqual(next(it), 'abcd')
+        self.assertEqual(next(it), 'ef')
+        it.close()
+        self.assertEqual(list(si.take(20)), ['g', 'hij'])
+
+        si = utils.Spliterator(input_chunks)
+        self.assertEqual(list(si.take(2)), ['ab'])
+        it = si.take(3)  # longer than rest of chunk
+        self.assertEqual(next(it), 'cd')
+        it.close()
+        self.assertEqual(list(si.take(20)), ['efg', 'hij'])
+
+
 class TestParseContentRange(unittest.TestCase):
     def test_good(self):
         start, end, total = utils.parse_content_range("bytes 100-200/300")
@@ -5567,6 +5920,28 @@ class TestDocumentItersToHTTPResponseBody(unittest.TestCase):
             "\r\n" +
             part2 + "\r\n" +
             "--boundaryboundary--"))
+
+    def test_closed_part_iterator(self):
+        print('test')
+        useful_iter_mock = mock.MagicMock()
+        useful_iter_mock.__iter__.return_value = ['']
+        body_iter = utils.document_iters_to_http_response_body(
+            iter([{'part_iter': useful_iter_mock}]), 'dontcare',
+            multipart=False, logger=FakeLogger())
+        body = ''
+        for s in body_iter:
+            body += s
+        self.assertEqual(body, '')
+        useful_iter_mock.close.assert_called_once_with()
+
+        # Calling "close" on the mock will now raise an AttributeError
+        del useful_iter_mock.close
+        body_iter = utils.document_iters_to_http_response_body(
+            iter([{'part_iter': useful_iter_mock}]), 'dontcare',
+            multipart=False, logger=FakeLogger())
+        body = ''
+        for s in body_iter:
+            body += s
 
 
 class TestPairs(unittest.TestCase):
