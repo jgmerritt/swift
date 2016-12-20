@@ -18,7 +18,6 @@ import os
 import sys
 import time
 import signal
-import re
 from os.path import basename, dirname, join
 from random import shuffle
 from swift import gettext_ as _
@@ -33,9 +32,6 @@ from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist,\
     DiskFileDeleted, DiskFileExpired
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import POLICIES
-
-# This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
-RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
 
 
 class AuditorWorker(object):
@@ -54,9 +50,10 @@ class AuditorWorker(object):
             # configure for their replicator
             replicator_config = readconf(self.conf['__file__'],
                                          'object-replicator')
-        except (KeyError, SystemExit):
+        except (KeyError, ValueError, IOError):
             # if we can't parse the real config (generally a KeyError on
-            # __file__, or SystemExit on no object-replicator section) we use
+            # __file__, or ValueError on no object-replicator section, or
+            # IOError if reading the file failed) we use
             # a very conservative default for rsync_timeout
             default_rsync_timeout = 86400
         else:
@@ -281,8 +278,8 @@ class AuditorWorker(object):
         # _ondisk_info attr is initialized to None and filled in by open
         ondisk_info_dict = df._ondisk_info or {}
         if 'unexpected' in ondisk_info_dict:
-            is_rsync_tempfile = lambda fpath: RE_RSYNC_TEMPFILE.match(
-                basename(fpath))
+            is_rsync_tempfile = lambda fpath: (
+                diskfile.RE_RSYNC_TEMPFILE.match(basename(fpath)))
             rsync_tempfile_paths = filter(is_rsync_tempfile,
                                           ondisk_info_dict['unexpected'])
             mtime = time.time() - self.rsync_tempfile_timeout

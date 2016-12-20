@@ -29,10 +29,10 @@ from swift.common.ring import Ring
 from swift.common.utils import get_logger, renamer, write_pickle, \
     dump_recon_cache, config_true_value, ismount
 from swift.common.daemon import Daemon
+from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import split_policy_string, PolicyError
 from swift.obj.diskfile import get_tmp_dir, ASYNCDIR_BASE
-from swift.common.http import is_success, HTTP_NOT_FOUND, \
-    HTTP_INTERNAL_SERVER_ERROR
+from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR
 
 
 class ObjectUpdater(Daemon):
@@ -219,7 +219,7 @@ class ObjectUpdater(Daemon):
             update['account'], update['container'])
         obj = '/%s/%s/%s' % \
               (update['account'], update['container'], update['obj'])
-        headers_out = update['headers'].copy()
+        headers_out = HeaderKeyDict(update['headers'])
         headers_out['user-agent'] = 'object-updater %s' % os.getpid()
         headers_out.setdefault('X-Backend-Storage-Policy-Index',
                                str(int(policy)))
@@ -269,8 +269,13 @@ class ObjectUpdater(Daemon):
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.read()
-                success = (is_success(resp.status) or
-                           resp.status == HTTP_NOT_FOUND)
+                success = is_success(resp.status)
+                if not success:
+                    self.logger.debug(
+                        _('Error code %(status)d is returned from remote '
+                          'server %(ip)s: %(port)s / %(device)s'),
+                        {'status': resp.status, 'ip': node['ip'],
+                         'port': node['port'], 'device': node['device']})
                 return (success, node['id'])
         except (Exception, Timeout):
             self.logger.exception(_('ERROR with remote server '

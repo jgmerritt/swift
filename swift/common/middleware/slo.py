@@ -39,10 +39,10 @@ Key         Description
 =========== ========================================================
 path        the path to the segment object (not including account)
             /container/object_name
-etag        the ETag given back when the segment object was PUT,
-            or null
-size_bytes  the size of the complete segment object in
-            bytes, or null
+etag        (optional) the ETag given back when the segment object
+            was PUT
+size_bytes  (optional) the size of the complete segment object in
+            bytes
 range       (optional) the (inclusive) range within the object to
             use as a segment. If omitted, the entire object is used.
 =========== ========================================================
@@ -67,8 +67,8 @@ head every segment passed in to verify:
  5. if the user provided a range, it is a singular, syntactically correct range
     that is satisfiable given the size of the object.
 
-Note that the etag and size_bytes keys are still required; this acts as a guard
-against user errors such as typos. If any of the objects fail to verify (not
+Note that the etag and size_bytes keys are optional; if ommitted, the
+verification is not performed. If any of the objects fail to verify (not
 found, size/etag mismatch, below minimum size, invalid range) then the user
 will receive a 4xx error response. If everything does match, the user will
 receive a 2xx response and the SLO object is ready for downloading.
@@ -106,12 +106,10 @@ If a user uploads this manifest:
 
   .. code::
 
-     [{"path": "/con/obj_seg_1", "etag": null, "size_bytes": 2097152,
-       "range": "0-1048576"},
-      {"path": "/con/obj_seg_2", "etag": null, "size_bytes": 2097152,
+     [{"path": "/con/obj_seg_1", "size_bytes": 2097152, "range": "0-1048576"},
+      {"path": "/con/obj_seg_2", "size_bytes": 2097152,
        "range": "512-1550000"},
-      {"path": "/con/obj_seg_1", "etag": null, "size_bytes": 2097152,
-       "range": "-2048"}]
+      {"path": "/con/obj_seg_1", "size_bytes": 2097152, "range": "-2048"}]
 
 The segment will consist of the first 1048576 bytes of /con/obj_seg_1,
 followed by bytes 513 through 1550000 (inclusive) of /con/obj_seg_2, and
@@ -200,14 +198,12 @@ the manifest and the segments it's referring to) in the container and account
 metadata which can be used for stats purposes.
 """
 
-from six.moves import range
-
+from collections import defaultdict
 from datetime import datetime
 import json
 import mimetypes
 import re
 import six
-from six import BytesIO
 from hashlib import md5
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.swob import Request, HTTPBadRequest, HTTPServerError, \
@@ -217,8 +213,9 @@ from swift.common.swob import Request, HTTPBadRequest, HTTPServerError, \
 from swift.common.utils import get_logger, config_true_value, \
     get_valid_utf8_str, override_bytes_from_content_type, split_path, \
     register_swift_info, RateLimitedIterator, quote, close_if_possible, \
-    closing_if_possible, LRUCache
-from swift.common.request_helpers import SegmentedIterable
+    closing_if_possible, LRUCache, StreamingPile
+from swift.common.request_helpers import SegmentedIterable, \
+    get_sys_meta_prefix, update_etag_is_at_header
 from swift.common.constraints import check_utf8, MAX_BUFFERED_SLO_SEGMENTS
 from swift.common.http import HTTP_NOT_FOUND, HTTP_UNAUTHORIZED, is_success
 from swift.common.wsgi import WSGIContext, make_subrequest
@@ -231,9 +228,12 @@ DEFAULT_MAX_MANIFEST_SEGMENTS = 1000
 DEFAULT_MAX_MANIFEST_SIZE = 1024 * 1024 * 2  # 2 MiB
 
 
-REQUIRED_SLO_KEYS = set(['path', 'etag', 'size_bytes'])
-OPTIONAL_SLO_KEYS = set(['range'])
+REQUIRED_SLO_KEYS = set(['path'])
+OPTIONAL_SLO_KEYS = set(['range', 'etag', 'size_bytes'])
 ALLOWED_SLO_KEYS = REQUIRED_SLO_KEYS | OPTIONAL_SLO_KEYS
+
+SYSMETA_SLO_ETAG = get_sys_meta_prefix('object') + 'slo-etag'
+SYSMETA_SLO_SIZE = get_sys_meta_prefix('object') + 'slo-size'
 
 
 def parse_and_validate_input(req_body, req_path):
@@ -299,10 +299,10 @@ def parse_and_validate_input(req_body, req_path):
         if not isinstance(seg_dict['path'], six.string_types):
             errors.append("Index %d: \"path\" must be a string" % seg_index)
             continue
-        if not (seg_dict['etag'] is None or
+        if not (seg_dict.get('etag') is None or
                 isinstance(seg_dict['etag'], six.string_types)):
-            errors.append(
-                "Index %d: \"etag\" must be a string or null" % seg_index)
+            errors.append('Index %d: "etag" must be a string or null '
+                          '(if provided)' % seg_index)
             continue
 
         if '/' not in seg_dict['path'].strip('/'):
@@ -311,7 +311,7 @@ def parse_and_validate_input(req_body, req_path):
                 "the form /container/object." % seg_index)
             continue
 
-        seg_size = seg_dict['size_bytes']
+        seg_size = seg_dict.get('size_bytes')
         if seg_size is not None:
             try:
                 seg_size = int(seg_size)
@@ -358,25 +358,6 @@ def parse_and_validate_input(req_body, req_path):
                              headers={"Content-Type": "text/plain"})
 
     return parsed_data
-
-
-class SloPutContext(WSGIContext):
-    def __init__(self, slo, slo_etag):
-        super(SloPutContext, self).__init__(slo.app)
-        self.slo_etag = '"' + slo_etag.hexdigest() + '"'
-
-    def handle_slo_put(self, req, start_response):
-        app_resp = self._app_call(req.environ)
-
-        for i in range(len(self._response_headers)):
-            if self._response_headers[i][0].lower() == 'etag':
-                self._response_headers[i] = ('Etag', self.slo_etag)
-                break
-
-        start_response(self._response_status,
-                       self._response_headers,
-                       self._response_exc_info)
-        return app_resp
 
 
 class SloGetContext(WSGIContext):
@@ -538,6 +519,9 @@ class SloGetContext(WSGIContext):
         Note: this assumes that X-Static-Large-Object has already been found.
         """
         if req.method == 'HEAD':
+            # We've already looked for SYSMETA_SLO_ETAG/SIZE in the response
+            # and didn't find them. We have to fetch the whole manifest and
+            # recompute.
             return True
 
         response_status = int(self._response_status[:3])
@@ -580,14 +564,31 @@ class SloGetContext(WSGIContext):
                     what may be a static large object manifest (or may not).
         :param start_response: WSGI start_response callable
         """
+        if req.params.get('multipart-manifest') != 'get':
+            # If this object is an SLO manifest, we may have saved off the
+            # large object etag during the original PUT. Send an
+            # X-Backend-Etag-Is-At header so that, if the SLO etag *was*
+            # saved, we can trust the object-server to respond appropriately
+            # to If-Match/If-None-Match requests.
+            update_etag_is_at_header(req, SYSMETA_SLO_ETAG)
         resp_iter = self._app_call(req.environ)
 
         # make sure this response is for a static large object manifest
+        slo_marker = slo_etag = slo_size = None
         for header, value in self._response_headers:
-            if (header.lower() == 'x-static-large-object' and
-                    config_true_value(value)):
+            header = header.lower()
+            if header == SYSMETA_SLO_ETAG:
+                slo_etag = value
+            elif header == SYSMETA_SLO_SIZE:
+                slo_size = value
+            elif (header == 'x-static-large-object' and
+                  config_true_value(value)):
+                slo_marker = value
+
+            if slo_marker and slo_etag and slo_size:
                 break
-        else:
+
+        if not slo_marker:
             # Not a static large object manifest. Just pass it through.
             start_response(self._response_status,
                            self._response_headers,
@@ -608,6 +609,22 @@ class SloGetContext(WSGIContext):
                     else:
                         new_headers.append((header, value))
                 self._response_headers = new_headers
+            start_response(self._response_status,
+                           self._response_headers,
+                           self._response_exc_info)
+            return resp_iter
+
+        is_conditional = self._response_status.startswith(('304', '412')) and (
+            req.if_match or req.if_none_match)
+        if slo_etag and slo_size and (
+                req.method == 'HEAD' or is_conditional):
+            # Since we have length and etag, we can respond immediately
+            for i, (header, _value) in enumerate(self._response_headers):
+                lheader = header.lower()
+                if lheader == 'etag':
+                    self._response_headers[i] = (header, '"%s"' % slo_etag)
+                elif lheader == 'content-length' and not is_conditional:
+                    self._response_headers[i] = (header, slo_size)
             start_response(self._response_status,
                            self._response_headers,
                            self._response_exc_info)
@@ -658,8 +675,7 @@ class SloGetContext(WSGIContext):
         new_headers = []
         for header, value in resp_headers:
             if header.lower() == 'content-length':
-                new_headers.append(('Content-Length',
-                                    len(json_data)))
+                new_headers.append(('Content-Length', len(json_data)))
             else:
                 new_headers.append((header, value))
         self._response_headers = new_headers
@@ -679,23 +695,36 @@ class SloGetContext(WSGIContext):
     def get_or_head_response(self, req, resp_headers, resp_iter):
         segments = self._get_manifest_read(resp_iter)
 
-        etag = md5()
-        content_length = 0
-        for seg_dict in segments:
-            if seg_dict.get('range'):
-                etag.update('%s:%s;' % (seg_dict['hash'], seg_dict['range']))
-            else:
-                etag.update(seg_dict['hash'])
+        slo_etag = None
+        content_length = None
+        response_headers = []
+        for header, value in resp_headers:
+            lheader = header.lower()
+            if lheader == SYSMETA_SLO_ETAG:
+                slo_etag = value
+            elif lheader == SYSMETA_SLO_SIZE:
+                content_length = value
+            elif lheader not in ('etag', 'content-length'):
+                response_headers.append((header, value))
 
-            if config_true_value(seg_dict.get('sub_slo')):
-                override_bytes_from_content_type(
-                    seg_dict, logger=self.slo.logger)
-            content_length += self._segment_length(seg_dict)
+        if slo_etag is None or content_length is None:
+            etag = md5()
+            content_length = 0
+            for seg_dict in segments:
+                if seg_dict.get('range'):
+                    etag.update('%s:%s;' % (seg_dict['hash'],
+                                            seg_dict['range']))
+                else:
+                    etag.update(seg_dict['hash'])
 
-        response_headers = [(h, v) for h, v in resp_headers
-                            if h.lower() not in ('etag', 'content-length')]
+                if config_true_value(seg_dict.get('sub_slo')):
+                    override_bytes_from_content_type(
+                        seg_dict, logger=self.slo.logger)
+                content_length += self._segment_length(seg_dict)
+            slo_etag = etag.hexdigest()
+
         response_headers.append(('Content-Length', str(content_length)))
-        response_headers.append(('Etag', '"%s"' % etag.hexdigest()))
+        response_headers.append(('Etag', '"%s"' % slo_etag))
 
         if req.method == 'HEAD':
             return self._manifest_head_response(req, response_headers)
@@ -798,7 +827,10 @@ class StaticLargeObject(object):
             'rate_limit_after_segment', '10'))
         self.rate_limit_segments_per_sec = int(self.conf.get(
             'rate_limit_segments_per_sec', '1'))
-        delete_concurrency = int(self.conf.get('delete_concurrency', '2'))
+        self.concurrency = min(1000, max(0, int(self.conf.get(
+            'concurrency', '2'))))
+        delete_concurrency = int(self.conf.get(
+            'delete_concurrency', self.concurrency))
         self.bulk_deleter = Bulk(
             app, {}, delete_concurrency=delete_concurrency, logger=self.logger)
 
@@ -851,107 +883,129 @@ class StaticLargeObject(object):
         if not out_content_type:
             out_content_type = 'text/plain'
         data_for_storage = []
-        slo_etag = md5()
-        last_obj_path = None
+        path2indices = defaultdict(list)
         for index, seg_dict in enumerate(parsed_data):
-            obj_name = seg_dict['path']
-            if isinstance(obj_name, six.text_type):
-                obj_name = obj_name.encode('utf-8')
-            obj_path = '/'.join(['', vrs, account, obj_name.lstrip('/')])
+            path2indices[seg_dict['path']].append(index)
 
-            if obj_path != last_obj_path:
-                last_obj_path = obj_path
-                sub_req = make_subrequest(
-                    req.environ, path=obj_path + '?',  # kill the query string
-                    method='HEAD',
-                    headers={'x-auth-token': req.headers.get('x-auth-token')},
-                    agent='%(orig)s SLO MultipartPUT', swift_source='SLO')
-                head_seg_resp = sub_req.get_response(self)
+        def do_head(obj_name):
+            obj_path = '/'.join(['', vrs, account,
+                                 get_valid_utf8_str(obj_name).lstrip('/')])
 
-            if head_seg_resp.is_success:
-                segment_length = head_seg_resp.content_length
-                if seg_dict.get('range'):
-                    # Since we now know the length, we can normalize the
-                    # range. We know that there is exactly one range
-                    # requested since we checked that earlier in
-                    # parse_and_validate_input().
-                    ranges = seg_dict['range'].ranges_for_length(
-                        head_seg_resp.content_length)
+            sub_req = make_subrequest(
+                req.environ, path=obj_path + '?',  # kill the query string
+                method='HEAD',
+                headers={'x-auth-token': req.headers.get('x-auth-token')},
+                agent='%(orig)s SLO MultipartPUT', swift_source='SLO')
+            return obj_name, sub_req.get_response(self)
 
-                    if not ranges:
-                        problem_segments.append([quote(obj_name),
-                                                 'Unsatisfiable Range'])
-                    elif ranges == [(0, head_seg_resp.content_length)]:
-                        # Just one range, and it exactly matches the object.
-                        # Why'd we do this again?
-                        del seg_dict['range']
-                        segment_length = head_seg_resp.content_length
-                    else:
-                        rng = ranges[0]
-                        seg_dict['range'] = '%d-%d' % (rng[0], rng[1] - 1)
-                        segment_length = rng[1] - rng[0]
-
-                if segment_length < 1:
-                    problem_segments.append(
-                        [quote(obj_name),
-                         'Too small; each segment must be at least 1 byte.'])
-                total_size += segment_length
-                if seg_dict['size_bytes'] is not None and \
-                        seg_dict['size_bytes'] != head_seg_resp.content_length:
-                    problem_segments.append([quote(obj_name), 'Size Mismatch'])
-                if seg_dict['etag'] is None or \
-                        seg_dict['etag'] == head_seg_resp.etag:
-                    if seg_dict.get('range'):
-                        slo_etag.update('%s:%s;' % (head_seg_resp.etag,
-                                                    seg_dict['range']))
-                    else:
-                        slo_etag.update(head_seg_resp.etag)
-                else:
-                    problem_segments.append([quote(obj_name), 'Etag Mismatch'])
-                if head_seg_resp.last_modified:
-                    last_modified = head_seg_resp.last_modified
-                else:
-                    # shouldn't happen
-                    last_modified = datetime.now()
-
-                last_modified_formatted = \
-                    last_modified.strftime('%Y-%m-%dT%H:%M:%S.%f')
-                seg_data = {'name': '/' + seg_dict['path'].lstrip('/'),
-                            'bytes': head_seg_resp.content_length,
-                            'hash': head_seg_resp.etag,
-                            'content_type': head_seg_resp.content_type,
-                            'last_modified': last_modified_formatted}
-                if seg_dict.get('range'):
-                    seg_data['range'] = seg_dict['range']
-
-                if config_true_value(
-                        head_seg_resp.headers.get('X-Static-Large-Object')):
-                    seg_data['sub_slo'] = True
-                data_for_storage.append(seg_data)
-
-            else:
+        def validate_seg_dict(seg_dict, head_seg_resp):
+            if not head_seg_resp.is_success:
                 problem_segments.append([quote(obj_name),
                                          head_seg_resp.status])
+                return 0, None
+
+            segment_length = head_seg_resp.content_length
+            if seg_dict.get('range'):
+                # Since we now know the length, we can normalize the
+                # range. We know that there is exactly one range
+                # requested since we checked that earlier in
+                # parse_and_validate_input().
+                ranges = seg_dict['range'].ranges_for_length(
+                    head_seg_resp.content_length)
+
+                if not ranges:
+                    problem_segments.append([quote(obj_name),
+                                             'Unsatisfiable Range'])
+                elif ranges == [(0, head_seg_resp.content_length)]:
+                    # Just one range, and it exactly matches the object.
+                    # Why'd we do this again?
+                    del seg_dict['range']
+                    segment_length = head_seg_resp.content_length
+                else:
+                    rng = ranges[0]
+                    seg_dict['range'] = '%d-%d' % (rng[0], rng[1] - 1)
+                    segment_length = rng[1] - rng[0]
+
+            if segment_length < 1:
+                problem_segments.append(
+                    [quote(obj_name),
+                     'Too small; each segment must be at least 1 byte.'])
+            if seg_dict.get('size_bytes') is not None and \
+                    seg_dict['size_bytes'] != head_seg_resp.content_length:
+                problem_segments.append([quote(obj_name), 'Size Mismatch'])
+            if seg_dict.get('etag') is not None and \
+                    seg_dict['etag'] != head_seg_resp.etag:
+                problem_segments.append([quote(obj_name), 'Etag Mismatch'])
+            if head_seg_resp.last_modified:
+                last_modified = head_seg_resp.last_modified
+            else:
+                # shouldn't happen
+                last_modified = datetime.now()
+
+            last_modified_formatted = \
+                last_modified.strftime('%Y-%m-%dT%H:%M:%S.%f')
+            seg_data = {'name': '/' + seg_dict['path'].lstrip('/'),
+                        'bytes': head_seg_resp.content_length,
+                        'hash': head_seg_resp.etag,
+                        'content_type': head_seg_resp.content_type,
+                        'last_modified': last_modified_formatted}
+            if seg_dict.get('range'):
+                seg_data['range'] = seg_dict['range']
+            if config_true_value(
+                    head_seg_resp.headers.get('X-Static-Large-Object')):
+                seg_data['sub_slo'] = True
+            return segment_length, seg_data
+
+        data_for_storage = [None] * len(parsed_data)
+        with StreamingPile(self.concurrency) as pile:
+            for obj_name, resp in pile.asyncstarmap(do_head, (
+                    (path, ) for path in path2indices)):
+                for i in path2indices[obj_name]:
+                    segment_length, seg_data = validate_seg_dict(
+                        parsed_data[i], resp)
+                    data_for_storage[i] = seg_data
+                    total_size += segment_length
+
         if problem_segments:
             resp_body = get_response_body(
                 out_content_type, {}, problem_segments)
             raise HTTPBadRequest(resp_body, content_type=out_content_type)
-        env = req.environ
 
+        slo_etag = md5()
+        for seg_data in data_for_storage:
+            if seg_data.get('range'):
+                slo_etag.update('%s:%s;' % (seg_data['hash'],
+                                            seg_data['range']))
+            else:
+                slo_etag.update(seg_data['hash'])
+
+        slo_etag = slo_etag.hexdigest()
+        req.headers.update({
+            SYSMETA_SLO_ETAG: slo_etag,
+            SYSMETA_SLO_SIZE: total_size,
+            'X-Static-Large-Object': 'True',
+        })
+
+        json_data = json.dumps(data_for_storage)
+        if six.PY3:
+            json_data = json_data.encode('utf-8')
+        req.body = json_data
+
+        env = req.environ
         if not env.get('CONTENT_TYPE'):
             guessed_type, _junk = mimetypes.guess_type(req.path_info)
             env['CONTENT_TYPE'] = guessed_type or 'application/octet-stream'
         env['swift.content_type_overridden'] = True
         env['CONTENT_TYPE'] += ";swift_bytes=%d" % total_size
-        env['HTTP_X_STATIC_LARGE_OBJECT'] = 'True'
-        json_data = json.dumps(data_for_storage)
-        if six.PY3:
-            json_data = json_data.encode('utf-8')
-        env['CONTENT_LENGTH'] = str(len(json_data))
-        env['wsgi.input'] = BytesIO(json_data)
 
-        slo_put_context = SloPutContext(self, slo_etag)
-        return slo_put_context.handle_slo_put(req, start_response)
+        def start_response_wrapper(status, headers, exc_info=None):
+            for i, (header, _value) in enumerate(headers):
+                if header.lower() == 'etag':
+                    headers[i] = ('Etag', '"%s"' % slo_etag)
+                    break
+            return start_response(status, headers, exc_info)
+
+        return self.app(env, start_response_wrapper)
 
     def get_segments_to_delete_iter(self, req):
         """

@@ -92,6 +92,8 @@ get_data_dir = partial(get_policy_string, DATADIR_BASE)
 get_async_dir = partial(get_policy_string, ASYNCDIR_BASE)
 get_tmp_dir = partial(get_policy_string, TMP_BASE)
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
+# This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
+RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
 
 
 def _get_filename(fd):
@@ -274,7 +276,8 @@ def consolidate_hashes(partition_dir):
             with open(invalidations_file, 'rb') as inv_fh:
                 for line in inv_fh:
                     suffix = line.strip()
-                    if hashes is not None and hashes.get(suffix) is not None:
+                    if hashes is not None and \
+                            hashes.get(suffix, '') is not None:
                         hashes[suffix] = None
                         modified = True
         except (IOError, OSError) as e:
@@ -563,9 +566,6 @@ class BaseDiskFileManager(object):
         self.use_splice = False
         self.pipe_size = None
 
-        # regex for rsync temp files e.g. '.1472017820.44503.data.QBYCYU'
-        self.rsync_temp_file_exp = re.compile('^\..*\.[0-9a-zA-Z]{6}$')
-
         conf_wants_splice = config_true_value(conf.get('splice', 'no'))
         # If the operator wants zero-copy with splice() but we don't have the
         # requisite kernel support, complain so they can go fix it.
@@ -802,7 +802,9 @@ class BaseDiskFileManager(object):
                 file_path = os.path.join(datadir or '', afile)
                 results.setdefault('unexpected', []).append(file_path)
                 # log warnings if it's not a rsync temp file
-                if self.rsync_temp_file_exp.match(afile) is None:
+                if RE_RSYNC_TEMPFILE.match(afile):
+                    self.logger.debug('Rsync tempfile: %s', file_path)
+                else:
                     self.logger.warning('Unexpected file %s: %s',
                                         file_path, e)
         for ext in exts:
@@ -1064,6 +1066,7 @@ class BaseDiskFileManager(object):
                 if len(suff) == 3:
                     hashes.setdefault(suff, None)
             modified = True
+            self.logger.debug('Run listdir on %s', partition_path)
         hashes.update((suffix, None) for suffix in recalculate)
         for suffix, hash_ in hashes.items():
             if not hash_:

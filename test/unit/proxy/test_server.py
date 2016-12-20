@@ -5221,11 +5221,11 @@ class TestObjectController(unittest.TestCase):
         exposed = set(
             h.strip() for h in
             resp.headers['access-control-expose-headers'].split(','))
-        expected_exposed = set(['cache-control', 'content-language',
-                                'content-type', 'expires', 'last-modified',
-                                'pragma', 'etag', 'x-timestamp',
-                                'x-trans-id', 'x-object-meta-color',
-                                'x-object-meta-color-ex'])
+        expected_exposed = set([
+            'cache-control', 'content-language', 'content-type', 'expires',
+            'last-modified', 'pragma', 'etag', 'x-timestamp', 'x-trans-id',
+            'x-openstack-request-id', 'x-object-meta-color',
+            'x-object-meta-color-ex'])
         self.assertEqual(expected_exposed, exposed)
 
         # test allow_origin *
@@ -5272,10 +5272,10 @@ class TestObjectController(unittest.TestCase):
         exposed = set(
             h.strip() for h in
             resp.headers['access-control-expose-headers'].split(','))
-        expected_exposed = set(['cache-control', 'content-language',
-                                'content-type', 'expires', 'last-modified',
-                                'pragma', 'etag', 'x-timestamp',
-                                'x-trans-id', 'x-object-meta-color'])
+        expected_exposed = set([
+            'cache-control', 'content-language', 'content-type', 'expires',
+            'last-modified', 'pragma', 'etag', 'x-timestamp', 'x-trans-id',
+            'x-openstack-request-id', 'x-object-meta-color'])
         self.assertEqual(expected_exposed, exposed)
 
         # test allow_origin empty
@@ -6159,12 +6159,26 @@ class TestObjectECRangedGET(unittest.TestCase):
 
     def test_unsatisfiable(self):
         # Goes just one byte too far off the end of the object, so it's
-        # unsatisfiable
+        # unsatisfiable. This should be close enough that the object servers
+        # actually responded 206
+        obj_len = len(self.obj)
         status, headers, _junk = self._get_obj(
-            "bytes=%d-%d" % (len(self.obj), len(self.obj) + 100))
+            "bytes=%d-%d" % (obj_len, obj_len + 100))
         self.assertEqual(status, 416)
         self.assertEqual(self.obj_etag, headers.get('Etag'))
         self.assertEqual('bytes', headers.get('Accept-Ranges'))
+        self.assertIn('Content-Range', headers)
+        self.assertEqual('bytes */%d' % obj_len, headers['Content-Range'])
+
+        # Goes *way* too far off the end of the object, so we're looking at
+        # the (massaged) 416 from an object server
+        status, headers, _junk = self._get_obj(
+            "bytes=%d-" % (obj_len + 2 ** 30))
+        self.assertEqual(status, 416)
+        self.assertEqual(self.obj_etag, headers.get('Etag'))
+        self.assertEqual('bytes', headers.get('Accept-Ranges'))
+        self.assertIn('Content-Range', headers)
+        self.assertEqual('bytes */%d' % obj_len, headers['Content-Range'])
 
     def test_off_end(self):
         # Ranged GET that's mostly off the end of the object, but overlaps
@@ -7534,10 +7548,10 @@ class TestContainerController(unittest.TestCase):
             exposed = set(
                 h.strip() for h in
                 resp.headers['access-control-expose-headers'].split(','))
-            expected_exposed = set(['cache-control', 'content-language',
-                                    'content-type', 'expires', 'last-modified',
-                                    'pragma', 'etag', 'x-timestamp',
-                                    'x-trans-id', 'x-container-meta-color'])
+            expected_exposed = set([
+                'cache-control', 'content-language', 'content-type', 'expires',
+                'last-modified', 'pragma', 'etag', 'x-timestamp', 'x-trans-id',
+                'x-openstack-request-id', 'x-container-meta-color'])
             self.assertEqual(expected_exposed, exposed)
 
     def _gather_x_account_headers(self, controller_call, req, *connect_args,
