@@ -112,65 +112,20 @@ If a request is sent without the query parameter, an attempt will be made to
 copy the whole object but will fail if the object size is
 greater than 5GB.
 
--------------------
-Object Post as Copy
--------------------
-Historically, this has been a feature (and a configurable option with default
-set to True) in proxy server configuration. This has been moved to server side
-copy middleware.
-
-When ``object_post_as_copy`` is set to ``true`` (default value), an incoming
-POST request is morphed into a COPY request where source and destination
-objects are same.
-
-This feature was necessary because of a previous behavior where POSTS would
-update the metadata on the object but not on the container. As a result,
-features like container sync would not work correctly. This is no longer the
-case and the plan is to deprecate this option. It is being kept now for
-backwards compatibility. At first chance, set ``object_post_as_copy`` to
-``false``.
 """
 
-import os
-from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
 from six.moves.urllib.parse import quote, unquote
 
-from swift.common import utils
-from swift.common.utils import get_logger, \
-    config_true_value, FileLikeIter, read_conf_dir, close_if_possible
+from swift.common.utils import get_logger, config_true_value, FileLikeIter, \
+    close_if_possible
 from swift.common.swob import Request, HTTPPreconditionFailed, \
     HTTPRequestEntityTooLarge, HTTPBadRequest, HTTPException
-from swift.common.http import HTTP_MULTIPLE_CHOICES, HTTP_CREATED, \
-    is_success, HTTP_OK
+from swift.common.http import HTTP_MULTIPLE_CHOICES, is_success, HTTP_OK
 from swift.common.constraints import check_account_format, MAX_FILE_SIZE
 from swift.common.request_helpers import copy_header_subset, remove_items, \
-    is_sys_meta, is_sys_or_user_meta, is_object_transient_sysmeta
+    is_sys_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
+    check_path_header
 from swift.common.wsgi import WSGIContext, make_subrequest
-
-
-def _check_path_header(req, name, length, error_msg):
-    """
-    Validate that the value of path-like header is
-    well formatted. We assume the caller ensures that
-    specific header is present in req.headers.
-
-    :param req: HTTP request object
-    :param name: header name
-    :param length: length of path segment check
-    :param error_msg: error message for client
-    :returns: A tuple with path parts according to length
-    :raise: HTTPPreconditionFailed if header value
-            is not well formatted.
-    """
-    src_header = unquote(req.headers.get(name))
-    if not src_header.startswith('/'):
-        src_header = '/' + src_header
-    try:
-        return utils.split_path(src_header, length, length, True)
-    except ValueError:
-        raise HTTPPreconditionFailed(
-            request=req,
-            body=error_msg)
 
 
 def _check_copy_from_header(req):
@@ -181,12 +136,12 @@ def _check_copy_from_header(req):
 
     :param req: HTTP request object
     :returns: A tuple with container name and object name
-    :raise: HTTPPreconditionFailed if x-copy-from value
+    :raise HTTPPreconditionFailed: if x-copy-from value
             is not well formatted.
     """
-    return _check_path_header(req, 'X-Copy-From', 2,
-                              'X-Copy-From header must be of the form '
-                              '<container name>/<object name>')
+    return check_path_header(req, 'X-Copy-From', 2,
+                             'X-Copy-From header must be of the form '
+                             '<container name>/<object name>')
 
 
 def _check_destination_header(req):
@@ -197,12 +152,12 @@ def _check_destination_header(req):
 
     :param req: HTTP request object
     :returns: A tuple with container name and object name
-    :raise: HTTPPreconditionFailed if destination value
+    :raise HTTPPreconditionFailed: if destination value
             is not well formatted.
     """
-    return _check_path_header(req, 'Destination', 2,
-                              'Destination header must be of the form '
-                              '<container name>/<object name>')
+    return check_path_header(req, 'Destination', 2,
+                             'Destination header must be of the form '
+                             '<container name>/<object name>')
 
 
 def _copy_headers(src, dest):
@@ -228,7 +183,7 @@ class ServerSideCopyWebContext(WSGIContext):
 
     def get_source_resp(self, req):
         sub_req = make_subrequest(
-            req.environ, path=req.path_info, headers=req.headers,
+            req.environ, path=quote(req.path_info), headers=req.headers,
             swift_source='SSC')
         return sub_req.get_response(self.app)
 
@@ -241,13 +196,7 @@ class ServerSideCopyWebContext(WSGIContext):
         return app_resp
 
     def _adjust_put_response(self, req, additional_resp_headers):
-        if 'swift.post_as_copy' in req.environ:
-            # Older editions returned 202 Accepted on object POSTs, so we'll
-            # convert any 201 Created responses to that for compatibility with
-            # picky clients.
-            if self._get_status_int() == HTTP_CREATED:
-                self._response_status = '202 Accepted'
-        elif is_success(self._get_status_int()):
+        if is_success(self._get_status_int()):
             for header, value in additional_resp_headers.items():
                 self._response_headers.append((header, value))
 
@@ -272,39 +221,6 @@ class ServerSideCopyMiddleware(object):
     def __init__(self, app, conf):
         self.app = app
         self.logger = get_logger(conf, log_route="copy")
-        # Read the old object_post_as_copy option from Proxy app just in case
-        # someone has set it to false (non default). This wouldn't cause
-        # problems during upgrade.
-        self._load_object_post_as_copy_conf(conf)
-        self.object_post_as_copy = \
-            config_true_value(conf.get('object_post_as_copy', 'true'))
-
-    def _load_object_post_as_copy_conf(self, conf):
-        if ('object_post_as_copy' in conf or '__file__' not in conf):
-            # Option is explicitly set in middleware conf. In that case,
-            # we assume operator knows what he's doing.
-            # This takes preference over the one set in proxy app
-            return
-
-        cp = ConfigParser()
-        if os.path.isdir(conf['__file__']):
-            read_conf_dir(cp, conf['__file__'])
-        else:
-            cp.read(conf['__file__'])
-
-        try:
-            pipe = cp.get("pipeline:main", "pipeline")
-        except (NoSectionError, NoOptionError):
-            return
-
-        proxy_name = pipe.rsplit(None, 1)[-1]
-        proxy_section = "app:" + proxy_name
-
-        try:
-            conf['object_post_as_copy'] = cp.get(proxy_section,
-                                                 'object_post_as_copy')
-        except (NoSectionError, NoOptionError):
-            pass
 
     def __call__(self, env, start_response):
         req = Request(env)
@@ -314,22 +230,16 @@ class ServerSideCopyMiddleware(object):
             # If obj component is not present in req, do not proceed further.
             return self.app(env, start_response)
 
-        self.account_name = account
-        self.container_name = container
-        self.object_name = obj
-
-        # Save off original request method (COPY/POST) in case it gets mutated
-        # into PUT during handling. This way logging can display the method
-        # the client actually sent.
-        req.environ['swift.orig_req_method'] = req.method
-
         try:
+            # In some cases, save off original request method since it gets
+            # mutated into PUT during handling. This way logging can display
+            # the method the client actually sent.
             if req.method == 'PUT' and req.headers.get('X-Copy-From'):
                 return self.handle_PUT(req, start_response)
             elif req.method == 'COPY':
-                return self.handle_COPY(req, start_response)
-            elif req.method == 'POST' and self.object_post_as_copy:
-                return self.handle_object_post_as_copy(req, start_response)
+                req.environ['swift.orig_req_method'] = req.method
+                return self.handle_COPY(req, start_response,
+                                        account, container, obj)
             elif req.method == 'OPTIONS':
                 # Does not interfere with OPTIONS response from
                 # (account,container) servers and /info response.
@@ -340,45 +250,30 @@ class ServerSideCopyMiddleware(object):
 
         return self.app(env, start_response)
 
-    def handle_object_post_as_copy(self, req, start_response):
-        req.method = 'PUT'
-        req.path_info = '/v1/%s/%s/%s' % (
-            self.account_name, self.container_name, self.object_name)
-        req.headers['Content-Length'] = 0
-        req.headers.pop('Range', None)
-        req.headers['X-Copy-From'] = quote('/%s/%s' % (self.container_name,
-                                           self.object_name))
-        req.environ['swift.post_as_copy'] = True
-        params = req.params
-        # for post-as-copy always copy the manifest itself if source is *LO
-        params['multipart-manifest'] = 'get'
-        req.params = params
-        return self.handle_PUT(req, start_response)
-
-    def handle_COPY(self, req, start_response):
+    def handle_COPY(self, req, start_response, account, container, obj):
         if not req.headers.get('Destination'):
             return HTTPPreconditionFailed(request=req,
                                           body='Destination header required'
                                           )(req.environ, start_response)
-        dest_account = self.account_name
+        dest_account = account
         if 'Destination-Account' in req.headers:
-            dest_account = req.headers.get('Destination-Account')
+            dest_account = unquote(req.headers.get('Destination-Account'))
             dest_account = check_account_format(req, dest_account)
-            req.headers['X-Copy-From-Account'] = self.account_name
-            self.account_name = dest_account
+            req.headers['X-Copy-From-Account'] = quote(account)
+            account = dest_account
             del req.headers['Destination-Account']
         dest_container, dest_object = _check_destination_header(req)
-        source = '/%s/%s' % (self.container_name, self.object_name)
-        self.container_name = dest_container
-        self.object_name = dest_object
+        source = '/%s/%s' % (container, obj)
+        container = dest_container
+        obj = dest_object
         # re-write the existing request as a PUT instead of creating a new one
         req.method = 'PUT'
         # As this the path info is updated with destination container,
         # the proxy server app will use the right object controller
         # implementation corresponding to the container's policy type.
         ver, _junk = req.split_path(1, 2, rest_with_last=True)
-        req.path_info = '/%s/%s/%s/%s' % \
-                        (ver, dest_account, dest_container, dest_object)
+        req.path_info = '/%s/%s/%s/%s' % (
+            ver, dest_account, dest_container, dest_object)
         req.headers['Content-Length'] = 0
         req.headers['X-Copy-From'] = quote(source)
         del req.headers['Destination']
@@ -389,13 +284,8 @@ class ServerSideCopyMiddleware(object):
 
         # make sure the source request uses it's container_info
         source_req.headers.pop('X-Backend-Storage-Policy-Index', None)
-        source_req.path_info = quote(source_path)
+        source_req.path_info = source_path
         source_req.headers['X-Newest'] = 'true'
-        if 'swift.post_as_copy' in req.environ:
-            # We're COPYing one object over itself because of a POST; rely on
-            # the PUT for write authorization, don't require read authorization
-            source_req.environ['swift.authorize'] = lambda req: None
-            source_req.environ['swift.authorize_override'] = True
 
         # in case we are copying an SLO manifest, set format=raw parameter
         params = source_req.params
@@ -410,9 +300,11 @@ class ServerSideCopyMiddleware(object):
             # which currently only happens because there are more than
             # CONTAINER_LISTING_LIMIT segments in a segmented object. In
             # this case, we're going to refuse to do the server-side copy.
+            close_if_possible(source_resp.app_iter)
             return HTTPRequestEntityTooLarge(request=req)
 
         if source_resp.content_length > MAX_FILE_SIZE:
+            close_if_possible(source_resp.app_iter)
             return HTTPRequestEntityTooLarge(request=req)
 
         return source_resp
@@ -423,8 +315,8 @@ class ServerSideCopyMiddleware(object):
         resp_headers['X-Copied-From-Account'] = quote(acct)
         resp_headers['X-Copied-From'] = quote(path)
         if 'last-modified' in source_resp.headers:
-                resp_headers['X-Copied-From-Last-Modified'] = \
-                    source_resp.headers['last-modified']
+            resp_headers['X-Copied-From-Last-Modified'] = \
+                source_resp.headers['last-modified']
         # Existing sys and user meta of source object is added to response
         # headers in addition to the new ones.
         _copy_headers(sink_req.headers, resp_headers)
@@ -441,22 +333,18 @@ class ServerSideCopyMiddleware(object):
         ver, acct, _rest = req.split_path(2, 3, True)
         src_account_name = req.headers.get('X-Copy-From-Account')
         if src_account_name:
-            src_account_name = check_account_format(req, src_account_name)
+            src_account_name = check_account_format(
+                req, unquote(src_account_name))
         else:
             src_account_name = acct
         src_container_name, src_obj_name = _check_copy_from_header(req)
         source_path = '/%s/%s/%s/%s' % (ver, src_account_name,
                                         src_container_name, src_obj_name)
 
-        if req.environ.get('swift.orig_req_method', req.method) != 'POST':
-            self.logger.info("Copying object from %s to %s" %
-                             (source_path, req.path))
-
         # GET the source object, bail out on error
         ssc_ctx = ServerSideCopyWebContext(self.app, self.logger)
         source_resp = self._get_source_object(ssc_ctx, source_path, req)
         if source_resp.status_int >= HTTP_MULTIPLE_CHOICES:
-            close_if_possible(source_resp.app_iter)
             return source_resp(source_resp.environ, start_response)
 
         # Create a new Request object based on the original request instance.
@@ -466,11 +354,7 @@ class ServerSideCopyMiddleware(object):
         def is_object_sysmeta(k):
             return is_sys_meta('object', k)
 
-        if 'swift.post_as_copy' in sink_req.environ:
-            # Post-as-copy: ignore new sysmeta, copy existing sysmeta
-            remove_items(sink_req.headers, is_object_sysmeta)
-            copy_header_subset(source_resp, sink_req, is_object_sysmeta)
-        elif config_true_value(req.headers.get('x-fresh-metadata', 'false')):
+        if config_true_value(req.headers.get('x-fresh-metadata', 'false')):
             # x-fresh-metadata only applies to copy, not post-as-copy: ignore
             # existing user metadata, update existing sysmeta with new
             copy_header_subset(source_resp, sink_req, is_object_sysmeta)
@@ -493,12 +377,13 @@ class ServerSideCopyMiddleware(object):
                 params['multipart-manifest'] = 'put'
             if 'X-Object-Manifest' in source_resp.headers:
                 del params['multipart-manifest']
-                if 'swift.post_as_copy' not in sink_req.environ:
-                    sink_req.headers['X-Object-Manifest'] = \
-                        source_resp.headers['X-Object-Manifest']
+                sink_req.headers['X-Object-Manifest'] = \
+                    source_resp.headers['X-Object-Manifest']
             sink_req.params = params
 
-        # Set data source, content length and etag for the PUT request
+        # Set swift.source, data source, content length and etag
+        # for the PUT request
+        sink_req.environ['swift.source'] = 'SSC'
         sink_req.environ['wsgi.input'] = FileLikeIter(source_resp.app_iter)
         sink_req.content_length = source_resp.content_length
         if (source_resp.status_int == HTTP_OK and

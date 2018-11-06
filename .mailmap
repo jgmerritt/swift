@@ -43,6 +43,7 @@ David Hadas <davidh@il.ibm.com> <david.hadas@gmail.com>
 Yaguang Wang <yaguang.wang@intel.com> ywang19 <yaguang.wang@intel.com>
 Liu Siqi <meizu647@gmail.com> dk647 <meizu647@gmail.com>
 James E. Blair <jeblair@openstack.org> <james.blair@rackspace.com>
+James E. Blair <jeblair@openstack.org> <jeblair@redhat.com>
 Kun Huang <gareth@unitedstack.com> <academicgareth@gmail.com>
 Michael Shuler <mshuler@gmail.com> <mshuler@rackspace.com>
 Ilya Kharin <ikharin@mirantis.com> <akscram@gmail.com>
@@ -58,7 +59,8 @@ Madhuri Kumari <madhuri.rai07@gmail.com> madhuri <madhuri@madhuri-VirtualBox.(no
 Morgan Fainberg <morgan.fainberg@gmail.com> <m@metacloud.com>
 Hua Zhang <zhuadl@cn.ibm.com> <zhuadl@cn.ibm.com>
 Yummy Bian <yummy.bian@gmail.com> <yummy.bian@gmail.com>
-Alistair Coles <alistair.coles@hpe.com> <alistair.coles@hp.com>
+Alistair Coles <alistairncoles@gmail.com> <alistair.coles@hpe.com>
+Alistair Coles <alistairncoles@gmail.com> <alistair.coles@hp.com>
 Tong Li <litong01@us.ibm.com> <litong01@us.ibm.com>
 Paul Luse <paul.e.luse@intel.com> <paul.e.luse@intel.com>
 Yuan Zhou <yuan.zhou@intel.com> <yuan.zhou@intel.com>
@@ -83,7 +85,9 @@ Atsushi Sakai <sakaia@jp.fujitsu.com>
 Takashi Natsume <natsume.takashi@lab.ntt.co.jp>
 Nakagawa Masaaki <nakagawamsa@nttdata.co.jp> nakagawamsa
 Romain Le Disez <romain.ledisez@ovh.net> Romain LE DISEZ
-Donagh McCabe <donagh.mccabe@hpe.com> <donagh.mccabe@hp.com>
+Romain Le Disez <romain.ledisez@ovh.net> <romain.le-disez@corp.ovh.com>
+Donagh McCabe <donagh.mccabe@gmail.com> <donagh.mccabe@hpe.com>
+Donagh McCabe <donagh.mccabe@gmail.com> <donagh.mccabe@hp.com>
 Eamonn O'Toole <eamonn.otoole@hpe.com> <eamonn.otoole@hp.com>
 Gerry Drudy <gerry.drudy@hpe.com> <gerry.drudy@hp.com>
 Mark Seger <mark.seger@hpe.com> <mark.seger@hp.com>
@@ -91,7 +95,9 @@ Timur Alperovich <timur.alperovich@gmail.com> <timuralp@swiftstack.com>
 Mehdi Abaakouk <sileht@redhat.com> <mehdi.abaakouk@enovance.com>
 Richard Hawkins <richard.hawkins@rackspace.com> <hurricanerix@gmail.com>
 Ondrej Novy <ondrej.novy@firma.seznam.cz>
-Peter Lisak <peter.lisak@firma.seznam.cz>
+Ondrej Novy <ondrej.novy@firma.seznam.cz> <novy@ondrej.org>
+Peter Lisák <peter.lisak@gmail.com> <peter.lisak@firma.seznam.cz>
+Peter Lisák <peter.lisak@gmail.com> Peter Lisák <peter.lisak@firma.seznam.cz>
 Ke Liang <ke.liang@easystack.cn>
 Daisuke Morita <morita.daisuke@ntti3.com> <morita.daisuke@lab.ntt.co.jp>
 Andreas Jaeger <aj@suse.de> <aj@suse.com>
@@ -113,5 +119,9 @@ Paul Dardeau <paul.dardeau@intel.com> <pauldardeau@gmail.com>
 Cheng Li <shcli@cn.ibm.com>
 Nandini Tata <nandini.tata@intel.com> <nandini.tata.15@gmail.com>
 Flavio Percoco <flaper87@gmail.com>
-Donagh McCabe <donagh.mccabe@hpe.com>
 Tin Lam <tinlam@gmail.com> <tl3438@att.com>
+Hisashi Osanai <osanai.hisashi@gmail.com> <osanai.hisashi@jp.fujitsu.com>
+Bryan Keller <kellerbr@us.ibm.com>
+Doug Hellmann <doug@doughellmann.com> <doug.hellmann@dreamhost.com>
+zhangdebo1987 <zhangdebo@inspur.com> zhangdebo
+Thomas Goirand <thomas@goirand.fr> <zigo@debian.org>

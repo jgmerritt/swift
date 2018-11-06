@@ -49,7 +49,6 @@ import json
 import logging
 import time
 from bisect import bisect
-from swift import gettext_ as _
 from hashlib import md5
 
 from eventlet.green import socket
@@ -77,7 +76,9 @@ ERROR_LIMIT_DURATION = 60
 
 
 def md5hash(key):
-    return md5(key).hexdigest()
+    if not isinstance(key, bytes):
+        key = key.encode('utf-8')
+    return md5(key).hexdigest().encode('ascii')
 
 
 def sanitize_timeout(timeout):
@@ -89,7 +90,21 @@ def sanitize_timeout(timeout):
     """
     if timeout > (30 * 24 * 60 * 60):
         timeout += time.time()
-    return timeout
+    return int(timeout)
+
+
+def set_msg(key, flags, timeout, value):
+    if not isinstance(key, bytes):
+        raise TypeError('key must be bytes')
+    if not isinstance(value, bytes):
+        raise TypeError('value must be bytes')
+    return b' '.join([
+        b'set',
+        key,
+        str(flags).encode('ascii'),
+        str(timeout).encode('ascii'),
+        str(len(value)).encode('ascii'),
+    ]) + (b'\r\n' + value + b'\r\n')
 
 
 class MemcacheConnectionError(Exception):
@@ -163,10 +178,13 @@ class MemcacheRing(object):
     def _exception_occurred(self, server, e, action='talking',
                             sock=None, fp=None, got_connection=True):
         if isinstance(e, Timeout):
-            logging.error(_("Timeout %(action)s to memcached: %(server)s"),
+            logging.error("Timeout %(action)s to memcached: %(server)s",
                           {'action': action, 'server': server})
+        elif isinstance(e, (socket.error, MemcacheConnectionError)):
+            logging.error("Error %(action)s to memcached: %(server)s: %(err)s",
+                          {'action': action, 'server': server, 'err': e})
         else:
-            logging.exception(_("Error %(action)s to memcached: %(server)s"),
+            logging.exception("Error %(action)s to memcached: %(server)s",
                               {'action': action, 'server': server})
         try:
             if fp:
@@ -191,7 +209,7 @@ class MemcacheRing(object):
                                     if err > now - ERROR_LIMIT_TIME]
             if len(self._errors[server]) > ERROR_LIMIT_COUNT:
                 self._error_limited[server] = now + ERROR_LIMIT_DURATION
-                logging.error(_('Error limiting server %s'), server)
+                logging.error('Error limiting server %s', server)
 
     def _get_conns(self, key):
         """
@@ -239,10 +257,10 @@ class MemcacheRing(object):
                           to memcache, or with pickle if configured to use
                           pickle instead of JSON (to avoid cache poisoning)
         :param time: the time to live
-        :min_compress_len: minimum compress length, this parameter was added
-                           to keep the signature compatible with
-                           python-memcached interface. This implementation
-                           ignores it.
+        :param min_compress_len: minimum compress length, this parameter was
+                                 added to keep the signature compatible with
+                                 python-memcached interface. This
+                                 implementation ignores it.
         """
         key = md5hash(key)
         timeout = sanitize_timeout(time)
@@ -251,13 +269,15 @@ class MemcacheRing(object):
             value = pickle.dumps(value, PICKLE_PROTOCOL)
             flags |= PICKLE_FLAG
         elif serialize:
-            value = json.dumps(value)
+            value = json.dumps(value).encode('ascii')
             flags |= JSON_FLAG
+        elif not isinstance(value, bytes):
+            value = str(value).encode('utf-8')
+
         for (server, fp, sock) in self._get_conns(key):
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall('set %s %d %d %s\r\n%s\r\n' %
-                                 (key, flags, timeout, len(value), value))
+                    sock.sendall(set_msg(key, flags, timeout, value))
                     # Wait for the set to complete
                     fp.readline()
                     self._return_conn(server, fp, sock)
@@ -279,10 +299,14 @@ class MemcacheRing(object):
         for (server, fp, sock) in self._get_conns(key):
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall('get %s\r\n' % key)
+                    sock.sendall(b'get ' + key + b'\r\n')
                     line = fp.readline().strip().split()
-                    while line[0].upper() != 'END':
-                        if line[0].upper() == 'VALUE' and line[1] == key:
+                    while True:
+                        if not line:
+                            raise MemcacheConnectionError('incomplete read')
+                        if line[0].upper() == b'END':
+                            break
+                        if line[0].upper() == b'VALUE' and line[1] == key:
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:
@@ -317,26 +341,31 @@ class MemcacheRing(object):
         :raises MemcacheConnectionError:
         """
         key = md5hash(key)
-        command = 'incr'
+        command = b'incr'
         if delta < 0:
-            command = 'decr'
-        delta = str(abs(int(delta)))
+            command = b'decr'
+        delta = str(abs(int(delta))).encode('ascii')
         timeout = sanitize_timeout(time)
         for (server, fp, sock) in self._get_conns(key):
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall('%s %s %s\r\n' % (command, key, delta))
+                    sock.sendall(b' '.join([
+                        command, key, delta]) + b'\r\n')
                     line = fp.readline().strip().split()
-                    if line[0].upper() == 'NOT_FOUND':
+                    if not line:
+                        raise MemcacheConnectionError('incomplete read')
+                    if line[0].upper() == b'NOT_FOUND':
                         add_val = delta
-                        if command == 'decr':
-                            add_val = '0'
-                        sock.sendall('add %s %d %d %s\r\n%s\r\n' %
-                                     (key, 0, timeout, len(add_val), add_val))
+                        if command == b'decr':
+                            add_val = b'0'
+                        sock.sendall(b' '.join([
+                            b'add', key, b'0', str(timeout).encode('ascii'),
+                            str(len(add_val)).encode('ascii')
+                        ]) + b'\r\n' + add_val + b'\r\n')
                         line = fp.readline().strip().split()
-                        if line[0].upper() == 'NOT_STORED':
-                            sock.sendall('%s %s %s\r\n' % (command, key,
-                                                           delta))
+                        if line[0].upper() == b'NOT_STORED':
+                            sock.sendall(b' '.join([
+                                command, key, delta]) + b'\r\n')
                             line = fp.readline().strip().split()
                             ret = int(line[0].strip())
                         else:
@@ -374,7 +403,7 @@ class MemcacheRing(object):
         for (server, fp, sock) in self._get_conns(key):
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall('delete %s\r\n' % key)
+                    sock.sendall(b'delete ' + key + b'\r\n')
                     # Wait for the delete to complete
                     fp.readline()
                     self._return_conn(server, fp, sock)
@@ -401,7 +430,7 @@ class MemcacheRing(object):
         """
         server_key = md5hash(server_key)
         timeout = sanitize_timeout(time)
-        msg = ''
+        msg = []
         for key, value in mapping.items():
             key = md5hash(key)
             flags = 0
@@ -409,14 +438,13 @@ class MemcacheRing(object):
                 value = pickle.dumps(value, PICKLE_PROTOCOL)
                 flags |= PICKLE_FLAG
             elif serialize:
-                value = json.dumps(value)
+                value = json.dumps(value).encode('ascii')
                 flags |= JSON_FLAG
-            msg += ('set %s %d %d %s\r\n%s\r\n' %
-                    (key, flags, timeout, len(value), value))
+            msg.append(set_msg(key, flags, timeout, value))
         for (server, fp, sock) in self._get_conns(server_key):
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall(msg)
+                    sock.sendall(b''.join(msg))
                     # Wait for the set to complete
                     for line in range(len(mapping)):
                         fp.readline()
@@ -430,8 +458,8 @@ class MemcacheRing(object):
         Gets multiple values from memcache for the given keys.
 
         :param keys: keys for values to be retrieved from memcache
-        :param servery_key: key to use in determining which server in the ring
-                            is used
+        :param server_key: key to use in determining which server in the ring
+                           is used
         :returns: list of values
         """
         server_key = md5hash(server_key)
@@ -439,11 +467,15 @@ class MemcacheRing(object):
         for (server, fp, sock) in self._get_conns(server_key):
             try:
                 with Timeout(self._io_timeout):
-                    sock.sendall('get %s\r\n' % ' '.join(keys))
+                    sock.sendall(b'get ' + b' '.join(keys) + b'\r\n')
                     line = fp.readline().strip().split()
                     responses = {}
-                    while line[0].upper() != 'END':
-                        if line[0].upper() == 'VALUE':
+                    while True:
+                        if not line:
+                            raise MemcacheConnectionError('incomplete read')
+                        if line[0].upper() == b'END':
+                            break
+                        if line[0].upper() == b'VALUE':
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:

@@ -27,7 +27,7 @@ from tempfile import mkdtemp
 import time
 
 
-from eventlet import listen, spawn, wsgi
+from eventlet import spawn, wsgi
 import mock
 from shutil import rmtree
 import six.moves.cPickle as pickle
@@ -37,7 +37,7 @@ from swift.account import server as account_server
 from swift.common import storage_policy
 from swift.common.ring import RingData
 from swift.common.storage_policy import StoragePolicy, ECStoragePolicy
-from swift.common.middleware import proxy_logging
+from swift.common.middleware import listing_formats, proxy_logging
 from swift.common import utils
 from swift.common.utils import mkdirs, normalize_timestamp, NullLogger
 from swift.container import server as container_server
@@ -45,6 +45,7 @@ from swift.obj import server as object_server
 from swift.proxy import server as proxy_server
 import swift.proxy.controllers.obj
 
+from test import listen_zero
 from test.unit import write_fake_ring, DEFAULT_TEST_EC_TYPE, debug_logger, \
     connect_tcp, readuntil2crlfs
 
@@ -74,7 +75,7 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
         "orig_POLICIES": storage_policy._POLICIES,
         "orig_SysLogHandler": utils.SysLogHandler}
 
-    utils.HASH_PATH_SUFFIX = 'endcap'
+    utils.HASH_PATH_SUFFIX = b'endcap'
     utils.SysLogHandler = mock.MagicMock()
     # Since we're starting up a lot here, we're going to test more than
     # just chunked puts; we're also going to test parts of
@@ -84,7 +85,8 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
     mkdirs(_testdir)
     rmtree(_testdir)
     for drive in ('sda1', 'sdb1', 'sdc1', 'sdd1', 'sde1',
-                  'sdf1', 'sdg1', 'sdh1', 'sdi1'):
+                  'sdf1', 'sdg1', 'sdh1', 'sdi1', 'sdj1',
+                  'sdk1', 'sdl1'):
         mkdirs(os.path.join(_testdir, drive, 'tmp'))
     conf = {'devices': _testdir, 'swift_dir': _testdir,
             'mount_check': 'false', 'allowed_headers':
@@ -92,17 +94,21 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
             'allow_versions': 't'}
     if extra_conf:
         conf.update(extra_conf)
-    prolis = listen(('localhost', 0))
-    acc1lis = listen(('localhost', 0))
-    acc2lis = listen(('localhost', 0))
-    con1lis = listen(('localhost', 0))
-    con2lis = listen(('localhost', 0))
-    obj1lis = listen(('localhost', 0))
-    obj2lis = listen(('localhost', 0))
-    obj3lis = listen(('localhost', 0))
-    objsocks = [obj1lis, obj2lis, obj3lis]
+    prolis = listen_zero()
+    acc1lis = listen_zero()
+    acc2lis = listen_zero()
+    con1lis = listen_zero()
+    con2lis = listen_zero()
+    obj1lis = listen_zero()
+    obj2lis = listen_zero()
+    obj3lis = listen_zero()
+    obj4lis = listen_zero()
+    obj5lis = listen_zero()
+    obj6lis = listen_zero()
+    objsocks = [obj1lis, obj2lis, obj3lis, obj4lis, obj5lis, obj6lis]
     context["test_sockets"] = \
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis, obj3lis)
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis, obj3lis,
+         obj4lis, obj5lis, obj6lis)
     account_ring_path = os.path.join(_testdir, 'account.ring.gz')
     account_devs = [
         {'port': acc1lis.getsockname()[1]},
@@ -120,7 +126,10 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
         StoragePolicy(1, 'one', False),
         StoragePolicy(2, 'two', False),
         ECStoragePolicy(3, 'ec', ec_type=DEFAULT_TEST_EC_TYPE,
-                        ec_ndata=2, ec_nparity=1, ec_segment_size=4096)])
+                        ec_ndata=2, ec_nparity=1, ec_segment_size=4096),
+        ECStoragePolicy(4, 'ec-dup', ec_type=DEFAULT_TEST_EC_TYPE,
+                        ec_ndata=2, ec_nparity=1, ec_segment_size=4096,
+                        ec_duplication_factor=2)])
     obj_rings = {
         0: ('sda1', 'sdb1'),
         1: ('sdc1', 'sdd1'),
@@ -136,21 +145,40 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
         write_fake_ring(obj_ring_path, *obj_devs)
 
     # write_fake_ring can't handle a 3-element ring, and the EC policy needs
-    # at least 3 devs to work with, so we do it manually
+    # at least 6 devs to work with (ec_k=2, ec_m=1, duplication_factor=2),
+    # so we do it manually
     devs = [{'id': 0, 'zone': 0, 'device': 'sdg1', 'ip': '127.0.0.1',
              'port': obj1lis.getsockname()[1]},
             {'id': 1, 'zone': 0, 'device': 'sdh1', 'ip': '127.0.0.1',
              'port': obj2lis.getsockname()[1]},
             {'id': 2, 'zone': 0, 'device': 'sdi1', 'ip': '127.0.0.1',
-             'port': obj3lis.getsockname()[1]}]
+             'port': obj3lis.getsockname()[1]},
+            {'id': 3, 'zone': 0, 'device': 'sdj1', 'ip': '127.0.0.1',
+             'port': obj4lis.getsockname()[1]},
+            {'id': 4, 'zone': 0, 'device': 'sdk1', 'ip': '127.0.0.1',
+             'port': obj5lis.getsockname()[1]},
+            {'id': 5, 'zone': 0, 'device': 'sdl1', 'ip': '127.0.0.1',
+             'port': obj6lis.getsockname()[1]}]
     pol3_replica2part2dev_id = [[0, 1, 2, 0],
                                 [1, 2, 0, 1],
                                 [2, 0, 1, 2]]
+    pol4_replica2part2dev_id = [[0, 1, 2, 3],
+                                [1, 2, 3, 4],
+                                [2, 3, 4, 5],
+                                [3, 4, 5, 0],
+                                [4, 5, 0, 1],
+                                [5, 0, 1, 2]]
     obj3_ring_path = os.path.join(
         _testdir, storage_policy.POLICIES[3].ring_name + '.ring.gz')
     part_shift = 30
     with closing(GzipFile(obj3_ring_path, 'wb')) as fh:
         pickle.dump(RingData(pol3_replica2part2dev_id, devs, part_shift), fh)
+
+    obj4_ring_path = os.path.join(
+        _testdir, storage_policy.POLICIES[4].ring_name + '.ring.gz')
+    part_shift = 30
+    with closing(GzipFile(obj4_ring_path, 'wb')) as fh:
+        pickle.dump(RingData(pol4_replica2part2dev_id, devs, part_shift), fh)
 
     prosrv = proxy_server.Application(conf, logger=debug_logger('proxy'))
     for policy in storage_policy.POLICIES:
@@ -172,11 +200,18 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
         conf, logger=debug_logger('obj2'))
     obj3srv = the_object_server.ObjectController(
         conf, logger=debug_logger('obj3'))
+    obj4srv = the_object_server.ObjectController(
+        conf, logger=debug_logger('obj4'))
+    obj5srv = the_object_server.ObjectController(
+        conf, logger=debug_logger('obj5'))
+    obj6srv = the_object_server.ObjectController(
+        conf, logger=debug_logger('obj6'))
     context["test_servers"] = \
-        (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv, obj2srv, obj3srv)
+        (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv, obj2srv, obj3srv,
+         obj4srv, obj5srv, obj6srv)
     nl = NullLogger()
-    logging_prosv = proxy_logging.ProxyLoggingMiddleware(prosrv, conf,
-                                                         logger=prosrv.logger)
+    logging_prosv = proxy_logging.ProxyLoggingMiddleware(
+        listing_formats.ListingFilter(prosrv), conf, logger=prosrv.logger)
     prospa = spawn(wsgi.server, prolis, logging_prosv, nl)
     acc1spa = spawn(wsgi.server, acc1lis, acc1srv, nl)
     acc2spa = spawn(wsgi.server, acc2lis, acc2srv, nl)
@@ -185,8 +220,12 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
     obj1spa = spawn(wsgi.server, obj1lis, obj1srv, nl)
     obj2spa = spawn(wsgi.server, obj2lis, obj2srv, nl)
     obj3spa = spawn(wsgi.server, obj3lis, obj3srv, nl)
+    obj4spa = spawn(wsgi.server, obj4lis, obj4srv, nl)
+    obj5spa = spawn(wsgi.server, obj5lis, obj5srv, nl)
+    obj6spa = spawn(wsgi.server, obj6lis, obj6srv, nl)
     context["test_coros"] = \
-        (prospa, acc1spa, acc2spa, con1spa, con2spa, obj1spa, obj2spa, obj3spa)
+        (prospa, acc1spa, acc2spa, con1spa, con2spa, obj1spa, obj2spa, obj3spa,
+         obj4spa, obj5spa, obj6spa)
     # Create account
     ts = normalize_timestamp(time.time())
     partition, nodes = prosrv.account_ring.get_nodes('a')

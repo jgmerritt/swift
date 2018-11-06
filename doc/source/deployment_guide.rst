@@ -228,10 +228,11 @@ service trying to start is missing there will be an error.  The sections not
 used by the service are ignored.
 
 Consider the example of an object storage node.  By convention, configuration
-for the object-server, object-updater, object-replicator, and object-auditor
-exist in a single file ``/etc/swift/object-server.conf``::
+for the object-server, object-updater, object-replicator, object-auditor, and
+object-reconstructor exist in a single file ``/etc/swift/object-server.conf``::
 
     [DEFAULT]
+    reclaim_age = 604800
 
     [pipeline:main]
     pipeline = object-server
@@ -240,7 +241,6 @@ exist in a single file ``/etc/swift/object-server.conf``::
     use = egg:swift#object
 
     [object-replicator]
-    reclaim_age = 259200
 
     [object-updater]
 
@@ -411,15 +411,24 @@ Object Server Configuration
 An Example Object Server configuration can be found at
 etc/object-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
+
+* :ref:`[DEFAULT] <object-server-default-options>`
+* `[object-server]`_
+* `[object-replicator]`_
+* `[object-reconstructor]`_
+* `[object-updater]`_
+* `[object-auditor]`_
 
 .. _object-server-default-options:
 
+*********
 [DEFAULT]
+*********
 
-================================ ==========  ==========================================
+================================ ==========  ============================================
 Option                           Default     Description
--------------------------------- ----------  ------------------------------------------
+-------------------------------- ----------  --------------------------------------------
 swift_dir                        /etc/swift  Swift configuration directory
 devices                          /srv/node   Parent directory of where devices are
                                              mounted
@@ -428,6 +437,7 @@ mount_check                      true        Whether or not check if the devices
                                              to the root device
 bind_ip                          0.0.0.0     IP Address for server to bind to
 bind_port                        6200        Port for server to bind to
+keep_idle                        600         Value to set for socket TCP_KEEPIDLE
 bind_timeout                     30          Seconds to attempt bind before giving up
 backlog                          4096        Maximum number of allowed pending
                                              connections
@@ -515,6 +525,16 @@ network_chunk_size               65536       Size of chunks to read/write over t
 disk_chunk_size                  65536       Size of chunks to read/write to disk
 container_update_timeout         1           Time to wait while sending a container
                                              update on object update.
+reclaim_age                      604800      Time elapsed in seconds before the tombstone
+                                             file representing a deleted object can be
+                                             reclaimed.  This is the maximum window for
+                                             your consistency engine.  If a node that was
+                                             disconnected from the cluster because of a
+                                             fault is reintroduced into the cluster after
+                                             this window without having its data purged
+                                             it will result in dark data.  This setting
+                                             should be consistent across all object
+                                             services.
 nice_priority                    None        Scheduling priority of server processes.
                                              Niceness values range from -20 (most
                                              favorable to the process) to 19 (least
@@ -536,114 +556,135 @@ ionice_priority                  None        I/O scheduling priority of server
                                              priority of the process. Work only with
                                              ionice_class.
                                              Ignored if IOPRIO_CLASS_IDLE is set.
-================================ ==========  ==========================================
+================================ ==========  ============================================
 
 .. _object-server-options:
 
+***************
 [object-server]
+***************
 
-=============================  ====================== ===============================================
-Option                         Default                Description
------------------------------  ---------------------- -----------------------------------------------
-use                                                   paste.deploy entry point for the
-                                                      object server.  For most cases,
-                                                      this should be
-                                                      `egg:swift#object`.
-set log_name                   object-server          Label used when logging
-set log_facility               LOG_LOCAL0             Syslog log facility
-set log_level                  INFO                   Logging level
-set log_requests               True                   Whether or not to log each
-                                                      request
-set log_address                /dev/log               Logging directory
-user                           swift                  User to run as
-max_upload_time                86400                  Maximum time allowed to upload an
-                                                      object
-slow                           0                      If > 0, Minimum time in seconds for a PUT or
-                                                      DELETE request to complete.  This is only
-                                                      useful to simulate slow devices during testing
-                                                      and development.
-mb_per_sync                    512                    On PUT requests, sync file every
-                                                      n MB
-keep_cache_size                5242880                Largest object size to keep in
-                                                      buffer cache
-keep_cache_private             false                  Allow non-public objects to stay
-                                                      in kernel's buffer cache
-allowed_headers                Content-Disposition,   Comma separated list of headers
-                               Content-Encoding,      that can be set in metadata on an object.
-                               X-Delete-At,           This list is in addition to
-                               X-Object-Manifest,     X-Object-Meta-* headers and cannot include
-                               X-Static-Large-Object  Content-Type, etag, Content-Length, or deleted
-auto_create_account_prefix     .                      Prefix used when automatically
-                                                      creating accounts.
-replication_server                                    Configure parameter for creating
-                                                      specific server. To handle all verbs,
-                                                      including replication verbs, do not
-                                                      specify "replication_server"
-                                                      (this is the default). To only
-                                                      handle replication, set to a True
-                                                      value (e.g. "True" or "1").
-                                                      To handle only non-replication
-                                                      verbs, set to "False". Unless you
-                                                      have a separate replication network, you
-                                                      should not specify any value for
-                                                      "replication_server".
-replication_concurrency        4                      Set to restrict the number of
-                                                      concurrent incoming SSYNC
-                                                      requests; set to 0 for unlimited
-replication_one_per_device     True                   Restricts incoming SSYNC
-                                                      requests to one per device,
-                                                      replication_currency above
-                                                      allowing. This can help control
-                                                      I/O to each device, but you may
-                                                      wish to set this to False to
-                                                      allow multiple SSYNC
-                                                      requests (up to the above
-                                                      replication_concurrency setting)
-                                                      per device.
-replication_lock_timeout       15                     Number of seconds to wait for an
-                                                      existing replication device lock
-                                                      before giving up.
-replication_failure_threshold  100                    The number of subrequest failures
-                                                      before the
-                                                      replication_failure_ratio is
-                                                      checked
-replication_failure_ratio      1.0                    If the value of failures /
-                                                      successes of SSYNC
-                                                      subrequests exceeds this ratio,
-                                                      the overall SSYNC request
-                                                      will be aborted
-splice                         no                     Use splice() for zero-copy object
-                                                      GETs. This requires Linux kernel
-                                                      version 3.0 or greater. If you set
-                                                      "splice = yes" but the kernel
-                                                      does not support it, error messages
-                                                      will appear in the object server
-                                                      logs at startup, but your object
-                                                      servers should continue to function.
-nice_priority                  None                   Scheduling priority of server processes.
-                                                      Niceness values range from -20 (most
-                                                      favorable to the process) to 19 (least
-                                                      favorable to the process). The default
-                                                      does not modify priority.
-ionice_class                   None                   I/O scheduling class of server processes.
-                                                      I/O niceness class values are IOPRIO_CLASS_RT
-                                                      (realtime), IOPRIO_CLASS_BE (best-effort),
-                                                      and IOPRIO_CLASS_IDLE (idle).
-                                                      The default does not modify class and
-                                                      priority. Linux supports io scheduling
-                                                      priorities and classes since 2.6.13 with
-                                                      the CFQ io scheduler.
-                                                      Work only with ionice_priority.
-ionice_priority                None                   I/O scheduling priority of server
-                                                      processes. I/O niceness priority is
-                                                      a number which goes from 0 to 7.
-                                                      The higher the value, the lower the I/O
-                                                      priority of the process. Work only with
-                                                      ionice_class.
-                                                      Ignored if IOPRIO_CLASS_IDLE is set.
-=============================  ====================== ===============================================
+================================== ====================== ===============================================
+Option                             Default                Description
+---------------------------------- ---------------------- -----------------------------------------------
+use                                                       paste.deploy entry point for the
+                                                          object server.  For most cases,
+                                                          this should be
+                                                          `egg:swift#object`.
+set log_name                       object-server          Label used when logging
+set log_facility                   LOG_LOCAL0             Syslog log facility
+set log_level                      INFO                   Logging level
+set log_requests                   True                   Whether or not to log each
+                                                          request
+set log_address                    /dev/log               Logging directory
+user                               swift                  User to run as
+max_upload_time                    86400                  Maximum time allowed to upload an
+                                                          object
+slow                               0                      If > 0, Minimum time in seconds for a PUT or
+                                                          DELETE request to complete.  This is only
+                                                          useful to simulate slow devices during testing
+                                                          and development.
+mb_per_sync                        512                    On PUT requests, sync file every
+                                                          n MB
+keep_cache_size                    5242880                Largest object size to keep in
+                                                          buffer cache
+keep_cache_private                 false                  Allow non-public objects to stay
+                                                          in kernel's buffer cache
+allowed_headers                    Content-Disposition,   Comma separated list of headers
+                                   Content-Encoding,      that can be set in metadata on an object.
+                                   X-Delete-At,           This list is in addition to
+                                   X-Object-Manifest,     X-Object-Meta-* headers and cannot include
+                                   X-Static-Large-Object  Content-Type, etag, Content-Length, or deleted
+                                   Cache-Control,
+                                   Content-Language,
+                                   Expires,
+                                   X-Robots-Tag
+auto_create_account_prefix         .                      Prefix used when automatically
+                                                          creating accounts.
+replication_server                                        Configure parameter for creating
+                                                          specific server. To handle all verbs,
+                                                          including replication verbs, do not
+                                                          specify "replication_server"
+                                                          (this is the default). To only
+                                                          handle replication, set to a True
+                                                          value (e.g. "True" or "1").
+                                                          To handle only non-replication
+                                                          verbs, set to "False". Unless you
+                                                          have a separate replication network, you
+                                                          should not specify any value for
+                                                          "replication_server".
+replication_concurrency            4                      Set to restrict the number of
+                                                          concurrent incoming SSYNC
+                                                          requests; set to 0 for unlimited
+replication_concurrency_per_device 1                      Set to restrict the number of
+                                                          concurrent incoming SSYNC
+                                                          requests per device; set to 0 for
+                                                          unlimited requests per devices.
+                                                          This can help control I/O to each
+                                                          device. This does not override
+                                                          replication_concurrency described
+                                                          above, so you may need to adjust
+                                                          both parameters depending on your
+                                                          hardware or network capacity.
+replication_lock_timeout           15                     Number of seconds to wait for an
+                                                          existing replication device lock
+                                                          before giving up.
+replication_failure_threshold      100                    The number of subrequest failures
+                                                          before the
+                                                          replication_failure_ratio is
+                                                          checked
+replication_failure_ratio          1.0                    If the value of failures /
+                                                          successes of SSYNC
+                                                          subrequests exceeds this ratio,
+                                                          the overall SSYNC request
+                                                          will be aborted
+splice                             no                     Use splice() for zero-copy object
+                                                          GETs. This requires Linux kernel
+                                                          version 3.0 or greater. If you set
+                                                          "splice = yes" but the kernel
+                                                          does not support it, error messages
+                                                          will appear in the object server
+                                                          logs at startup, but your object
+                                                          servers should continue to function.
+nice_priority                      None                   Scheduling priority of server processes.
+                                                          Niceness values range from -20 (most
+                                                          favorable to the process) to 19 (least
+                                                          favorable to the process). The default
+                                                          does not modify priority.
+ionice_class                       None                   I/O scheduling class of server processes.
+                                                          I/O niceness class values are IOPRIO_CLASS_RT
+                                                          (realtime), IOPRIO_CLASS_BE (best-effort),
+                                                          and IOPRIO_CLASS_IDLE (idle).
+                                                          The default does not modify class and
+                                                          priority. Linux supports io scheduling
+                                                          priorities and classes since 2.6.13 with
+                                                          the CFQ io scheduler.
+                                                          Work only with ionice_priority.
+ionice_priority                    None                   I/O scheduling priority of server
+                                                          processes. I/O niceness priority is
+                                                          a number which goes from 0 to 7.
+                                                          The higher the value, the lower the I/O
+                                                          priority of the process. Work only with
+                                                          ionice_class.
+                                                          Ignored if IOPRIO_CLASS_IDLE is set.
+eventlet_tpool_num_threads         auto                   The number of threads in eventlet's thread pool.
+                                                          Most IO will occur in the object server's main
+                                                          thread, but certain "heavy" IO operations will
+                                                          occur in separate IO threads, managed by
+                                                          eventlet.
+                                                          The default value is auto, whose actual value
+                                                          is dependent on the servers_per_port value.
+                                                          If servers_per_port is zero then it uses
+                                                          eventlet's default (currently 20 threads).
+                                                          If the servers_per_port is nonzero then it'll
+                                                          only use 1 thread per process.
+                                                          This value can be overridden with an integer
+                                                          value.
+================================== ====================== ===============================================
 
+*******************
 [object-replicator]
+*******************
 
 ===========================  ========================  ================================
 Option                       Default                   Description
@@ -656,8 +697,14 @@ daemonize                    yes                       Whether or not to run rep
                                                        as a daemon
 interval                     30                        Time in seconds to wait between
                                                        replication passes
-concurrency                  1                         Number of replication workers to
-                                                       spawn
+concurrency                  1                         Number of replication jobs to
+                                                       run per worker process
+replicator_workers           0                         Number of worker processes to use.
+                                                       No matter how big this number is,
+                                                       at most one worker per disk will
+                                                       be used. The default value of 0
+                                                       means no forking; all work is done
+                                                       in the main process.
 sync_method                  rsync                     The sync method to use; default
                                                        is rsync but you can use ssync to
                                                        try the EXPERIMENTAL
@@ -685,8 +732,6 @@ rsync_compress               no                        Allow rsync to compress d
                                                        process.
 stats_interval               300                       Interval in seconds between
                                                        logging replication statistics
-reclaim_age                  604800                    Time elapsed in seconds before an
-                                                       object can be reclaimed
 handoffs_first               false                     If set to True, partitions that
                                                        are not supposed to be on the
                                                        node will be replicated first.
@@ -762,22 +807,123 @@ ionice_priority              None                      I/O scheduling priority o
                                                        is set.
 ===========================  ========================  ================================
 
-[object-updater]
+**********************
+[object-reconstructor]
+**********************
 
-==================  =================== ==========================================
+===========================  ========================  ================================
+Option                       Default                   Description
+---------------------------  ------------------------  --------------------------------
+log_name                     object-reconstructor      Label used when logging
+log_facility                 LOG_LOCAL0                Syslog log facility
+log_level                    INFO                      Logging level
+log_address                  /dev/log                  Logging directory
+daemonize                    yes                       Whether or not to run
+                                                       reconstruction as a daemon
+interval                     30                        Time in seconds to wait between
+                                                       reconstruction passes
+reconstructor_workers        0                         Maximum number of worker processes
+                                                       to spawn.  Each worker will handle
+                                                       a subset of devices.  Devices will
+                                                       be assigned evenly among the workers
+                                                       so that workers cycle at similar
+                                                       intervals (which can lead to fewer
+                                                       workers than requested).  You can not
+                                                       have more workers than devices.  If
+                                                       you have no devices only a single
+                                                       worker is spawned.
+concurrency                  1                         Number of reconstruction threads to
+                                                       spawn per reconstructor process.
+stats_interval               300                       Interval in seconds between
+                                                       logging reconstruction statistics
+handoffs_only                false                     The handoffs_only mode option is for
+                                                       special case emergency situations
+                                                       during rebalance such as disk full in
+                                                       the cluster.  This option SHOULD NOT
+                                                       BE CHANGED, except for extreme
+                                                       situations.  When handoffs_only mode
+                                                       is enabled the reconstructor will
+                                                       *only* revert fragments from handoff
+                                                       nodes to primary nodes and will not
+                                                       sync primary nodes with neighboring
+                                                       primary nodes.  This will force the
+                                                       reconstructor to sync and delete
+                                                       handoffs' fragments more quickly and
+                                                       minimize the time of the rebalance by
+                                                       limiting the number of rebuilds.  The
+                                                       handoffs_only option is only for
+                                                       temporary use and should be disabled
+                                                       as soon as the emergency situation
+                                                       has been resolved.
+node_timeout                 DEFAULT or 10             Request timeout to external
+                                                       services. The value used is the value
+                                                       set in this section, or the value set
+                                                       in the DEFAULT section, or 10.
+http_timeout                 60                        Max duration of an http request.
+                                                       This is for REPLICATE finalization
+                                                       calls and so should be longer
+                                                       than node_timeout.
+lockup_timeout               1800                      Attempts to kill all threads if
+                                                       no fragment has been reconstructed
+                                                       for lockup_timeout seconds.
+ring_check_interval          15                        Interval for checking new ring
+                                                       file
+recon_cache_path             /var/cache/swift          Path to recon cache
+nice_priority                None                      Scheduling priority of server
+                                                       processes. Niceness values
+                                                       range from -20 (most favorable
+                                                       to the process) to 19 (least
+                                                       favorable to the process).
+                                                       The default does not modify
+                                                       priority.
+ionice_class                 None                      I/O scheduling class of server
+                                                       processes. I/O niceness class
+                                                       values are IOPRIO_CLASS_RT (realtime),
+                                                       IOPRIO_CLASS_BE (best-effort),
+                                                       and IOPRIO_CLASS_IDLE (idle).
+                                                       The default does not modify
+                                                       class and priority.
+                                                       Linux supports io scheduling
+                                                       priorities and classes since
+                                                       2.6.13 with the CFQ io scheduler.
+                                                       Work only with ionice_priority.
+ionice_priority              None                      I/O scheduling priority of server
+                                                       processes. I/O niceness priority
+                                                       is a number which goes from
+                                                       0 to 7. The higher the value,
+                                                       the lower the I/O priority of
+                                                       the process.
+                                                       Work only with ionice_class.
+                                                       Ignored if IOPRIO_CLASS_IDLE
+                                                       is set.
+===========================  ========================  ================================
+
+****************
+[object-updater]
+****************
+
+=================== =================== ==========================================
 Option              Default             Description
-------------------  ------------------- ------------------------------------------
+------------------- ------------------- ------------------------------------------
 log_name            object-updater      Label used when logging
 log_facility        LOG_LOCAL0          Syslog log facility
 log_level           INFO                Logging level
 log_address         /dev/log            Logging directory
 interval            300                 Minimum time for a pass to take
-concurrency         1                   Number of updater workers to spawn
+updater_workers     1                   Number of worker processes
+concurrency         8                   Number of updates to run concurrently in
+                                        each worker process
 node_timeout        DEFAULT or 10       Request timeout to external services. This
                                         uses what's set here, or what's set in the
                                         DEFAULT section, or 10 (though other
                                         sections use 3 as the final default).
-slowdown            0.01                Time in seconds to wait between objects
+objects_per_second  50                  Maximum objects updated per second.
+                                        Should be tuned according to individual
+                                        system specs. 0 is unlimited.
+slowdown            0.01                Time in seconds to wait between objects.
+                                        Deprecated in favor of objects_per_second.
+report_interval     300                 Interval in seconds between logging
+                                        statistics about the current update pass.
 recon_cache_path    /var/cache/swift    Path to recon cache
 nice_priority       None                Scheduling priority of server processes.
                                         Niceness values range from -20 (most
@@ -800,9 +946,11 @@ ionice_priority     None                I/O scheduling priority of server
                                         priority of the process. Work only with
                                         ionice_class.
                                         Ignored if IOPRIO_CLASS_IDLE is set.
-==================  =================== ==========================================
+=================== =================== ==========================================
 
+****************
 [object-auditor]
+****************
 
 =========================== =================== ==========================================
 Option                      Default             Description
@@ -861,9 +1009,19 @@ Container Server Configuration
 An example Container Server configuration can be found at
 etc/container-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
 
+* :ref:`[DEFAULT] <container_server_default_options>`
+* `[container-server]`_
+* `[container-replicator]`_
+* `[container-updater]`_
+* `[container-auditor]`_
+
+.. _container_server_default_options:
+
+*********
 [DEFAULT]
+*********
 
 ===============================  ==========  ============================================
 Option                           Default     Description
@@ -875,6 +1033,7 @@ mount_check                      true        Whether or not check if the devices
                                              to the root device
 bind_ip                          0.0.0.0     IP Address for server to bind to
 bind_port                        6201        Port for server to bind to
+keep_idle                        600         Value to set for socket TCP_KEEPIDLE
 bind_timeout                     30          Seconds to attempt bind before giving up
 backlog                          4096        Maximum number of allowed pending
                                              connections
@@ -954,7 +1113,9 @@ ionice_priority                  None        I/O scheduling priority of server p
                                              Ignored if IOPRIO_CLASS_IDLE is set.
 ===============================  ==========  ============================================
 
+******************
 [container-server]
+******************
 
 ==============================  ================  ========================================
 Option                          Default           Description
@@ -1008,98 +1169,106 @@ ionice_priority                 None              I/O scheduling priority of ser
                                                   Ignored if IOPRIO_CLASS_IDLE is set.
 ==============================  ================  ========================================
 
+**********************
 [container-replicator]
+**********************
 
-==================  ===========================  =============================
-Option              Default                      Description
-------------------  ---------------------------  -----------------------------
-log_name            container-replicator         Label used when logging
-log_facility        LOG_LOCAL0                   Syslog log facility
-log_level           INFO                         Logging level
-log_address         /dev/log                     Logging directory
-per_diff            1000                         Maximum number of database
-                                                 rows that will be sync'd in a
-                                                 single HTTP replication
-                                                 request. Databases with less
-                                                 than or equal to this number
-                                                 of differing rows will always
-                                                 be sync'd using an HTTP
-                                                 replication request rather
-                                                 than using rsync.
-max_diffs           100                          Maximum number of HTTP
-                                                 replication requests attempted
-                                                 on each replication pass for
-                                                 any one container. This caps
-                                                 how long the replicator will
-                                                 spend trying to sync a given
-                                                 database per pass so the other
-                                                 databases don't get starved.
-concurrency         8                            Number of replication workers
-                                                 to spawn
-interval            30                           Time in seconds to wait
-                                                 between replication passes
-node_timeout        10                           Request timeout to external
-                                                 services
-conn_timeout        0.5                          Connection timeout to external
-                                                 services
-reclaim_age         604800                       Time elapsed in seconds before
-                                                 a container can be reclaimed
-rsync_module        {replication_ip}::container  Format of the rsync module
-                                                 where the replicator will send
-                                                 data. The configuration value
-                                                 can include some variables
-                                                 that will be extracted from
-                                                 the ring. Variables must
-                                                 follow the format {NAME} where
-                                                 NAME is one of: ip, port,
-                                                 replication_ip,
-                                                 replication_port, region,
-                                                 zone, device, meta. See
-                                                 etc/rsyncd.conf-sample for
-                                                 some examples.
-rsync_compress      no                           Allow rsync to compress data
-                                                 which is transmitted to
-                                                 destination node during sync.
-                                                 However, this is applicable
-                                                 only when destination node is
-                                                 in a different region than the
-                                                 local one. NOTE: Objects that
-                                                 are already compressed (for
-                                                 example: .tar.gz, mp3) might
-                                                 slow down the syncing process.
-recon_cache_path    /var/cache/swift             Path to recon cache
-nice_priority       None                         Scheduling priority of server
-                                                 processes. Niceness values
-                                                 range from -20 (most favorable
-                                                 to the process) to 19 (least
-                                                 favorable to the process).
-                                                 The default does not modify
-                                                 priority.
-ionice_class        None                         I/O scheduling class of server
-                                                 processes. I/O niceness class
-                                                 values are
-                                                 IOPRIO_CLASS_RT (realtime),
-                                                 IOPRIO_CLASS_BE (best-effort),
-                                                 and IOPRIO_CLASS_IDLE (idle).
-                                                 The default does not modify
-                                                 class and priority. Linux
-                                                 supports io scheduling
-                                                 priorities and classes since
-                                                 2.6.13 with the CFQ io
-                                                 scheduler.
-                                                 Work only with ionice_priority.
-ionice_priority     None                         I/O scheduling priority of
-                                                 server processes. I/O niceness
-                                                 priority is a number which goes
-                                                 from 0 to 7.
-                                                 The higher the value, the lower
-                                                 the I/O priority of the process.
-                                                 Work only with ionice_class.
-                                                 Ignored if IOPRIO_CLASS_IDLE
-                                                 is set.
-==================  ===========================  =============================
+==================== ===========================  =============================
+Option               Default                      Description
+-------------------- ---------------------------  -----------------------------
+log_name             container-replicator         Label used when logging
+log_facility         LOG_LOCAL0                   Syslog log facility
+log_level            INFO                         Logging level
+log_address          /dev/log                     Logging directory
+per_diff             1000                         Maximum number of database
+                                                  rows that will be sync'd in a
+                                                  single HTTP replication
+                                                  request. Databases with less
+                                                  than or equal to this number
+                                                  of differing rows will always
+                                                  be sync'd using an HTTP
+                                                  replication request rather
+                                                  than using rsync.
+max_diffs            100                          Maximum number of HTTP
+                                                  replication requests attempted
+                                                  on each replication pass for
+                                                  any one container. This caps
+                                                  how long the replicator will
+                                                  spend trying to sync a given
+                                                  database per pass so the other
+                                                  databases don't get starved.
+concurrency          8                            Number of replication workers
+                                                  to spawn
+interval             30                           Time in seconds to wait
+                                                  between replication passes
+databases_per_second 50                           Maximum databases to process
+                                                  per second.  Should be tuned
+                                                  according to individual
+                                                  system specs.  0 is unlimited.
+node_timeout         10                           Request timeout to external
+                                                  services
+conn_timeout         0.5                          Connection timeout to external
+                                                  services
+reclaim_age          604800                       Time elapsed in seconds before
+                                                  a container can be reclaimed
+rsync_module         {replication_ip}::container  Format of the rsync module
+                                                  where the replicator will send
+                                                  data. The configuration value
+                                                  can include some variables
+                                                  that will be extracted from
+                                                  the ring. Variables must
+                                                  follow the format {NAME} where
+                                                  NAME is one of: ip, port,
+                                                  replication_ip,
+                                                  replication_port, region,
+                                                  zone, device, meta. See
+                                                  etc/rsyncd.conf-sample for
+                                                  some examples.
+rsync_compress       no                           Allow rsync to compress data
+                                                  which is transmitted to
+                                                  destination node during sync.
+                                                  However, this is applicable
+                                                  only when destination node is
+                                                  in a different region than the
+                                                  local one. NOTE: Objects that
+                                                  are already compressed (for
+                                                  example: .tar.gz, mp3) might
+                                                  slow down the syncing process.
+recon_cache_path     /var/cache/swift             Path to recon cache
+nice_priority        None                         Scheduling priority of server
+                                                  processes. Niceness values
+                                                  range from -20 (most favorable
+                                                  to the process) to 19 (least
+                                                  favorable to the process).
+                                                  The default does not modify
+                                                  priority.
+ionice_class         None                         I/O scheduling class of server
+                                                  processes. I/O niceness class
+                                                  values are
+                                                  IOPRIO_CLASS_RT (realtime),
+                                                  IOPRIO_CLASS_BE (best-effort),
+                                                  and IOPRIO_CLASS_IDLE (idle).
+                                                  The default does not modify
+                                                  class and priority. Linux
+                                                  supports io scheduling
+                                                  priorities and classes since
+                                                  2.6.13 with the CFQ io
+                                                  scheduler.
+                                                  Work only with ionice_priority.
+ionice_priority      None                         I/O scheduling priority of
+                                                  server processes. I/O niceness
+                                                  priority is a number which goes
+                                                  from 0 to 7.
+                                                  The higher the value, the lower
+                                                  the I/O priority of the process.
+                                                  Work only with ionice_class.
+                                                  Ignored if IOPRIO_CLASS_IDLE
+                                                  is set.
+==================== ===========================  =============================
 
+*******************
 [container-updater]
+*******************
 
 ========================  =================  ==================================
 Option                    Default            Description
@@ -1114,8 +1283,13 @@ node_timeout              3                  Request timeout to external
                                              services
 conn_timeout              0.5                Connection timeout to external
                                              services
+containers_per_second     50                 Maximum containers updated per second.
+                                             Should be tuned according to individual
+                                             system specs. 0 is unlimited.
+
 slowdown                  0.01               Time in seconds to wait between
-                                             containers
+                                             containers. Deprecated in favor of
+                                             containers_per_second.
 account_suppression_time  60                 Seconds to suppress updating an
                                              account that has generated an
                                              error (timeout, not yet found,
@@ -1146,7 +1320,9 @@ ionice_priority           None               I/O scheduling priority of server
                                              Ignored if IOPRIO_CLASS_IDLE is set.
 ========================  =================  ==================================
 
+*******************
 [container-auditor]
+*******************
 
 =====================  =================  =======================================
 Option                 Default            Description
@@ -1191,9 +1367,19 @@ Account Server Configuration
 An example Account Server configuration can be found at
 etc/account-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
 
+* :ref:`[DEFAULT] <account_server_default_options>`
+* `[account-server]`_
+* `[account-replicator]`_
+* `[account-auditor]`_
+* `[account-reaper]`_
+
+.. _account_server_default_options:
+
+*********
 [DEFAULT]
+*********
 
 ===============================  ==========  =============================================
 Option                           Default     Description
@@ -1205,6 +1391,7 @@ mount_check                      true        Whether or not check if the devices
                                              to the root device
 bind_ip                          0.0.0.0     IP Address for server to bind to
 bind_port                        6202        Port for server to bind to
+keep_idle                        600         Value to set for socket TCP_KEEPIDLE
 bind_timeout                     30          Seconds to attempt bind before giving up
 backlog                          4096        Maximum number of allowed pending
                                              connections
@@ -1284,7 +1471,9 @@ ionice_priority                  None        I/O scheduling priority of server p
                                              Ignored if IOPRIO_CLASS_IDLE is set.
 ===============================  ==========  =============================================
 
+****************
 [account-server]
+****************
 
 =============================  ==============  ==========================================
 Option                         Default         Description
@@ -1335,93 +1524,101 @@ ionice_priority                None            I/O scheduling priority of server
                                                Ignored if IOPRIO_CLASS_IDLE is set.
 =============================  ==============  ==========================================
 
+********************
 [account-replicator]
+********************
 
-==================  =========================  ===============================
-Option              Default                    Description
-------------------  -------------------------  -------------------------------
-log_name            account-replicator         Label used when logging
-log_facility        LOG_LOCAL0                 Syslog log facility
-log_level           INFO                       Logging level
-log_address         /dev/log                   Logging directory
-per_diff            1000                       Maximum number of database rows
-                                               that will be sync'd in a single
-                                               HTTP replication request.
-                                               Databases with less than or
-                                               equal to this number of
-                                               differing rows will always be
-                                               sync'd using an HTTP replication
-                                               request rather than using rsync.
-max_diffs           100                        Maximum number of HTTP
-                                               replication requests attempted
-                                               on each replication pass for any
-                                               one container. This caps how
-                                               long the replicator will spend
-                                               trying to sync a given database
-                                               per pass so the other databases
-                                               don't get starved.
-concurrency         8                          Number of replication workers
-                                               to spawn
-interval            30                         Time in seconds to wait between
-                                               replication passes
-node_timeout        10                         Request timeout to external
-                                               services
-conn_timeout        0.5                        Connection timeout to external
-                                               services
-reclaim_age         604800                     Time elapsed in seconds before
-                                               an account can be reclaimed
-rsync_module        {replication_ip}::account  Format of the rsync module where
-                                               the replicator will send data.
-                                               The configuration value can
-                                               include some variables that will
-                                               be extracted from the ring.
-                                               Variables must follow the format
-                                               {NAME} where NAME is one of: ip,
-                                               port, replication_ip,
-                                               replication_port, region, zone,
-                                               device, meta. See
-                                               etc/rsyncd.conf-sample for some
-                                               examples.
-rsync_compress      no                         Allow rsync to compress data
-                                               which is transmitted to
-                                               destination node during sync.
-                                               However, this is applicable only
-                                               when destination node is in a
-                                               different region than the local
-                                               one. NOTE: Objects that are
-                                               already compressed (for example:
-                                               .tar.gz, mp3) might slow down
-                                               the syncing process.
-recon_cache_path    /var/cache/swift           Path to recon cache
-nice_priority       None                       Scheduling priority of server
-                                               processes. Niceness values
-                                               range from -20 (most favorable
-                                               to the process) to 19 (least
-                                               favorable to the process).
-                                               The default does not modify
-                                               priority.
-ionice_class        None                       I/O scheduling class of server
-                                               processes. I/O niceness class
-                                               values are IOPRIO_CLASS_RT
-                                               (realtime), IOPRIO_CLASS_BE
-                                               (best-effort), and IOPRIO_CLASS_IDLE
-                                               (idle).
-                                               The default does not modify
-                                               class and priority. Linux supports
-                                               io scheduling priorities and classes
-                                               since 2.6.13 with the CFQ io scheduler.
-                                               Work only with ionice_priority.
-ionice_priority     None                       I/O scheduling priority of server
-                                               processes. I/O niceness priority
-                                               is a number which goes from 0 to 7.
-                                               The higher the value, the lower
-                                               the I/O priority of the process.
-                                               Work only with ionice_class.
-                                               Ignored if IOPRIO_CLASS_IDLE
-                                               is set.
-==================  =========================  ===============================
+==================== =========================  ===============================
+Option               Default                    Description
+-------------------- -------------------------  -------------------------------
+log_name             account-replicator         Label used when logging
+log_facility         LOG_LOCAL0                 Syslog log facility
+log_level            INFO                       Logging level
+log_address          /dev/log                   Logging directory
+per_diff             1000                       Maximum number of database rows
+                                                that will be sync'd in a single
+                                                HTTP replication request.
+                                                Databases with less than or
+                                                equal to this number of
+                                                differing rows will always be
+                                                sync'd using an HTTP replication
+                                                request rather than using rsync.
+max_diffs            100                        Maximum number of HTTP
+                                                replication requests attempted
+                                                on each replication pass for any
+                                                one container. This caps how
+                                                long the replicator will spend
+                                                trying to sync a given database
+                                                per pass so the other databases
+                                                don't get starved.
+concurrency          8                          Number of replication workers
+                                                to spawn
+interval             30                         Time in seconds to wait between
+                                                replication passes
+databases_per_second 50                         Maximum databases to process
+                                                per second.  Should be tuned
+                                                according to individual
+                                                system specs.  0 is unlimited.
+node_timeout         10                         Request timeout to external
+                                                services
+conn_timeout         0.5                        Connection timeout to external
+                                                services
+reclaim_age          604800                     Time elapsed in seconds before
+                                                an account can be reclaimed
+rsync_module         {replication_ip}::account  Format of the rsync module where
+                                                the replicator will send data.
+                                                The configuration value can
+                                                include some variables that will
+                                                be extracted from the ring.
+                                                Variables must follow the format
+                                                {NAME} where NAME is one of: ip,
+                                                port, replication_ip,
+                                                replication_port, region, zone,
+                                                device, meta. See
+                                                etc/rsyncd.conf-sample for some
+                                                examples.
+rsync_compress       no                         Allow rsync to compress data
+                                                which is transmitted to
+                                                destination node during sync.
+                                                However, this is applicable only
+                                                when destination node is in a
+                                                different region than the local
+                                                one. NOTE: Objects that are
+                                                already compressed (for example:
+                                                .tar.gz, mp3) might slow down
+                                                the syncing process.
+recon_cache_path     /var/cache/swift           Path to recon cache
+nice_priority        None                       Scheduling priority of server
+                                                processes. Niceness values
+                                                range from -20 (most favorable
+                                                to the process) to 19 (least
+                                                favorable to the process).
+                                                The default does not modify
+                                                priority.
+ionice_class         None                       I/O scheduling class of server
+                                                processes. I/O niceness class
+                                                values are IOPRIO_CLASS_RT
+                                                (realtime), IOPRIO_CLASS_BE
+                                                (best-effort), and IOPRIO_CLASS_IDLE
+                                                (idle).
+                                                The default does not modify
+                                                class and priority. Linux supports
+                                                io scheduling priorities and classes
+                                                since 2.6.13 with the CFQ io scheduler.
+                                                Work only with ionice_priority.
+ionice_priority      None                       I/O scheduling priority of server
+                                                processes. I/O niceness priority
+                                                is a number which goes from 0 to 7.
+                                                The higher the value, the lower
+                                                the I/O priority of the process.
+                                                Work only with ionice_class.
+                                                Ignored if IOPRIO_CLASS_IDLE
+                                                is set.
+==================== =========================  ===============================
 
+*****************
 [account-auditor]
+*****************
 
 ====================  ================  =======================================
 Option                Default           Description
@@ -1459,7 +1656,9 @@ ionice_priority       None              I/O scheduling priority of server
                                         Ignored if IOPRIO_CLASS_IDLE is set.
 ====================  ================  =======================================
 
+****************
 [account-reaper]
+****************
 
 ==================  ===============  =========================================
 Option              Default          Description
@@ -1476,7 +1675,15 @@ delay_reaping       0                Normally, the reaper begins deleting
                                      account information for deleted accounts
                                      immediately; you can set this to delay
                                      its work however. The value is in seconds,
-                                     2592000 = 30 days, for example.
+                                     2592000 = 30 days, for example. The sum of
+                                     this value and the container-updater
+                                     ``interval`` should be less than the
+                                     account-replicator ``reclaim_age``. This
+                                     ensures that once the account-reaper has
+                                     deleted a container there is sufficient
+                                     time for the container-updater to report
+                                     to the account before the account DB is
+                                     removed.
 reap_warn_after     2892000          If the account fails to be be reaped due
                                      to a persistent error, the account reaper
                                      will log a message such as:
@@ -1517,9 +1724,17 @@ Proxy Server Configuration
 An example Proxy Server configuration can be found at
 etc/proxy-server.conf-sample in the source code repository.
 
-The following configuration options are available:
+The following configuration sections are available:
 
+* :ref:`[DEFAULT] <proxy_server_default_options>`
+* `[proxy-server]`_
+* Individual sections for `Proxy middlewares`_
+
+.. _proxy_server_default_options:
+
+*********
 [DEFAULT]
+*********
 
 ====================================  ========================  ========================================
 Option                                Default                   Description
@@ -1527,6 +1742,7 @@ Option                                Default                   Description
 bind_ip                               0.0.0.0                   IP Address for server to
                                                                 bind to
 bind_port                             80                        Port for server to bind to
+keep_idle                             600                       Value to set for socket TCP_KEEPIDLE
 bind_timeout                          30                        Seconds to attempt bind before
                                                                 giving up
 backlog                               4096                      Maximum number of allowed pending
@@ -1557,14 +1773,19 @@ cert_file                                                       Path to the ssl 
 key_file                                                        Path to the ssl .key. This
                                                                 should be enabled for testing
                                                                 purposes only.
-cors_allow_origin                                               This is a list of hosts that
-                                                                are included with any CORS
-                                                                request by default and
-                                                                returned with the
-                                                                Access-Control-Allow-Origin
-                                                                header in addition to what
+cors_allow_origin                                               List of origin hosts that are allowed
+                                                                for CORS requests in addition to what
                                                                 the container has set.
-strict_cors_mode                      True
+strict_cors_mode                      True                      If True (default) then CORS
+                                                                requests are only allowed if their
+                                                                Origin header matches an allowed
+                                                                origin. Otherwise, any Origin is
+                                                                allowed.
+cors_expose_headers                                             This is a list of headers that
+                                                                are included in the header
+                                                                Access-Control-Expose-Headers
+                                                                in addition to what the container
+                                                                has set.
 client_timeout                        60
 trans_id_suffix                                                 This optional suffix (default is empty)
                                                                 that would be appended to the swift
@@ -1639,234 +1860,310 @@ ionice_priority                       None                      I/O scheduling p
                                                                 Ignored if IOPRIO_CLASS_IDLE is set.
 ====================================  ========================  ========================================
 
+**************
 [proxy-server]
+**************
 
-============================  ===============  =====================================
-Option                        Default          Description
-----------------------------  ---------------  -------------------------------------
-use                                            Entry point for paste.deploy for
-                                               the proxy server.  For most
-                                               cases, this should be
-                                               `egg:swift#proxy`.
-set log_name                  proxy-server     Label used when logging
-set log_facility              LOG_LOCAL0       Syslog log facility
-set log_level                 INFO             Log level
-set log_headers               True             If True, log headers in each
-                                               request
-set log_handoffs              True             If True, the proxy will log
-                                               whenever it has to failover to a
-                                               handoff node
-recheck_account_existence     60               Cache timeout in seconds to
-                                               send memcached for account
-                                               existence
-recheck_container_existence   60               Cache timeout in seconds to
-                                               send memcached for container
-                                               existence
-object_chunk_size             65536            Chunk size to read from
-                                               object servers
-client_chunk_size             65536            Chunk size to read from
-                                               clients
-memcache_servers              127.0.0.1:11211  Comma separated list of
-                                               memcached servers
-                                               ip:port or [ipv6addr]:port
-memcache_max_connections      2                Max number of connections to
-                                               each memcached server per
-                                               worker
-node_timeout                  10               Request timeout to external
-                                               services
-recoverable_node_timeout      node_timeout     Request timeout to external
-                                               services for requests that, on
-                                               failure, can be recovered
-                                               from. For example, object GET.
-client_timeout                60               Timeout to read one chunk
-                                               from a client
-conn_timeout                  0.5              Connection timeout to
-                                               external services
-error_suppression_interval    60               Time in seconds that must
-                                               elapse since the last error
-                                               for a node to be considered
-                                               no longer error limited
-error_suppression_limit       10               Error count to consider a
-                                               node error limited
-allow_account_management      false            Whether account PUTs and DELETEs
-                                               are even callable
-object_post_as_copy           true             Set object_post_as_copy = false
-                                               to turn on fast posts where only
-                                               the metadata changes are stored
-                                               anew and the original data file
-                                               is kept in place. This makes for
-                                               quicker posts.
-account_autocreate            false            If set to 'true' authorized
-                                               accounts that do not yet exist
-                                               within the Swift cluster will
-                                               be automatically created.
-max_containers_per_account    0                If set to a positive value,
-                                               trying to create a container
-                                               when the account already has at
-                                               least this maximum containers
-                                               will result in a 403 Forbidden.
-                                               Note: This is a soft limit,
-                                               meaning a user might exceed the
-                                               cap for
-                                               recheck_account_existence before
-                                               the 403s kick in.
-max_containers_whitelist                       This is a comma separated list
-                                               of account names that ignore
-                                               the max_containers_per_account
-                                               cap.
-rate_limit_after_segment      10               Rate limit the download of
-                                               large object segments after
-                                               this segment is downloaded.
-rate_limit_segments_per_sec   1                Rate limit large object
-                                               downloads at this rate.
-request_node_count            2 * replicas     Set to the number of nodes to
-                                               contact for a normal request.
-                                               You can use '* replicas' at the
-                                               end to have it use the number
-                                               given times the number of
-                                               replicas for the ring being used
-                                               for the request.
-swift_owner_headers           <see the sample  These are the headers whose
-                              conf file for    values will only be shown to
-                              the list of      swift_owners. The exact
-                              default          definition of a swift_owner is
-                              headers>         up to the auth system in use,
-                                               but usually indicates
-                                               administrative responsibilities.
-sorting_method                shuffle          Storage nodes can be chosen at
-                                               random (shuffle), by using timing
-                                               measurements (timing), or by using
-                                               an explicit match (affinity).
-                                               Using timing measurements may allow
-                                               for lower overall latency, while
-                                               using affinity allows for finer
-                                               control. In both the timing and
-                                               affinity cases, equally-sorting nodes
-                                               are still randomly chosen to spread
-                                               load.
-timing_expiry                 300              If the "timing" sorting_method is
-                                               used, the timings will only be valid
-                                               for the number of seconds configured
-                                               by timing_expiry.
-concurrent_gets               off              Use replica count number of
-                                               threads concurrently during a
-                                               GET/HEAD and return with the
-                                               first successful response. In
-                                               the EC case, this parameter only
-                                               effects an EC HEAD as an EC GET
-                                               behaves differently.
-concurrency_timeout           conn_timeout     This parameter controls how long
-                                               to wait before firing off the
-                                               next concurrent_get thread. A
-                                               value of 0 would we fully concurrent
-                                               any other number will stagger the
-                                               firing of the threads. This number
-                                               should be between 0 and node_timeout.
-                                               The default is conn_timeout (0.5).
-nice_priority                 None             Scheduling priority of server
-                                               processes.
-                                               Niceness values range from -20 (most
-                                               favorable to the process) to 19 (least
-                                               favorable to the process). The default
-                                               does not modify priority.
-ionice_class                  None             I/O scheduling class of server
-                                               processes. I/O niceness class values
-                                               are IOPRIO_CLASS_RT (realtime),
-                                               IOPRIO_CLASS_BE (best-effort),
-                                               and IOPRIO_CLASS_IDLE (idle).
-                                               The default does not modify class and
-                                               priority. Linux supports io scheduling
-                                               priorities and classes since 2.6.13
-                                               with the CFQ io scheduler.
-                                               Work only with ionice_priority.
-ionice_priority               None             I/O scheduling priority of server
-                                               processes. I/O niceness priority is
-                                               a number which goes from 0 to 7.
-                                               The higher the value, the lower the
-                                               I/O priority of the process. Work
-                                               only with ionice_class.
-                                               Ignored if IOPRIO_CLASS_IDLE is set.
-============================  ===============  =====================================
+======================================  ===============  =====================================
+Option                                  Default          Description
+--------------------------------------  ---------------  -------------------------------------
+use                                                      Entry point for paste.deploy for
+                                                         the proxy server.  For most
+                                                         cases, this should be
+                                                         `egg:swift#proxy`.
+set log_name                            proxy-server     Label used when logging
+set log_facility                        LOG_LOCAL0       Syslog log facility
+set log_level                           INFO             Log level
+set log_headers                         True             If True, log headers in each
+                                                         request
+set log_handoffs                        True             If True, the proxy will log
+                                                         whenever it has to failover to a
+                                                         handoff node
+recheck_account_existence               60               Cache timeout in seconds to
+                                                         send memcached for account
+                                                         existence
+recheck_container_existence             60               Cache timeout in seconds to
+                                                         send memcached for container
+                                                         existence
+object_chunk_size                       65536            Chunk size to read from
+                                                         object servers
+client_chunk_size                       65536            Chunk size to read from
+                                                         clients
+memcache_servers                        127.0.0.1:11211  Comma separated list of
+                                                         memcached servers
+                                                         ip:port or [ipv6addr]:port
+memcache_max_connections                2                Max number of connections to
+                                                         each memcached server per
+                                                         worker
+node_timeout                            10               Request timeout to external
+                                                         services
+recoverable_node_timeout                node_timeout     Request timeout to external
+                                                         services for requests that, on
+                                                         failure, can be recovered
+                                                         from. For example, object GET.
+client_timeout                          60               Timeout to read one chunk
+                                                         from a client
+conn_timeout                            0.5              Connection timeout to
+                                                         external services
+error_suppression_interval              60               Time in seconds that must
+                                                         elapse since the last error
+                                                         for a node to be considered
+                                                         no longer error limited
+error_suppression_limit                 10               Error count to consider a
+                                                         node error limited
+allow_account_management                false            Whether account PUTs and DELETEs
+                                                         are even callable
+account_autocreate                      false            If set to 'true' authorized
+                                                         accounts that do not yet exist
+                                                         within the Swift cluster will
+                                                         be automatically created.
+max_containers_per_account              0                If set to a positive value,
+                                                         trying to create a container
+                                                         when the account already has at
+                                                         least this maximum containers
+                                                         will result in a 403 Forbidden.
+                                                         Note: This is a soft limit,
+                                                         meaning a user might exceed the
+                                                         cap for
+                                                         recheck_account_existence before
+                                                         the 403s kick in.
+max_containers_whitelist                                 This is a comma separated list
+                                                         of account names that ignore
+                                                         the max_containers_per_account
+                                                         cap.
+rate_limit_after_segment                10               Rate limit the download of
+                                                         large object segments after
+                                                         this segment is downloaded.
+rate_limit_segments_per_sec             1                Rate limit large object
+                                                         downloads at this rate.
+request_node_count                      2 * replicas     Set to the number of nodes to
+                                                         contact for a normal request.
+                                                         You can use '* replicas' at the
+                                                         end to have it use the number
+                                                         given times the number of
+                                                         replicas for the ring being used
+                                                         for the request.
+swift_owner_headers                     <see the sample  These are the headers whose
+                                        conf file for    values will only be shown to
+                                        the list of      swift_owners. The exact
+                                        default          definition of a swift_owner is
+                                        headers>         up to the auth system in use,
+                                                         but usually indicates
+                                                         administrative responsibilities.
+sorting_method                          shuffle          Storage nodes can be chosen at
+                                                         random (shuffle), by using timing
+                                                         measurements (timing), or by using
+                                                         an explicit match (affinity).
+                                                         Using timing measurements may allow
+                                                         for lower overall latency, while
+                                                         using affinity allows for finer
+                                                         control. In both the timing and
+                                                         affinity cases, equally-sorting nodes
+                                                         are still randomly chosen to spread
+                                                         load. This option may be overridden
+                                                         in a per-policy configuration
+                                                         section.
+timing_expiry                           300              If the "timing" sorting_method is
+                                                         used, the timings will only be valid
+                                                         for the number of seconds configured
+                                                         by timing_expiry.
+concurrent_gets                         off              Use replica count number of
+                                                         threads concurrently during a
+                                                         GET/HEAD and return with the
+                                                         first successful response. In
+                                                         the EC case, this parameter only
+                                                         affects an EC HEAD as an EC GET
+                                                         behaves differently.
+concurrency_timeout                     conn_timeout     This parameter controls how long
+                                                         to wait before firing off the
+                                                         next concurrent_get thread. A
+                                                         value of 0 would we fully concurrent,
+                                                         any other number will stagger the
+                                                         firing of the threads. This number
+                                                         should be between 0 and node_timeout.
+                                                         The default is conn_timeout (0.5).
+nice_priority                           None             Scheduling priority of server
+                                                         processes.
+                                                         Niceness values range from -20 (most
+                                                         favorable to the process) to 19 (least
+                                                         favorable to the process). The default
+                                                         does not modify priority.
+ionice_class                            None             I/O scheduling class of server
+                                                         processes. I/O niceness class values
+                                                         are IOPRIO_CLASS_RT (realtime),
+                                                         IOPRIO_CLASS_BE (best-effort),
+                                                         and IOPRIO_CLASS_IDLE (idle).
+                                                         The default does not modify class and
+                                                         priority. Linux supports io scheduling
+                                                         priorities and classes since 2.6.13
+                                                         with the CFQ io scheduler.
+                                                         Work only with ionice_priority.
+ionice_priority                         None             I/O scheduling priority of server
+                                                         processes. I/O niceness priority is
+                                                         a number which goes from 0 to 7.
+                                                         The higher the value, the lower the
+                                                         I/O priority of the process. Work
+                                                         only with ionice_class.
+                                                         Ignored if IOPRIO_CLASS_IDLE is set.
+read_affinity                           None             Specifies which backend servers to
+                                                         prefer on reads; used in conjunction
+                                                         with the sorting_method option being
+                                                         set to 'affinity'. Format is a comma
+                                                         separated list of affinity descriptors
+                                                         of the form <selection>=<priority>.
+                                                         The <selection> may be r<N> for
+                                                         selecting nodes in region N or
+                                                         r<N>z<M> for selecting nodes in
+                                                         region N, zone M. The <priority>
+                                                         value should be a whole number
+                                                         that represents the priority to
+                                                         be given to the selection; lower
+                                                         numbers are higher priority.
+                                                         Default is empty, meaning no
+                                                         preference. This option may be
+                                                         overridden in a per-policy
+                                                         configuration section.
+write_affinity                          None             Specifies which backend servers to
+                                                         prefer on writes. Format is a comma
+                                                         separated list of affinity
+                                                         descriptors of the form r<N> for
+                                                         region N or r<N>z<M> for region N,
+                                                         zone M. Default is empty, meaning no
+                                                         preference. This option may be
+                                                         overridden in a per-policy
+                                                         configuration section.
+write_affinity_node_count               2 * replicas     The number of local (as governed by
+                                                         the write_affinity setting) nodes to
+                                                         attempt to contact first on writes,
+                                                         before any non-local ones. The value
+                                                         should be an integer number, or use
+                                                         '* replicas' at the end to have it
+                                                         use the number given times the number
+                                                         of replicas for the ring being used
+                                                         for the request. This option may be
+                                                         overridden in a per-policy
+                                                         configuration section.
+write_affinity_handoff_delete_count     auto             The number of local (as governed by
+                                                         the write_affinity setting) handoff
+                                                         nodes to attempt to contact on
+                                                         deletion, in addition to primary
+                                                         nodes. Example: in geographically
+                                                         distributed deployment, If replicas=3,
+                                                         sometimes there may be 1 primary node
+                                                         and 2 local handoff nodes in one region
+                                                         holding the object after uploading but
+                                                         before object replicated to the
+                                                         appropriate locations in other regions.
+                                                         In this case, include these handoff
+                                                         nodes to send request when deleting
+                                                         object could help make correct decision
+                                                         for the response. The default value 'auto'
+                                                         means Swift will calculate the number
+                                                         automatically, the default value is
+                                                         (replicas - len(local_primary_nodes)).
+                                                         This option may be overridden in a
+                                                         per-policy configuration section.
+======================================  ===============  =====================================
 
-[tempauth]
+.. _proxy_server_per_policy_config:
 
-=====================  =============================== =======================
-Option                 Default                         Description
----------------------  ------------------------------- -----------------------
-use                                                    Entry point for
-                                                       paste.deploy to use for
-                                                       auth. To use tempauth
-                                                       set to:
-                                                       `egg:swift#tempauth`
-set log_name           tempauth                        Label used when logging
-set log_facility       LOG_LOCAL0                      Syslog log facility
-set log_level          INFO                            Log level
-set log_headers        True                            If True, log headers in
-                                                       each request
-reseller_prefix        AUTH                            The naming scope for the
-                                                       auth service. Swift
-                                                       storage accounts and
-                                                       auth tokens will begin
-                                                       with this prefix.
-auth_prefix            /auth/                          The HTTP request path
-                                                       prefix for the auth
-                                                       service. Swift itself
-                                                       reserves anything
-                                                       beginning with the
-                                                       letter `v`.
-token_life             86400                           The number of seconds a
-                                                       token is valid.
-storage_url_scheme     default                         Scheme to return with
-                                                       storage urls: http,
-                                                       https, or default
-                                                       (chooses based on what
-                                                       the server is running
-                                                       as) This can be useful
-                                                       with an SSL load
-                                                       balancer in front of a
-                                                       non-SSL server.
-=====================  =============================== =======================
+************************
+Per policy configuration
+************************
 
-Additionally, you need to list all the accounts/users you want here. The format
-is::
+Some proxy-server configuration options may be overridden for individual
+:doc:`overview_policies` by including per-policy config section(s). These
+options are:
 
-    user_<account>_<user> = <key> [group] [group] [...] [storage_url]
+- ``sorting_method``
+- ``read_affinity``
+- ``write_affinity``
+- ``write_affinity_node_count``
+- ``write_affinity_handoff_delete_count``
 
-or if you want to be able to include underscores in the ``<account>`` or
-``<user>`` portions, you can base64 encode them (with *no* equal signs) in a
-line like this::
+The per-policy config section name must be of the form::
 
-    user64_<account_b64>_<user_b64> = <key> [group] [group] [...] [storage_url]
+    [proxy-server:policy:<policy index>]
 
-There are special groups of::
+.. note::
 
-    .reseller_admin = can do anything to any account for this auth
-    .admin = can do anything within the account
+    The per-policy config section name should refer to the policy index, not
+    the policy name.
 
-If neither of these groups are specified, the user can only access containers
-that have been explicitly allowed for them by a .admin or .reseller_admin.
+.. note::
 
-The trailing optional storage_url allows you to specify an alternate URL to
-hand back to the user upon authentication. If not specified, this defaults to::
+    The first part of proxy-server config section name must match the name of
+    the proxy-server config section. This is typically ``proxy-server`` as
+    shown above, but if different then the names of any per-policy config
+    sections must be changed accordingly.
 
-    $HOST/v1/<reseller_prefix>_<account>
+The value of an option specified in a per-policy section will override any
+value given in the proxy-server section for that policy only. Otherwise the
+value of these options will be that specified in the proxy-server section.
 
-Where $HOST will do its best to resolve to what the requester would need to use
-to reach this host, <reseller_prefix> is from this section, and <account> is
-from the user_<account>_<user> name. Note that $HOST cannot possibly handle
-when you have a load balancer in front of it that does https while TempAuth
-itself runs with http; in such a case, you'll have to specify the
-storage_url_scheme configuration value as an override.
+For example, the following section provides policy-specific options for a
+policy with index ``3``::
 
-Here are example entries, required for running the tests::
+    [proxy-server:policy:3]
+    sorting_method = affinity
+    read_affinity = r2=1
+    write_affinity = r2
+    write_affinity_node_count = 1 * replicas
+    write_affinity_handoff_delete_count = 2
 
-    user_admin_admin = admin .admin .reseller_admin
-    user_test_tester = testing .admin
-    user_test2_tester2 = testing2 .admin
-    user_test_tester3 = testing3
+.. note::
 
-    # account "test_y" and user "tester_y" (note the lack of padding = chars)
-    user64_dGVzdF95_dGVzdGVyX3k = testing4 .admin
+    It is recommended that per-policy config options are *not* included in the
+    ``[DEFAULT]`` section. If they are then the following behavior applies.
+
+    Per-policy config sections will inherit options in the ``[DEFAULT]``
+    section of the config file, and any such inheritance will take precedence
+    over inheriting options from the proxy-server config section.
+
+    Per-policy config section options will override options in the
+    ``[DEFAULT]`` section. Unlike the behavior described under `General Server
+    Configuration`_ for paste-deploy ``filter`` and ``app`` sections, the
+    ``set`` keyword is not required for options to override in per-policy
+    config sections.
+
+    For example, given the following settings in a config file::
+
+        [DEFAULT]
+        sorting_method = affinity
+        read_affinity = r0=100
+        write_affinity = r0
+
+        [app:proxy-server]
+        use = egg:swift#proxy
+        # use of set keyword here overrides [DEFAULT] option
+        set read_affinity = r1=100
+        # without set keyword, [DEFAULT] option overrides in a paste-deploy section
+        write_affinity = r1
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        # set keyword not required here to override [DEFAULT] option
+        write_affinity = r1
+
+    would result in policy with index ``0`` having settings:
+
+    * ``read_affinity = r0=100`` (inherited from the ``[DEFAULT]`` section)
+    * ``write_affinity = r1`` (specified in the policy 0 section)
+
+    and any other policy would have the default settings of:
+
+    * ``read_affinity = r1=100`` (set in the proxy-server section)
+    * ``write_affinity = r0`` (inherited from the ``[DEFAULT]`` section)
+
+*****************
+Proxy Middlewares
+*****************
+
+Many features in Swift are implemented as middleware in the proxy-server
+pipeline. See :doc:`middleware` and the ``proxy-server.conf-sample`` file for
+more information. In particular, the use of some type of :doc:`authentication
+and authorization middleware <overview_auth>` is highly recommended.
+
 
 ------------------------
 Memcached Considerations

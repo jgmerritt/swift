@@ -28,11 +28,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import hmac
 import itertools
 import mock
 import unittest
-from hashlib import sha1
+import hashlib
 from time import time, strftime, gmtime
 
 from swift.common.middleware import tempauth, tempurl
@@ -130,7 +131,7 @@ class TestTempURL(unittest.TestCase):
         if not environ:
             environ = {}
         environ['QUERY_STRING'] = 'temp_url_sig=%s&temp_url_expires=%s' % (
-            sig, expires)
+            sig.replace('+', '%2B'), expires)
         if prefix is not None:
             environ['QUERY_STRING'] += '&temp_url_prefix=%s' % prefix
         req = self._make_request(path, keys=keys, environ=environ)
@@ -151,8 +152,19 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         self.assert_valid_sig(expires, path, [key], sig)
+
+        sig = hmac.new(key, hmac_body, hashlib.sha256).hexdigest()
+        self.assert_valid_sig(expires, path, [key], sig)
+
+        sig = base64.b64encode(hmac.new(
+            key, hmac_body, hashlib.sha256).digest())
+        self.assert_valid_sig(expires, path, [key], 'sha256:' + sig)
+
+        sig = base64.b64encode(hmac.new(
+            key, hmac_body, hashlib.sha512).digest())
+        self.assert_valid_sig(expires, path, [key], 'sha512:' + sig)
 
     def test_get_valid_key2(self):
         method = 'GET'
@@ -161,8 +173,8 @@ class TestTempURL(unittest.TestCase):
         key1 = 'abc123'
         key2 = 'def456'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig1 = hmac.new(key1, hmac_body, sha1).hexdigest()
-        sig2 = hmac.new(key2, hmac_body, sha1).hexdigest()
+        sig1 = hmac.new(key1, hmac_body, hashlib.sha1).hexdigest()
+        sig2 = hmac.new(key2, hmac_body, hashlib.sha1).hexdigest()
         for sig in (sig1, sig2):
             self.assert_valid_sig(expires, path, [key1, key2], sig)
 
@@ -184,8 +196,8 @@ class TestTempURL(unittest.TestCase):
         key1 = 'me'
         key2 = 'other'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig1 = hmac.new(key1, hmac_body, sha1).hexdigest()
-        sig2 = hmac.new(key2, hmac_body, sha1).hexdigest()
+        sig1 = hmac.new(key1, hmac_body, hashlib.sha1).hexdigest()
+        sig2 = hmac.new(key2, hmac_body, hashlib.sha1).hexdigest()
         account_keys = []
         for sig in (sig1, sig2):
             self.assert_valid_sig(expires, path, account_keys, sig, environ)
@@ -197,7 +209,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
             'filename=bob%%20%%22killer%%22.txt' % (sig, expires)})
@@ -219,7 +231,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'REQUEST_METHOD': 'HEAD',
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
@@ -237,7 +249,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'REQUEST_METHOD': 'HEAD',
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s'
@@ -247,7 +259,7 @@ class TestTempURL(unittest.TestCase):
 
         get_method = 'GET'
         get_hmac_body = '%s\n%s\n%s' % (get_method, expires, path)
-        get_sig = hmac.new(key, get_hmac_body, sha1).hexdigest()
+        get_sig = hmac.new(key, get_hmac_body, hashlib.sha1).hexdigest()
         get_req = self._make_request(path, keys=[key], environ={
             'REQUEST_METHOD': 'GET',
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s'
@@ -263,7 +275,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
             'filename=bob%%20%%22killer%%22.txt&inline=' % (sig, expires)})
@@ -285,7 +297,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
             'inline=' % (sig, expires)})
@@ -305,13 +317,13 @@ class TestTempURL(unittest.TestCase):
         query_path = '/v1/a/c/' + prefix + 'o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, sig_path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         self.assert_valid_sig(expires, query_path, [key], sig, prefix=prefix)
 
         query_path = query_path[:-1] + 'p3/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, sig_path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         self.assert_valid_sig(expires, query_path, [key], sig, prefix=prefix)
 
     def test_get_valid_with_prefix_empty(self):
@@ -321,7 +333,7 @@ class TestTempURL(unittest.TestCase):
         query_path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, sig_path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         self.assert_valid_sig(expires, query_path, [key], sig, prefix='')
 
     def test_obj_odd_chars(self):
@@ -330,7 +342,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/a\r\nb'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
@@ -350,7 +362,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
@@ -370,7 +382,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o/'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
@@ -390,7 +402,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
             'filename=/i/want/this/just/as/it/is/' % (sig, expires)})
@@ -411,7 +423,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
@@ -429,7 +441,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'PUT',
@@ -437,8 +449,8 @@ class TestTempURL(unittest.TestCase):
                          sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_put_valid(self):
         method = 'PUT'
@@ -446,7 +458,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'PUT',
@@ -463,15 +475,15 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_missing_sig(self):
         method = 'GET'
@@ -479,14 +491,14 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        hmac.new(key, hmac_body, sha1).hexdigest()
+        hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_expires=%s' % expires})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_missing_expires(self):
         method = 'GET'
@@ -494,14 +506,14 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s' % sig})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_bad_path(self):
         method = 'GET'
@@ -509,15 +521,15 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_no_key(self):
         method = 'GET'
@@ -525,15 +537,15 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_head_allowed_by_get(self):
         method = 'GET'
@@ -541,7 +553,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'HEAD',
@@ -558,7 +570,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'HEAD',
@@ -575,7 +587,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'HEAD',
@@ -592,7 +604,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         # Deliberately fudge expires to show HEADs aren't just automatically
         # allowed.
         expires += 1
@@ -603,7 +615,7 @@ class TestTempURL(unittest.TestCase):
                          sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_post_when_forbidden_by_config(self):
         self.tempurl.conf['methods'].remove('POST')
@@ -612,7 +624,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'POST',
@@ -620,8 +632,8 @@ class TestTempURL(unittest.TestCase):
                          sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_delete_when_forbidden_by_config(self):
         self.tempurl.conf['methods'].remove('DELETE')
@@ -630,7 +642,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'DELETE',
@@ -638,8 +650,8 @@ class TestTempURL(unittest.TestCase):
                          sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_delete_allowed(self):
         method = 'DELETE'
@@ -647,7 +659,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'DELETE',
@@ -662,7 +674,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'REQUEST_METHOD': 'UNKNOWN',
@@ -670,8 +682,8 @@ class TestTempURL(unittest.TestCase):
                          sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_authorize_limits_scope(self):
         req_other_object = Request.blank("/v1/a/c/o2")
@@ -690,7 +702,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
 
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new('account-key', hmac_body, sha1).hexdigest()
+        sig = hmac.new('account-key', hmac_body, hashlib.sha1).hexdigest()
         qs = '?temp_url_sig=%s&temp_url_expires=%s' % (sig, expires)
 
         # make request will setup the environ cache for us
@@ -702,9 +714,9 @@ class TestTempURL(unittest.TestCase):
         # Requests for other objects happen if, for example, you're
         # downloading a large object or creating a large-object manifest.
         oo_resp = authorize(req_other_object)
-        self.assertEqual(oo_resp, None)
+        self.assertIsNone(oo_resp)
         oc_resp = authorize(req_other_container)
-        self.assertEqual(oc_resp, None)
+        self.assertIsNone(oc_resp)
         oa_resp = authorize(req_other_account)
         self.assertEqual(oa_resp.status_int, 401)
 
@@ -712,7 +724,7 @@ class TestTempURL(unittest.TestCase):
         # the container level; a different container in the same account is
         # out of scope and thus forbidden.
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new('container-key', hmac_body, sha1).hexdigest()
+        sig = hmac.new('container-key', hmac_body, hashlib.sha1).hexdigest()
         qs = '?temp_url_sig=%s&temp_url_expires=%s' % (sig, expires)
 
         req = self._make_request(path + qs, **key_kwargs)
@@ -721,7 +733,7 @@ class TestTempURL(unittest.TestCase):
 
         authorize = req.environ['swift.authorize']
         oo_resp = authorize(req_other_object)
-        self.assertEqual(oo_resp, None)
+        self.assertIsNone(oo_resp)
         oc_resp = authorize(req_other_container)
         self.assertEqual(oc_resp.status_int, 401)
         oa_resp = authorize(req_other_account)
@@ -733,7 +745,7 @@ class TestTempURL(unittest.TestCase):
         # account-level tempurls by reusing one of the account's keys on a
         # container.
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new('shared-key', hmac_body, sha1).hexdigest()
+        sig = hmac.new('shared-key', hmac_body, hashlib.sha1).hexdigest()
         qs = '?temp_url_sig=%s&temp_url_expires=%s' % (sig, expires)
 
         req = self._make_request(path + qs, **key_kwargs)
@@ -742,9 +754,9 @@ class TestTempURL(unittest.TestCase):
 
         authorize = req.environ['swift.authorize']
         oo_resp = authorize(req_other_object)
-        self.assertEqual(oo_resp, None)
+        self.assertIsNone(oo_resp)
         oc_resp = authorize(req_other_container)
-        self.assertEqual(oc_resp, None)
+        self.assertIsNone(oc_resp)
         oa_resp = authorize(req_other_account)
         self.assertEqual(oa_resp.status_int, 401)
 
@@ -754,15 +766,15 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path + '2', keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_changed_sig_invalid(self):
         method = 'GET'
@@ -770,7 +782,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         if sig[-1] != '0':
             sig = sig[:-1] + '0'
         else:
@@ -781,8 +793,8 @@ class TestTempURL(unittest.TestCase):
                 sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_changed_expires_invalid(self):
         method = 'GET'
@@ -790,15 +802,61 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
                 sig, expires + 1)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
+
+    def test_ip_range_value_error(self):
+        method = 'GET'
+        expires = int(time() + 86400)
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        not_an_ip = 'abcd'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(
+            path, keys=[key],
+            environ={
+                'QUERY_STRING':
+                'temp_url_sig=%s&temp_url_expires=%s&temp_url_ip_range=%s'
+                % (sig, expires, not_an_ip),
+                'REMOTE_ADDR': '127.0.0.1'
+            },
+        )
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 401)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
+
+    def test_bad_ip_range_invalid(self):
+        method = 'GET'
+        expires = int(time() + 86400)
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        bad_ip = '127.0.0.2'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(
+            path, keys=[key],
+            environ={
+                'QUERY_STRING':
+                'temp_url_sig=%s&temp_url_expires=%s&temp_url_ip_range=%s'
+                % (sig, expires, ip),
+                'REMOTE_ADDR': bad_ip
+            },
+        )
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 401)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_different_key_invalid(self):
         method = 'GET'
@@ -806,7 +864,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key + '2'],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
@@ -823,7 +881,7 @@ class TestTempURL(unittest.TestCase):
         query_path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, sig_path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             query_path, keys=[key],
             environ={'QUERY_STRING':
@@ -840,7 +898,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING':
@@ -848,8 +906,8 @@ class TestTempURL(unittest.TestCase):
                      (sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_disallowed_header_object_manifest(self):
         self.tempurl = tempurl.filter_factory({})(self.auth)
@@ -857,18 +915,21 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         for method in ('PUT', 'POST'):
-            hmac_body = '%s\n%s\n%s' % (method, expires, path)
-            sig = hmac.new(key, hmac_body, sha1).hexdigest()
-            req = self._make_request(
-                path, method=method, keys=[key],
-                headers={'x-object-manifest': 'private/secret'},
-                environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s'
-                                         % (sig, expires)})
-            resp = req.get_response(self.tempurl)
-            self.assertEqual(resp.status_int, 400)
-            self.assertTrue('header' in resp.body)
-            self.assertTrue('not allowed' in resp.body)
-            self.assertTrue('X-Object-Manifest' in resp.body)
+            for hdr, value in [('X-Object-Manifest', 'private/secret'),
+                               ('X-Symlink-Target', 'cont/symlink')]:
+                hmac_body = '%s\n%s\n%s' % (method, expires, path)
+                sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+                req = self._make_request(
+                    path, method=method, keys=[key],
+                    headers={hdr: value},
+                    environ={'QUERY_STRING':
+                             'temp_url_sig=%s&temp_url_expires=%s'
+                             % (sig, expires)})
+                resp = req.get_response(self.tempurl)
+                self.assertEqual(resp.status_int, 400)
+                self.assertTrue('header' in resp.body)
+                self.assertTrue('not allowed' in resp.body)
+                self.assertTrue(hdr in resp.body)
 
     def test_removed_incoming_header(self):
         self.tempurl = tempurl.filter_factory({
@@ -878,7 +939,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             headers={'x-remove-this': 'value'},
@@ -897,7 +958,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             headers={'x-remove-this-one': 'value1',
@@ -919,7 +980,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             headers={'x-conflict-header': 'value'},
@@ -938,7 +999,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             headers={'x-conflict-header-test': 'value'},
@@ -956,7 +1017,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
@@ -975,7 +1036,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             environ={'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
@@ -995,7 +1056,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             headers={},
@@ -1017,7 +1078,7 @@ class TestTempURL(unittest.TestCase):
         path = '/v1/a/c/o'
         key = 'abc'
         hmac_body = '%s\n%s\n%s' % (method, expires, path)
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
         req = self._make_request(
             path, keys=[key],
             headers={},
@@ -1076,67 +1137,96 @@ class TestTempURL(unittest.TestCase):
 
     def test_get_temp_url_info(self):
         s = 'f5d5051bddf5df7e27c628818738334f'
-        e = int(time() + 86400)
+        e_ts = int(time() + 86400)
+        e_8601 = strftime(tempurl.EXPIRES_ISO8601_FORMAT, gmtime(e_ts))
+        for e in (e_ts, e_8601):
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
+                        s, e)}),
+                (s, e_ts, None, None, None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING':
+                     'temp_url_sig=%s&temp_url_expires=%s&temp_url_prefix=%s'
+                     % (s, e, 'prefix')}),
+                (s, e_ts, 'prefix', None, None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+                     'filename=bobisyouruncle' % (s, e)}),
+                (s, e_ts, None, 'bobisyouruncle', None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info({}),
+                (None, None, None, None, None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_expires=%s' % e}),
+                (None, e_ts, None, None, None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s' % s}),
+                (s, None, None, None, None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=bad' % (
+                        s)}),
+                (s, 0, None, None, None, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+                     'inline=' % (s, e)}),
+                (s, e_ts, None, None, True, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+                     'filename=bobisyouruncle&inline=' % (s, e)}),
+                (s, e_ts, None, 'bobisyouruncle', True, None))
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+                     'filename=bobisyouruncle&inline='
+                     '&temp_url_ip_range=127.0.0.1' % (s, e)}),
+                (s, e_ts, None, 'bobisyouruncle', True, '127.0.0.1'))
+
+        e_ts = int(time() - 1)
+        e_8601 = strftime(tempurl.EXPIRES_ISO8601_FORMAT, gmtime(e_ts))
+        for e in (e_ts, e_8601):
+            self.assertEqual(
+                self.tempurl._get_temp_url_info(
+                    {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
+                        s, e)}),
+                (s, 0, None, None, None, None))
+        # Offsets not supported (yet?).
+        e_8601 = strftime('%Y-%m-%dT%H:%M:%S+0000', gmtime(e_ts))
         self.assertEqual(
             self.tempurl._get_temp_url_info(
                 {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
-                    s, e)}),
-            (s, e, None, None, None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING':
-                 'temp_url_sig=%s&temp_url_expires=%s&temp_url_prefix=%s' % (
-                     s, e, 'prefix')}),
-            (s, e, 'prefix', None, None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
-                 'filename=bobisyouruncle' % (s, e)}),
-            (s, e, None, 'bobisyouruncle', None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info({}),
-            (None, None, None, None, None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_expires=%s' % e}),
-            (None, e, None, None, None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_sig=%s' % s}),
-            (s, None, None, None, None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=bad' % (
-                    s)}),
-            (s, 0, None, None, None))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
-                 'inline=' % (s, e)}),
-            (s, e, None, None, True))
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
-                 'filename=bobisyouruncle&inline=' % (s, e)}),
-            (s, e, None, 'bobisyouruncle', True))
-        e = int(time() - 1)
-        self.assertEqual(
-            self.tempurl._get_temp_url_info(
-                {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s' % (
-                    s, e)}),
-            (s, 0, None, None, None))
+                    s, e_8601)}),
+            (s, 0, None, None, None, None))
 
     def test_get_hmacs(self):
         self.assertEqual(
             self.tempurl._get_hmacs(
                 {'REQUEST_METHOD': 'GET'}, 1, '/v1/a/c/o',
-                [('abc', 'account')]),
+                [('abc', 'account')], 'sha1'),
             [('026d7f7cc25256450423c7ad03fc9f5ffc1dab6d', 'account')])
         self.assertEqual(
             self.tempurl._get_hmacs(
                 {'REQUEST_METHOD': 'HEAD'}, 1, '/v1/a/c/o',
-                [('abc', 'account')], request_method='GET'),
-            [('026d7f7cc25256450423c7ad03fc9f5ffc1dab6d', 'account')])
+                [('abc', 'account')], 'sha512', request_method='GET'),
+            [('240866478d94bbe683ab1d25fba52c7d0df21a60951'
+              '4fe6a493dc30f951d2748abc51da0cbc633cd1e0acf'
+              '6fadd3af3aedff00ee3d3434dc6a4c423e74adfc4a', 'account')])
+        self.assertEqual(
+            self.tempurl._get_hmacs(
+                {'REQUEST_METHOD': 'HEAD'}, 1, '/v1/a/c/o',
+                [('abc', 'account')], 'sha512', request_method='GET',
+                ip_range='127.0.0.1'
+            ),
+            [('b713f99a66911cdf41dbcdff16db3efbd1ca89340a20'
+              '86cc2ed88f0d3a74c7159e7687a312b12345d3721b7b'
+              '94e36c2753d7cc01e9a91cc318c5081d788f2cfe', 'account')])
 
     def test_invalid(self):
 
@@ -1157,7 +1247,7 @@ class TestTempURL(unittest.TestCase):
             self.tempurl)
         self.assertEqual(resp.status_int, 401)
         self.assertNotIn('Temp URL invalid', resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Www-Authenticate', resp.headers)
         self.assertNotIn('swift.auth_scheme', environ)
 
         # Rejected by TempURL
@@ -1168,8 +1258,8 @@ class TestTempURL(unittest.TestCase):
                                  environ=environ)
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
-        self.assertTrue('Temp URL invalid' in resp.body)
-        self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_clean_incoming_headers(self):
         irh = []
@@ -1179,7 +1269,7 @@ class TestTempURL(unittest.TestCase):
             None, {'incoming_remove_headers': irh,
                    'incoming_allow_headers': iah}
         )._clean_incoming_headers(env)
-        self.assertTrue('HTTP_TEST_HEADER' in env)
+        self.assertIn('HTTP_TEST_HEADER', env)
 
         irh = ['test-header']
         iah = []
@@ -1210,7 +1300,7 @@ class TestTempURL(unittest.TestCase):
                    'incoming_allow_headers': iah}
         )._clean_incoming_headers(env)
         self.assertNotIn('HTTP_TEST_HEADER_ONE', env)
-        self.assertTrue('HTTP_TEST_HEADER_TWO' in env)
+        self.assertIn('HTTP_TEST_HEADER_TWO', env)
 
         irh = ['test-header-*', 'test-other-header']
         iah = ['test-header-two', 'test-header-yes-*']
@@ -1224,10 +1314,10 @@ class TestTempURL(unittest.TestCase):
                    'incoming_allow_headers': iah}
         )._clean_incoming_headers(env)
         self.assertNotIn('HTTP_TEST_HEADER_ONE', env)
-        self.assertTrue('HTTP_TEST_HEADER_TWO' in env)
+        self.assertIn('HTTP_TEST_HEADER_TWO', env)
         self.assertNotIn('HTTP_TEST_OTHER_HEADER', env)
         self.assertNotIn('HTTP_TEST_HEADER_YES', env)
-        self.assertTrue('HTTP_TEST_HEADER_YES_THIS' in env)
+        self.assertIn('HTTP_TEST_HEADER_YES_THIS', env)
 
     def test_clean_outgoing_headers(self):
         orh = []
@@ -1237,7 +1327,7 @@ class TestTempURL(unittest.TestCase):
             None,
             {'outgoing_remove_headers': orh, 'outgoing_allow_headers': oah}
         )._clean_outgoing_headers(hdrs.items()))
-        self.assertTrue('test-header' in hdrs)
+        self.assertIn('test-header', hdrs)
 
         orh = ['test-header']
         oah = []
@@ -1268,7 +1358,7 @@ class TestTempURL(unittest.TestCase):
             {'outgoing_remove_headers': orh, 'outgoing_allow_headers': oah}
         )._clean_outgoing_headers(hdrs.items()))
         self.assertNotIn('test-header-one', hdrs)
-        self.assertTrue('test-header-two' in hdrs)
+        self.assertIn('test-header-two', hdrs)
 
         orh = ['test-header-*', 'test-other-header']
         oah = ['test-header-two', 'test-header-yes-*']
@@ -1282,16 +1372,146 @@ class TestTempURL(unittest.TestCase):
             {'outgoing_remove_headers': orh, 'outgoing_allow_headers': oah}
         )._clean_outgoing_headers(hdrs.items()))
         self.assertNotIn('test-header-one', hdrs)
-        self.assertTrue('test-header-two' in hdrs)
+        self.assertIn('test-header-two', hdrs)
         self.assertNotIn('test-other-header', hdrs)
         self.assertNotIn('test-header-yes', hdrs)
-        self.assertTrue('test-header-yes-this' in hdrs)
+        self.assertIn('test-header-yes-this', hdrs)
 
     def test_unicode_metadata_value(self):
         meta = {"temp-url-key": "test", "temp-url-key-2": u"test2"}
         results = tempurl.get_tempurl_keys_from_metadata(meta)
         for str_value in results:
-            self.assertTrue(isinstance(str_value, str))
+            self.assertIsInstance(str_value, str)
+
+    @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
+    def test_get_valid_with_ip_range(self, mock_time):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip_range = '127.0.0.0/29'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip_range, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip_range),
+            'REMOTE_ADDR': '127.0.0.1'},
+        )
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        self.assertIn('expires', resp.headers)
+        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
+                         resp.headers['expires'])
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
+    def test_get_valid_with_ip_from_remote_addr(self, mock_time):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip),
+            'REMOTE_ADDR': ip},
+        )
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        self.assertIn('expires', resp.headers)
+        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
+                         resp.headers['expires'])
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    def test_get_valid_with_fake_ip_from_x_forwarded_for(self):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        remote_addr = '127.0.0.2'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip),
+            'REMOTE_ADDR': remote_addr},
+            headers={'x-forwarded-for': ip})
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 401)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
+
+    @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
+    def test_get_valid_with_single_ipv6(self, mock_time):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '2001:db8::'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip),
+            'REMOTE_ADDR': '2001:db8::'},
+        )
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        self.assertIn('expires', resp.headers)
+        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
+                         resp.headers['expires'])
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
+    def test_get_valid_with_ipv6_range(self, mock_time):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip_range = '2001:db8::/127'
+        hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip_range, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip_range),
+            'REMOTE_ADDR': '2001:db8::'},
+        )
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        self.assertIn('expires', resp.headers)
+        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
+                         resp.headers['expires'])
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    def test_get_valid_with_no_client_address(self):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        hmac_body = '%s\n%s\n%s\n%s' % (ip, method, expires, path)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip)},
+        )
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 401)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
 
 class TestSwiftInfo(unittest.TestCase):
@@ -1302,7 +1522,7 @@ class TestSwiftInfo(unittest.TestCase):
     def test_registered_defaults(self):
         tempurl.filter_factory({})
         swift_info = utils.get_swift_info()
-        self.assertTrue('tempurl' in swift_info)
+        self.assertIn('tempurl', swift_info)
         info = swift_info['tempurl']
         self.assertEqual(set(info['methods']),
                          set(('GET', 'HEAD', 'PUT', 'POST', 'DELETE')))
@@ -1313,6 +1533,7 @@ class TestSwiftInfo(unittest.TestCase):
                          set(('x-object-meta-*',)))
         self.assertEqual(set(info['outgoing_allow_headers']),
                          set(('x-object-meta-public-*',)))
+        self.assertEqual(info['allowed_digests'], ['sha1', 'sha256', 'sha512'])
 
     def test_non_default_methods(self):
         tempurl.filter_factory({
@@ -1321,9 +1542,10 @@ class TestSwiftInfo(unittest.TestCase):
             'incoming_allow_headers': 'x-timestamp x-versions-location',
             'outgoing_remove_headers': 'x-*',
             'outgoing_allow_headers': 'x-object-meta-* content-type',
+            'allowed_digests': 'sha512 md5 not-a-valid-digest',
         })
         swift_info = utils.get_swift_info()
-        self.assertTrue('tempurl' in swift_info)
+        self.assertIn('tempurl', swift_info)
         info = swift_info['tempurl']
         self.assertEqual(set(info['methods']),
                          set(('GET', 'HEAD', 'PUT', 'DELETE', 'BREW')))
@@ -1333,6 +1555,13 @@ class TestSwiftInfo(unittest.TestCase):
         self.assertEqual(set(info['outgoing_remove_headers']), set(('x-*', )))
         self.assertEqual(set(info['outgoing_allow_headers']),
                          set(('x-object-meta-*', 'content-type')))
+        self.assertEqual(info['allowed_digests'], ['sha512'])
+
+    def test_bad_config(self):
+        with self.assertRaises(ValueError):
+            tempurl.filter_factory({
+                'allowed_digests': 'md4',
+            })
 
 
 if __name__ == '__main__':

@@ -57,6 +57,8 @@ IP address the object server should bind to. The default is 0.0.0.0 which will m
 it bind to all available addresses.
 .IP "\fBbind_port\fR"
 TCP port the object server should bind to. The default is 6200.
+.IP "\fBkeep_idle\fR"
+Value to set for socket TCP_KEEPIDLE. The default value is 600.
 .IP "\fBbind_timeout\fR"
 Timeout to bind socket. The default is 30.
 .IP \fBbacklog\fR
@@ -142,6 +144,9 @@ backend node. The default is 60.
 The default is 65536.
 .IP \fBdisk_chunk_size\fR
 The default is 65536.
+.IP \fBreclaim_age\fR
+Time elapsed in seconds before an object can be reclaimed. The default is
+604800 seconds.
 .IP \fBnice_priority\fR
 Modify scheduling priority of server processes. Niceness values range from -20
 (most favorable to the process) to 19 (least favorable to the process).
@@ -208,12 +213,9 @@ On PUTs, sync data every n MB. The default is 512.
 .IP "\fBallowed_headers\fR"
 Comma separated list of headers that can be set in metadata on an object.
 This list is in addition to X-Object-Meta-* headers and cannot include Content-Type, etag, Content-Length, or deleted.
-The default is 'Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object'.
+The default is 'Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object, Cache-Control, Content-Language, Expires, X-Robots-Tag'.
 .IP "\fBauto_create_account_prefix\fR"
 The default is '.'.
-.IP "\fBthreads_per_disk\fR"
-A value of 0 means "don't use thread pools". A reasonable starting point is
-4. The default is 0.
 .IP "\fBreplication_server\fR"
 Configure parameter for creating specific server
 To handle all verbs, including replication verbs, do not specify
@@ -225,11 +227,12 @@ should not specify any value for "replication_server".
 Set to restrict the number of concurrent incoming SSYNC requests
 Set to 0 for unlimited (the default is 4). Note that SSYNC requests are only used
 by the object reconstructor or the object replicator when configured to use ssync.
-.IP "\fBreplication_one_per_device\fR"
-Restricts incoming SSYNC requests to one per device,
-replication_currency above allowing. This can help control I/O to each
-device, but you may wish to set this to False to allow multiple SSYNC
-requests (up to the above replication_concurrency setting) per device. The default is true.
+.IP "\fBreplication_concurrency_per_device\fR"
+Set to restrict the number of concurrent incoming SSYNC requests per device;
+set to 0 for unlimited requests per devices. This can help control I/O to each
+device. This does not override replication_concurrency described above, so you
+may need to adjust both parameters depending on your hardware or network
+capacity. Defaults to 1.
 .IP "\fBreplication_lock_timeout\fR"
 Number of seconds to wait for an existing replication device lock before
 giving up. The default is 15.
@@ -394,9 +397,6 @@ default is 1800 seconds.
 The default is 15.
 .IP \fBrsync_error_log_line_length\fR
 Limits how long rsync error log lines are. 0 (default) means to log the entire line.
-.IP \fBreclaim_age\fR
-Time elapsed in seconds before an object can be reclaimed. The default is
-604800 seconds.
 .IP "\fBrecon_cache_path\fR"
 The recon_cache_path simply sets the directory where stats for a few items will be stored.
 Depending on the method of deployment you may need to create this directory manually
@@ -468,9 +468,6 @@ Attempts to kill all workers if nothing replicates for lockup_timeout seconds. T
 default is 1800 seconds.
 .IP \fBring_check_interval\fR
 The default is 15.
-.IP \fBreclaim_age\fR
-Time elapsed in seconds before an object can be reclaimed. The default is
-604800 seconds.
 .IP "\fBrecon_cache_path\fR"
 The recon_cache_path simply sets the directory where stats for a few items will be stored.
 Depending on the method of deployment you may need to create this directory manually
@@ -500,11 +497,13 @@ Logging address. The default is /dev/log.
 .IP \fBinterval\fR
 Minimum time for a pass to take. The default is 300 seconds.
 .IP \fBconcurrency\fR
-Number of reaper workers to spawn. The default is 1.
+Number of updater workers to spawn. The default is 1.
 .IP \fBnode_timeout\fR
 Request timeout to external services. The default is 10 seconds.
+.IP \fBobjects_per_second\fR
+Maximum objects updated per second. Should be tuned according to individual system specs. 0 is unlimited. The default is 50.
 .IP \fBslowdown\fR
-Slowdown will sleep that amount between objects. The default is 0.01 seconds.
+Slowdown will sleep that amount between objects. The default is 0.01 seconds. Deprecated in favor of objects_per_second.
 .IP "\fBrecon_cache_path\fR"
 The recon_cache_path simply sets the directory where stats for a few items will be stored.
 Depending on the method of deployment you may need to create this directory manually
@@ -549,7 +548,7 @@ system specs. 0 is unlimited. The default is 20.
 Maximum bytes audited per second. Should be tuned according to individual
 system specs. 0 is unlimited. The default is 10000000.
 .IP \fBconcurrency\fR
-Number of reaper workers to spawn. The default is 1.
+Number of auditor workers to spawn. The default is 1.
 .IP \fBlog_time\fR
 The default is 3600 seconds.
 .IP \fBzero_byte_files_per_second\fR
@@ -588,9 +587,9 @@ Ignored if IOPRIO_CLASS_IDLE is set.
 .LP
 More in depth documentation about the swift-object-server and
 also OpenStack Swift as a whole can be found at
-.BI http://swift.openstack.org/admin_guide.html
+.BI https://docs.openstack.org/swift/latest/admin_guide.html
 and
-.BI http://swift.openstack.org
+.BI https://docs.openstack.org/swift/latest/
 
 
 .SH "SEE ALSO"

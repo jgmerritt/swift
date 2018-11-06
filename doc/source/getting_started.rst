@@ -6,7 +6,7 @@ Getting Started
 System Requirements
 -------------------
 
-Swift development currently targets Ubuntu Server 14.04, but should work on
+Swift development currently targets Ubuntu Server 16.04, but should work on
 most Linux platforms.
 
 Swift is written in Python and has these dependencies:
@@ -15,7 +15,7 @@ Swift is written in Python and has these dependencies:
 * rsync 3.0
 * The Python packages listed in `the requirements file <https://github.com/openstack/swift/blob/master/requirements.txt>`_
 * Testing additionally requires `the test dependencies <https://github.com/openstack/swift/blob/master/test-requirements.txt>`_
-* Testing requires `these distribution packages <https://github.com/openstack/swift/blob/master/other-requirements.txt>`_
+* Testing requires `these distribution packages <https://github.com/openstack/swift/blob/master/bindep.txt>`_
 
 There is no current support for Python 3.
 
@@ -35,11 +35,11 @@ following docs will be useful:
 CLI client and SDK library
 --------------------------
 
-There are many clients in the `ecosystem <http://docs.openstack.org/developer/swift/associated_projects.html#application-bindings>`_. The official CLI
+There are many clients in the :ref:`ecosystem <application-bindings>`. The official CLI
 and SDK is python-swiftclient.
 
 * `Source code <https://github.com/openstack/python-swiftclient>`_
-* `Python Package Index <https://pypi.python.org/pypi/python-swiftclient>`_
+* `Python Package Index <https://pypi.org/project/python-swiftclient>`_
 
 ----------
 Production

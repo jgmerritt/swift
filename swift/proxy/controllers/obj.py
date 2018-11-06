@@ -24,7 +24,6 @@
 #   These shenanigans are to ensure all related objects can be garbage
 # collected. We've seen objects hang around forever otherwise.
 
-import six
 from six.moves.urllib.parse import unquote
 
 import collections
@@ -65,7 +64,7 @@ from swift.common.http import (
 from swift.common.storage_policy import (POLICIES, REPL_POLICY, EC_POLICY,
                                          ECDriverError, PolicyError)
 from swift.proxy.controllers.base import Controller, delay_denial, \
-    cors_validation, ResumingGetter
+    cors_validation, ResumingGetter, update_headers
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
     HTTPServerError, HTTPServiceUnavailable, HTTPClientDisconnect, \
@@ -83,6 +82,46 @@ def check_content_type(req):
                 return HTTPBadRequest("Invalid Content-Type, "
                                       "swift_* is not a valid parameter name.")
     return None
+
+
+def num_container_updates(container_replicas, container_quorum,
+                          object_replicas, object_quorum):
+    """
+    We need to send container updates via enough object servers such
+    that, if the object PUT succeeds, then the container update is
+    durable (either it's synchronously updated or written to async
+    pendings).
+
+    Define:
+      Qc = the quorum size for the container ring
+      Qo = the quorum size for the object ring
+      Rc = the replica count for the container ring
+      Ro = the replica count (or EC N+K) for the object ring
+
+    A durable container update is one that's made it to at least Qc
+    nodes. To always be durable, we have to send enough container
+    updates so that, if only Qo object PUTs succeed, and all the
+    failed object PUTs had container updates, at least Qc updates
+    remain. Since (Ro - Qo) object PUTs may fail, we must have at
+    least Qc + Ro - Qo container updates to ensure that Qc of them
+    remain.
+
+    Also, each container replica is named in at least one object PUT
+    request so that, when all requests succeed, no work is generated
+    for the container replicator. Thus, at least Rc updates are
+    necessary.
+
+    :param container_replicas: replica count for the container ring (Rc)
+    :param container_quorum: quorum size for the container ring (Qc)
+    :param object_replicas: replica count for the object ring (Ro)
+    :param object_quorum: quorum size for the object ring (Qo)
+
+    """
+    return max(
+        # Qc + Ro - Qo
+        container_quorum + object_replicas - object_quorum,
+        # Rc
+        container_replicas)
 
 
 class ObjectControllerRouter(object):
@@ -111,11 +150,11 @@ class ObjectControllerRouter(object):
     def __init__(self):
         self.policy_to_controller_cls = {}
         for policy in POLICIES:
-            self.policy_to_controller_cls[policy] = \
+            self.policy_to_controller_cls[int(policy)] = \
                 self.policy_type_to_controller_map[policy.policy_type]
 
     def __getitem__(self, policy):
-        return self.policy_to_controller_cls[policy]
+        return self.policy_to_controller_cls[int(policy)]
 
 
 class BaseObjectController(Controller):
@@ -124,12 +163,13 @@ class BaseObjectController(Controller):
 
     def __init__(self, app, account_name, container_name, object_name,
                  **kwargs):
-        Controller.__init__(self, app)
+        super(BaseObjectController, self).__init__(app)
         self.account_name = unquote(account_name)
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
 
-    def iter_nodes_local_first(self, ring, partition):
+    def iter_nodes_local_first(self, ring, partition, policy=None,
+                               local_handoffs_first=False):
         """
         Yields nodes for a ring partition.
 
@@ -142,30 +182,49 @@ class BaseObjectController(Controller):
 
         :param ring: ring to get nodes from
         :param partition: ring partition to yield nodes for
+        :param policy: optional, an instance of
+            :class:`~swift.common.storage_policy.BaseStoragePolicy`
+        :param local_handoffs_first: optional, if True prefer primaries and
+            local handoff nodes first before looking elsewhere.
         """
-
-        is_local = self.app.write_affinity_is_local_fn
+        policy_options = self.app.get_policy_options(policy)
+        is_local = policy_options.write_affinity_is_local_fn
         if is_local is None:
-            return self.app.iter_nodes(ring, partition)
+            return self.app.iter_nodes(ring, partition, policy=policy)
 
         primary_nodes = ring.get_part_nodes(partition)
-        num_locals = self.app.write_affinity_node_count(len(primary_nodes))
+        handoff_nodes = ring.get_more_nodes(partition)
+        all_nodes = itertools.chain(primary_nodes, handoff_nodes)
 
-        all_nodes = itertools.chain(primary_nodes,
-                                    ring.get_more_nodes(partition))
-        first_n_local_nodes = list(itertools.islice(
-            six.moves.filter(is_local, all_nodes), num_locals))
+        if local_handoffs_first:
+            num_locals = policy_options.write_affinity_handoff_delete_count
+            if num_locals is None:
+                local_primaries = [node for node in primary_nodes
+                                   if is_local(node)]
+                num_locals = len(primary_nodes) - len(local_primaries)
 
-        # refresh it; it moved when we computed first_n_local_nodes
-        all_nodes = itertools.chain(primary_nodes,
-                                    ring.get_more_nodes(partition))
-        local_first_node_iter = itertools.chain(
-            first_n_local_nodes,
-            six.moves.filter(lambda node: node not in first_n_local_nodes,
-                             all_nodes))
+            first_local_handoffs = list(itertools.islice(
+                (node for node in handoff_nodes if is_local(node)), num_locals)
+            )
+            preferred_nodes = primary_nodes + first_local_handoffs
+        else:
+            num_locals = policy_options.write_affinity_node_count_fn(
+                len(primary_nodes)
+            )
+            preferred_nodes = list(itertools.islice(
+                (node for node in all_nodes if is_local(node)), num_locals)
+            )
+            # refresh it; it moved when we computed preferred_nodes
+            handoff_nodes = ring.get_more_nodes(partition)
+            all_nodes = itertools.chain(primary_nodes, handoff_nodes)
 
-        return self.app.iter_nodes(
-            ring, partition, node_iter=local_first_node_iter)
+        node_iter = itertools.chain(
+            preferred_nodes,
+            (node for node in all_nodes if node not in preferred_nodes)
+        )
+
+        return self.app.iter_nodes(ring, partition, node_iter=node_iter,
+                                   policy=policy)
 
     def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
@@ -184,7 +243,7 @@ class BaseObjectController(Controller):
                 return aresp
         partition = obj_ring.get_part(
             self.account_name, self.container_name, self.object_name)
-        node_iter = self.app.iter_nodes(obj_ring, partition)
+        node_iter = self.app.iter_nodes(obj_ring, partition, policy=policy)
 
         resp = self._get_or_head_response(req, node_iter, partition, policy)
 
@@ -207,6 +266,20 @@ class BaseObjectController(Controller):
         """Handler for HTTP HEAD requests."""
         return self.GETorHEAD(req)
 
+    def _get_update_target(self, req, container_info):
+        # find the sharded container to which we'll send the update
+        db_state = container_info.get('sharding_state', 'unsharded')
+        if db_state in ('sharded', 'sharding'):
+            shard_ranges = self._get_shard_ranges(
+                req, self.account_name, self.container_name,
+                includes=self.object_name, states='updating')
+            if shard_ranges:
+                partition, nodes = self.app.container_ring.get_nodes(
+                    shard_ranges[0].account, shard_ranges[0].container)
+                return partition, nodes, shard_ranges[0].name
+
+        return container_info['partition'], container_info['nodes'], None
+
     @public
     @cors_validation
     @delay_denial
@@ -214,8 +287,8 @@ class BaseObjectController(Controller):
         """HTTP POST request handler."""
         container_info = self.container_info(
             self.account_name, self.container_name, req)
-        container_partition = container_info['partition']
-        container_nodes = container_info['nodes']
+        container_partition, container_nodes, container_path = \
+            self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
@@ -227,6 +300,8 @@ class BaseObjectController(Controller):
         if error_response:
             return error_response
 
+        req.headers['X-Timestamp'] = Timestamp.now().internal
+
         req, delete_at_container, delete_at_part, \
             delete_at_nodes = self._config_obj_expiration(req)
 
@@ -235,20 +310,22 @@ class BaseObjectController(Controller):
                                        container_info['storage_policy'])
         obj_ring = self.app.get_object_ring(policy_index)
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        next_part_power = getattr(obj_ring, 'next_part_power', None)
+        if next_part_power:
+            req.headers['X-Backend-Next-Part-Power'] = next_part_power
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 
-        req.headers['X-Timestamp'] = Timestamp(time.time()).internal
-
         headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
-            delete_at_container, delete_at_part, delete_at_nodes)
+            delete_at_container, delete_at_part, delete_at_nodes,
+            container_path=container_path)
         return self._post_object(req, obj_ring, partition, headers)
 
     def _backend_requests(self, req, n_outgoing,
                           container_partition, containers,
                           delete_at_container=None, delete_at_partition=None,
-                          delete_at_nodes=None):
+                          delete_at_nodes=None, container_path=None):
         policy_index = req.headers['X-Backend-Storage-Policy-Index']
         policy = POLICIES.get_by_index(policy_index)
         headers = [self.generate_request_headers(req, additional=req.headers)
@@ -262,32 +339,58 @@ class BaseObjectController(Controller):
             headers[index]['X-Container-Device'] = csv_append(
                 headers[index].get('X-Container-Device'),
                 container['device'])
+            if container_path:
+                headers[index]['X-Backend-Container-Path'] = container_path
 
-        for i, container in enumerate(containers):
-            i = i % len(headers)
-            set_container_update(i, container)
+        def set_delete_at_headers(index, delete_at_node):
+            headers[index]['X-Delete-At-Container'] = delete_at_container
+            headers[index]['X-Delete-At-Partition'] = delete_at_partition
+            headers[index]['X-Delete-At-Host'] = csv_append(
+                headers[index].get('X-Delete-At-Host'),
+                '%(ip)s:%(port)s' % delete_at_node)
+            headers[index]['X-Delete-At-Device'] = csv_append(
+                headers[index].get('X-Delete-At-Device'),
+                delete_at_node['device'])
 
-        # if # of container_updates is not enough against # of replicas
-        # (or fragments). Fill them like as pigeon hole problem.
-        # TODO?: apply these to X-Delete-At-Container?
-        n_updates_needed = min(policy.quorum + 1, n_outgoing)
+        n_updates_needed = num_container_updates(
+            len(containers), quorum_size(len(containers)),
+            n_outgoing, policy.quorum)
+
         container_iter = itertools.cycle(containers)
-        existing_updates = len(containers)
+        dan_iter = itertools.cycle(delete_at_nodes or [])
+        existing_updates = 0
         while existing_updates < n_updates_needed:
-            set_container_update(existing_updates, next(container_iter))
+            index = existing_updates % n_outgoing
+            set_container_update(index, next(container_iter))
+            if delete_at_nodes:
+                # We reverse the index in order to distribute the updates
+                # across all nodes.
+                set_delete_at_headers(n_outgoing - 1 - index, next(dan_iter))
             existing_updates += 1
 
-        for i, node in enumerate(delete_at_nodes or []):
-            i = i % len(headers)
-
-            headers[i]['X-Delete-At-Container'] = delete_at_container
-            headers[i]['X-Delete-At-Partition'] = delete_at_partition
-            headers[i]['X-Delete-At-Host'] = csv_append(
-                headers[i].get('X-Delete-At-Host'),
-                '%(ip)s:%(port)s' % node)
-            headers[i]['X-Delete-At-Device'] = csv_append(
-                headers[i].get('X-Delete-At-Device'),
-                node['device'])
+        # Keep the number of expirer-queue deletes to a reasonable number.
+        #
+        # In the best case, at least one object server writes out an
+        # async_pending for an expirer-queue update. In the worst case, no
+        # object server does so, and an expirer-queue row remains that
+        # refers to an already-deleted object. In this case, upon attempting
+        # to delete the object, the object expirer will notice that the
+        # object does not exist and then remove the row from the expirer
+        # queue.
+        #
+        # In other words: expirer-queue updates on object DELETE are nice to
+        # have, but not strictly necessary for correct operation.
+        #
+        # Also, each queue update results in an async_pending record, which
+        # causes the object updater to talk to all container servers. If we
+        # have N async_pendings and Rc container replicas, we cause N * Rc
+        # requests from object updaters to container servers (possibly more,
+        # depending on retries). Thus, it is helpful to keep this number
+        # small.
+        n_desired_queue_updates = 2
+        for i in range(len(headers)):
+            headers[i].setdefault('X-Backend-Clean-Expiring-Object-Queue',
+                                  't' if i < n_desired_queue_updates else 'f')
 
         return headers
 
@@ -434,7 +537,9 @@ class BaseObjectController(Controller):
                 req.headers.pop('x-detect-content-type')
 
     def _update_x_timestamp(self, req):
-        # Used by container sync feature
+        # The container sync feature includes an x-timestamp header with
+        # requests. If present this is checked and preserved, otherwise a fresh
+        # timestamp is added.
         if 'x-timestamp' in req.headers:
             try:
                 req_timestamp = Timestamp(req.headers['X-Timestamp'])
@@ -445,7 +550,7 @@ class BaseObjectController(Controller):
                          'was %r' % req.headers['x-timestamp'])
             req.headers['X-Timestamp'] = req_timestamp.internal
         else:
-            req.headers['X-Timestamp'] = Timestamp(time.time()).internal
+            req.headers['X-Timestamp'] = Timestamp.now().internal
         return None
 
     def _check_failure_put_connections(self, putters, req, min_conns):
@@ -541,13 +646,16 @@ class BaseObjectController(Controller):
         """
         obj_ring = policy.object_ring
         node_iter = GreenthreadSafeIterator(
-            self.iter_nodes_local_first(obj_ring, partition))
+            self.iter_nodes_local_first(obj_ring, partition, policy=policy))
         pile = GreenPile(len(nodes))
 
         for nheaders in outgoing_headers:
-            # RFC2616:8.2.3 disallows 100-continue without a body
-            if (req.content_length > 0) or req.is_chunked:
-                nheaders['Expect'] = '100-continue'
+            # RFC2616:8.2.3 disallows 100-continue without a body,
+            # so switch to chunked request
+            if nheaders.get('Content-Length') == '0':
+                nheaders['Transfer-Encoding'] = 'chunked'
+                del nheaders['Content-Length']
+            nheaders['Expect'] = '100-continue'
             pile.spawn(self._connect_put_node, node_iter, partition,
                        req, nheaders, self.app.logger.thread_locals)
 
@@ -590,10 +698,12 @@ class BaseObjectController(Controller):
         raise NotImplementedError()
 
     def _delete_object(self, req, obj_ring, partition, headers):
-        """
-        send object DELETE request to storage nodes. Subclasses of
-        the BaseObjectController can provide their own implementation
-        of this method.
+        """Delete object considering write-affinity.
+
+        When deleting object in write affinity deployment, also take configured
+        handoff nodes number into consideration, instead of just sending
+        requests to primary nodes. Otherwise (write-affinity is disabled),
+        go with the same way as before.
 
         :param req: the DELETE Request
         :param obj_ring: the object ring
@@ -601,11 +711,37 @@ class BaseObjectController(Controller):
         :param headers: system headers to storage nodes
         :return: Response object
         """
-        # When deleting objects treat a 404 status as 204.
+        policy_index = req.headers.get('X-Backend-Storage-Policy-Index')
+        policy = POLICIES.get_by_index(policy_index)
+
+        node_count = None
+        node_iterator = None
+
+        policy_options = self.app.get_policy_options(policy)
+        is_local = policy_options.write_affinity_is_local_fn
+        if is_local is not None:
+            primaries = obj_ring.get_part_nodes(partition)
+            node_count = len(primaries)
+
+            local_handoffs = policy_options.write_affinity_handoff_delete_count
+            if local_handoffs is None:
+                local_primaries = [node for node in primaries
+                                   if is_local(node)]
+                local_handoffs = len(primaries) - len(local_primaries)
+
+            node_count += local_handoffs
+
+            node_iterator = self.iter_nodes_local_first(
+                obj_ring, partition, policy=policy, local_handoffs_first=True
+            )
+
         status_overrides = {404: 204}
         resp = self.make_requests(req, obj_ring,
                                   partition, 'DELETE', req.swift_entity_path,
-                                  headers, overrides=status_overrides)
+                                  headers, overrides=status_overrides,
+                                  node_count=node_count,
+                                  node_iterator=node_iterator)
+
         return resp
 
     def _post_object(self, req, obj_ring, partition, headers):
@@ -636,13 +772,16 @@ class BaseObjectController(Controller):
         policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                        container_info['storage_policy'])
         obj_ring = self.app.get_object_ring(policy_index)
-        container_nodes = container_info['nodes']
-        container_partition = container_info['partition']
+        container_partition, container_nodes, container_path = \
+            self._get_update_target(req, container_info)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
+        next_part_power = getattr(obj_ring, 'next_part_power', None)
+        if next_part_power:
+            req.headers['X-Backend-Next-Part-Power'] = next_part_power
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
 
@@ -658,13 +797,13 @@ class BaseObjectController(Controller):
         # update content type in case it is missing
         self._update_content_type(req)
 
+        self._update_x_timestamp(req)
+
         # check constraints on object name and request headers
         error_response = check_object_creation(req, self.object_name) or \
             check_content_type(req)
         if error_response:
             return error_response
-
-        self._update_x_timestamp(req)
 
         def reader():
             try:
@@ -681,7 +820,8 @@ class BaseObjectController(Controller):
         # add special headers to be handled by storage nodes
         outgoing_headers = self._backend_requests(
             req, len(nodes), container_partition, container_nodes,
-            delete_at_container, delete_at_part, delete_at_nodes)
+            delete_at_container, delete_at_part, delete_at_nodes,
+            container_path=container_path)
 
         # send object to storage nodes
         resp = self._store_object(
@@ -701,8 +841,11 @@ class BaseObjectController(Controller):
         obj_ring = self.app.get_object_ring(policy_index)
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
-        container_partition = container_info['partition']
-        container_nodes = container_info['nodes']
+        next_part_power = getattr(obj_ring, 'next_part_power', None)
+        if next_part_power:
+            req.headers['X-Backend-Next-Part-Power'] = next_part_power
+        container_partition, container_nodes, container_path = \
+            self._get_update_target(req, container_info)
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
         if 'swift.authorize' in req.environ:
@@ -713,21 +856,24 @@ class BaseObjectController(Controller):
             return HTTPNotFound(request=req)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
-        # Used by container sync feature
-        if 'x-timestamp' in req.headers:
-            try:
-                req_timestamp = Timestamp(req.headers['X-Timestamp'])
-            except ValueError:
-                return HTTPBadRequest(
-                    request=req, content_type='text/plain',
-                    body='X-Timestamp should be a UNIX timestamp float value; '
-                         'was %r' % req.headers['x-timestamp'])
-            req.headers['X-Timestamp'] = req_timestamp.internal
-        else:
-            req.headers['X-Timestamp'] = Timestamp(time.time()).internal
+
+        self._update_x_timestamp(req)
+
+        # Include local handoff nodes if write-affinity is enabled.
+        node_count = len(nodes)
+        policy = POLICIES.get_by_index(policy_index)
+        policy_options = self.app.get_policy_options(policy)
+        is_local = policy_options.write_affinity_is_local_fn
+        if is_local is not None:
+            local_handoffs = policy_options.write_affinity_handoff_delete_count
+            if local_handoffs is None:
+                local_primaries = [node for node in nodes if is_local(node)]
+                local_handoffs = len(nodes) - len(local_primaries)
+            node_count += local_handoffs
 
         headers = self._backend_requests(
-            req, len(nodes), container_partition, container_nodes)
+            req, node_count, container_partition, container_nodes,
+            container_path=container_path)
         return self._delete_object(req, obj_ring, partition, headers)
 
 
@@ -751,12 +897,13 @@ class ReplicatedObjectController(BaseObjectController):
                 logger=self.app.logger,
                 need_multiphase=False)
         else:
+            te = ',' + headers.get('Transfer-Encoding', '')
             putter = Putter.connect(
                 node, part, req.swift_entity_path, headers,
                 conn_timeout=self.app.conn_timeout,
                 node_timeout=self.app.node_timeout,
                 logger=self.app.logger,
-                chunked=req.is_chunked)
+                chunked=te.endswith(',chunked'))
         return putter
 
     def _transfer_data(self, req, data_source, putters, nodes):
@@ -951,11 +1098,15 @@ class ECAppIter(object):
         can also use it in the body.
 
         :returns: None
-        :raises: HTTPException on error
+        :raises HTTPException: on error
         """
         self.mime_boundary = resp.boundary
 
-        self.stashed_iter = reiterate(self._real_iter(req, resp.headers))
+        try:
+            self.stashed_iter = reiterate(self._real_iter(req, resp.headers))
+        except Exception:
+            self.close()
+            raise
 
         if self.learned_content_type is not None:
             resp.content_type = self.learned_content_type
@@ -975,20 +1126,30 @@ class ECAppIter(object):
         return headers, frag_iters
 
     def _actual_range(self, req_start, req_end, entity_length):
+        # Takes 3 args: (requested-first-byte, requested-last-byte,
+        # actual-length).
+        #
+        # Returns a 3-tuple (first-byte, last-byte, satisfiable).
+        #
+        # It is possible to get (None, None, True). This means that the last
+        # N>0 bytes of a 0-byte object were requested, and we are able to
+        # satisfy that request by returning nothing.
         try:
             rng = Range("bytes=%s-%s" % (
                 req_start if req_start is not None else '',
                 req_end if req_end is not None else ''))
         except ValueError:
-            return (None, None)
+            return (None, None, False)
 
         rfl = rng.ranges_for_length(entity_length)
-        if not rfl:
-            return (None, None)
+        if rfl and entity_length == 0:
+            return (None, None, True)
+        elif not rfl:
+            return (None, None, False)
         else:
             # ranges_for_length() adds 1 to the last byte's position
             # because webob once made a mistake
-            return (rfl[0][0], rfl[0][1] - 1)
+            return (rfl[0][0], rfl[0][1] - 1, True)
 
     def _fill_out_range_specs_from_obj_length(self, range_specs):
         # Add a few fields to each range spec:
@@ -1015,21 +1176,23 @@ class ECAppIter(object):
         # _fill_out_range_specs_from_fa_length() requires the beginnings of
         # the response bodies.
         for spec in range_specs:
-            cstart, cend = self._actual_range(
+            cstart, cend, csat = self._actual_range(
                 spec['req_client_start'],
                 spec['req_client_end'],
                 self.obj_length)
             spec['resp_client_start'] = cstart
             spec['resp_client_end'] = cend
-            spec['satisfiable'] = (cstart is not None and cend is not None)
+            spec['satisfiable'] = csat
 
-            sstart, send = self._actual_range(
+            sstart, send, _junk = self._actual_range(
                 spec['req_segment_start'],
                 spec['req_segment_end'],
                 self.obj_length)
 
             seg_size = self.policy.ec_segment_size
-            if spec['req_segment_start'] is None and sstart % seg_size != 0:
+            if (spec['req_segment_start'] is None and
+                    sstart is not None and
+                    sstart % seg_size != 0):
                 # Segment start may, in the case of a suffix request, need
                 # to be rounded up (not down!) to the nearest segment boundary.
                 # This reflects the trimming of leading garbage (partial
@@ -1051,7 +1214,7 @@ class ECAppIter(object):
         # are omitted from the response entirely and also to put the right
         # Content-Range headers in a multipart/byteranges response.
         for spec in range_specs:
-            fstart, fend = self._actual_range(
+            fstart, fend, _junk = self._actual_range(
                 spec['req_fragment_start'],
                 spec['req_fragment_end'],
                 fa_length)
@@ -1213,16 +1376,21 @@ class ECAppIter(object):
         client_end = (min(client_end, self.obj_length - 1)
                       if client_end is not None
                       else self.obj_length - 1)
-        num_segments = int(
-            math.ceil(float(segment_end + 1 - segment_start)
-                      / self.policy.ec_segment_size))
-        # We get full segments here, but the client may have requested a
-        # byte range that begins or ends in the middle of a segment.
-        # Thus, we have some amount of overrun (extra decoded bytes)
-        # that we trim off so the client gets exactly what they
-        # requested.
-        start_overrun = client_start - segment_start
-        end_overrun = segment_end - client_end
+        if segment_start is None:
+            num_segments = 0
+            start_overrun = 0
+            end_overrun = 0
+        else:
+            num_segments = int(
+                math.ceil(float(segment_end + 1 - segment_start)
+                          / self.policy.ec_segment_size))
+            # We get full segments here, but the client may have requested a
+            # byte range that begins or ends in the middle of a segment.
+            # Thus, we have some amount of overrun (extra decoded bytes)
+            # that we trim off so the client gets exactly what they
+            # requested.
+            start_overrun = client_start - segment_start
+            end_overrun = segment_end - client_end
 
         for i, next_seg in enumerate(segment_iter):
             # We may have a start_overrun of more than one segment in
@@ -1469,7 +1637,7 @@ class Putter(object):
         :param informational: if True then try to get a 100-continue response,
                               otherwise try to get a final response.
         :returns: HTTPResponse
-        :raises: Timeout if the response took too long
+        :raises Timeout: if the response took too long
         """
         # don't do this update of self.resp if the Expect response during
         # connect() was actually a final response
@@ -1588,10 +1756,10 @@ class Putter(object):
 
         :returns: Putter instance
 
-        :raises: ConnectionTimeout if initial connection timed out
-        :raises: ResponseTimeout if header retrieval timed out
-        :raises: InsufficientStorage on 507 response from node
-        :raises: PutterConnectError on non-507 server error response from node
+        :raises ConnectionTimeout: if initial connection timed out
+        :raises ResponseTimeout: if header retrieval timed out
+        :raises InsufficientStorage: on 507 response from node
+        :raises PutterConnectError: on non-507 server error response from node
         """
         conn, expect_resp, final_resp, connect_duration = cls._make_connection(
             node, part, path, headers, conn_timeout, node_timeout)
@@ -1701,9 +1869,9 @@ class MIMEPutter(Putter):
 
         :param need_multiphase: if True then multiphase support is required of
                                 the object server
-        :raises: FooterNotSupported if need_metadata_footer is set but
+        :raises FooterNotSupported: if need_metadata_footer is set but
                  backend node can't process footers
-        :raises: MultiphasePUTNotSupported if need_multiphase is set but
+        :raises MultiphasePUTNotSupported: if need_multiphase is set but
                  backend node can't handle multiphase PUT
         """
         mime_boundary = "%.64x" % random.randint(0, 16 ** 64)
@@ -1747,7 +1915,12 @@ class MIMEPutter(Putter):
                    mime_boundary, multiphase=need_multiphase)
 
 
-def chunk_transformer(policy, nstreams):
+def chunk_transformer(policy):
+    """
+    A generator to transform a source chunk to erasure coded chunks for each
+    `send` call. The number of erasure coded chunks is as
+    policy.ec_n_unique_fragments.
+    """
     segment_size = policy.ec_segment_size
 
     buf = collections.deque()
@@ -1803,7 +1976,7 @@ def chunk_transformer(policy, nstreams):
         last_frags = policy.pyeclib_driver.encode(last_bytes)
         yield last_frags
     else:
-        yield [''] * nstreams
+        yield [''] * policy.ec_n_unique_fragments
 
 
 def trailing_metadata(policy, client_obj_hasher,
@@ -2010,7 +2183,7 @@ class ECGetResponseCollection(object):
         Return the best bucket in the collection.
 
         The "best" bucket is the newest timestamp with sufficient getters, or
-        the closest to having a sufficient getters, unless it is bettered by a
+        the closest to having sufficient getters, unless it is bettered by a
         bucket with potential alternate nodes.
 
         :return: An instance of :class:`~ECGetResponseBucket` or None if there
@@ -2130,7 +2303,7 @@ class ECObjectController(BaseObjectController):
         for client_start, client_end in req.range.ranges:
             # TODO: coalesce ranges that overlap segments. For
             # example, "bytes=0-10,20-30,40-50" with a 64 KiB
-            # segment size will result in a a Range header in the
+            # segment size will result in a Range header in the
             # object request of "bytes=0-65535,0-65535,0-65535",
             # which is wasteful. We should be smarter and only
             # request that first segment once.
@@ -2178,6 +2351,7 @@ class ECObjectController(BaseObjectController):
             range_specs = self._convert_range(req, policy)
 
         safe_iter = GreenthreadSafeIterator(node_iter)
+
         # Sending the request concurrently to all nodes, and responding
         # with the first response isn't something useful for EC as all
         # nodes contain different fragments. Also EC has implemented it's
@@ -2204,8 +2378,11 @@ class ECObjectController(BaseObjectController):
             # getters in case some unforeseen scenario, or a misbehaving object
             # server, causes us to otherwise make endless requests e.g. if an
             # object server were to ignore frag_prefs and always respond with
-            # a frag that is already in a bucket.
-            max_extra_requests = 2 * policy.ec_nparity + policy.ec_ndata
+            # a frag that is already in a bucket. Now we're assuming it should
+            # be limit at most 2 * replicas.
+            max_extra_requests = (
+                (policy.object_ring.replica_count * 2) - policy.ec_ndata)
+
             for get, parts_iter in pile:
                 if get.last_status is None:
                     # We may have spawned getters that find the node iterator
@@ -2263,9 +2440,9 @@ class ECObjectController(BaseObjectController):
                 self.app.logger)
             resp = Response(
                 request=req,
-                headers=resp_headers,
                 conditional_response=True,
                 app_iter=app_iter)
+            update_headers(resp, resp_headers)
             try:
                 app_iter.kickoff(req, resp)
             except HTTPException as err_resp:
@@ -2322,27 +2499,32 @@ class ECObjectController(BaseObjectController):
             logger=self.app.logger,
             need_multiphase=True)
 
-    def _determine_chunk_destinations(self, putters):
+    def _determine_chunk_destinations(self, putters, policy):
         """
         Given a list of putters, return a dict where the key is the putter
-        and the value is the node index to use.
+        and the value is the frag index to use.
 
-        This is done so that we line up handoffs using the same node index
+        This is done so that we line up handoffs using the same frag index
         (in the primary part list) as the primary that the handoff is standing
         in for.  This lets erasure-code fragment archives wind up on the
         preferred local primary nodes when possible.
+
+        :param putters: a list of swift.proxy.controllers.obj.MIMEPutter
+                        instance
+        :param policy: A policy instance which should be one of ECStoragePolicy
         """
-        # Give each putter a "chunk index": the index of the
+        # Give each putter a "frag index": the index of the
         # transformed chunk that we'll send to it.
         #
         # For primary nodes, that's just its index (primary 0 gets
         # chunk 0, primary 1 gets chunk 1, and so on). For handoffs,
         # we assign the chunk index of a missing primary.
         handoff_conns = []
-        chunk_index = {}
+        putter_to_frag_index = {}
         for p in putters:
             if p.node_index is not None:
-                chunk_index[p] = p.node_index
+                putter_to_frag_index[p] = policy.get_backend_index(
+                    p.node_index)
             else:
                 handoff_conns.append(p)
 
@@ -2351,12 +2533,35 @@ class ECObjectController(BaseObjectController):
         # nodes. Holes occur when a storage node is down, in which
         # case the connection is not replaced, and when a storage node
         # returns 507, in which case a handoff is used to replace it.
-        holes = [x for x in range(len(putters))
-                 if x not in chunk_index.values()]
 
+        # lack_list is a dict of list to keep hole indexes
+        # e.g. if we have 2 holes for frag index 0 with ec_duplication_factor=2
+        # lack_list is like {0: [0], 1: [0]}, and then, if 1 hole found
+        # for frag index 1, lack_list will be {0: [0, 1], 1: [0]}.
+        # After that, holes will be filled from bigger key
+        # (i.e. 1:[0] at first)
+
+        # Grouping all missing fragment indexes for each frag_index
+        available_indexes = putter_to_frag_index.values()
+        lack_list = collections.defaultdict(list)
+        for frag_index in range(policy.ec_n_unique_fragments):
+            # Set the missing index to lack_list
+            available_count = available_indexes.count(frag_index)
+            # N.B. it should be duplication_factor >= lack >= 0
+            lack = policy.ec_duplication_factor - available_count
+            # now we are missing one or more nodes to store the frag index
+            for lack_tier in range(lack):
+                lack_list[lack_tier].append(frag_index)
+
+        # Extract the lack_list to a flat list
+        holes = []
+        for lack_tier, indexes in sorted(lack_list.items(), reverse=True):
+            holes.extend(indexes)
+
+        # Fill putter_to_frag_index list with the hole list
         for hole, p in zip(holes, handoff_conns):
-            chunk_index[p] = hole
-        return chunk_index
+            putter_to_frag_index[p] = hole
+        return putter_to_frag_index
 
     def _transfer_data(self, req, policy, data_source, putters, nodes,
                        min_conns, etag_hasher):
@@ -2366,15 +2571,15 @@ class ECObjectController(BaseObjectController):
         This method was added in the PUT method extraction change
         """
         bytes_transferred = 0
-        chunk_transform = chunk_transformer(policy, len(nodes))
+        chunk_transform = chunk_transformer(policy)
         chunk_transform.send(None)
-        chunk_hashers = collections.defaultdict(md5)
+        frag_hashers = collections.defaultdict(md5)
 
         def send_chunk(chunk):
             # Note: there's two different hashers in here. etag_hasher is
             # hashing the original object so that we can validate the ETag
             # that the client sent (and etag_hasher is None if the client
-            # didn't send one). The hasher in chunk_hashers is hashing the
+            # didn't send one). The hasher in frag_hashers is hashing the
             # fragment archive being sent to the client; this lets us guard
             # against data corruption on the network between proxy and
             # object server.
@@ -2386,11 +2591,17 @@ class ECObjectController(BaseObjectController):
                 # or whatever we're doing, the transform will give us None.
                 return
 
+            updated_frag_indexes = set()
             for putter in list(putters):
-                ci = chunk_index[putter]
-                backend_chunk = backend_chunks[ci]
+                frag_index = putter_to_frag_index[putter]
+                backend_chunk = backend_chunks[frag_index]
                 if not putter.failed:
-                    chunk_hashers[ci].update(backend_chunk)
+                    # N.B. same frag_index will appear when using
+                    # ec_duplication_factor >= 2. So skip to feed the chunk
+                    # to hasher if the frag was updated already.
+                    if frag_index not in updated_frag_indexes:
+                        frag_hashers[frag_index].update(backend_chunk)
+                        updated_frag_indexes.add(frag_index)
                     putter.send_chunk(backend_chunk)
                 else:
                     putter.close()
@@ -2403,9 +2614,10 @@ class ECObjectController(BaseObjectController):
         try:
             with ContextPool(len(putters)) as pool:
 
-                # build our chunk index dict to place handoffs in the
+                # build our putter_to_frag_index dict to place handoffs in the
                 # same part nodes index as the primaries they are covering
-                chunk_index = self._determine_chunk_destinations(putters)
+                putter_to_frag_index = self._determine_chunk_destinations(
+                    putters, policy)
 
                 for putter in putters:
                     putter.spawn_sender_greenthread(
@@ -2431,19 +2643,13 @@ class ECObjectController(BaseObjectController):
                     self.app.logger.increment('client_disconnects')
                     raise HTTPClientDisconnect(request=req)
 
-                computed_etag = (etag_hasher.hexdigest()
-                                 if etag_hasher else None)
-                received_etag = req.headers.get(
-                    'etag', '').strip('"')
-                if (computed_etag and received_etag and
-                   computed_etag != received_etag):
-                    raise HTTPUnprocessableEntity(request=req)
-
                 send_chunk('')  # flush out any buffered data
 
+                computed_etag = (etag_hasher.hexdigest()
+                                 if etag_hasher else None)
                 footers = self._get_footers(req)
-                received_etag = footers.get(
-                    'etag', '').strip('"')
+                received_etag = footers.get('etag', req.headers.get(
+                    'etag', '')).strip('"')
                 if (computed_etag and received_etag and
                    computed_etag != received_etag):
                     raise HTTPUnprocessableEntity(request=req)
@@ -2452,14 +2658,14 @@ class ECObjectController(BaseObjectController):
                 footers = {(k, v) for k, v in footers.items()
                            if not k.lower().startswith('x-object-sysmeta-ec-')}
                 for putter in putters:
-                    ci = chunk_index[putter]
+                    frag_index = putter_to_frag_index[putter]
                     # Update any footers set by middleware with EC footers
                     trail_md = trailing_metadata(
                         policy, etag_hasher,
-                        bytes_transferred, ci)
+                        bytes_transferred, frag_index)
                     trail_md.update(footers)
                     # Etag footer must always be hash of what we sent
-                    trail_md['Etag'] = chunk_hashers[ci].hexdigest()
+                    trail_md['Etag'] = frag_hashers[frag_index].hexdigest()
                     putter.end_of_object_data(footer_metadata=trail_md)
 
                 for putter in putters:
@@ -2582,7 +2788,7 @@ class ECObjectController(BaseObjectController):
             # TODO: PyECLib <= 1.2.0 looks to return the segment info
             # different from the input for aligned data efficiency but
             # Swift never does. So calculate the fragment length Swift
-            # will actually send to object sever by making two different
+            # will actually send to object server by making two different
             # get_segment_info calls (until PyECLib fixed).
             # policy.fragment_size makes the call using segment size,
             # and the next call is to get info for the last segment

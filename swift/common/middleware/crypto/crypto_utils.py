@@ -24,10 +24,11 @@ import six
 from six.moves.urllib import parse as urlparse
 
 from swift import gettext_ as _
-from swift.common.exceptions import EncryptionException
+from swift.common.exceptions import EncryptionException, UnknownSecretIdError
 from swift.common.swob import HTTPInternalServerError
 from swift.common.utils import get_logger
 from swift.common.wsgi import WSGIContext
+from cgi import parse_header
 
 CRYPTO_KEY_CALLBACK = 'swift.callback.fetch_crypto_keys'
 
@@ -52,7 +53,7 @@ class Crypto(object):
 
         :param key: 256-bit key
         :param iv: 128-bit iv or nonce used for encryption
-        :raises: ValueError on invalid key or iv
+        :raises ValueError: on invalid key or iv
         :returns: an instance of an encryptor
         """
         self.check_key(key)
@@ -77,7 +78,7 @@ class Crypto(object):
             # The CTR mode offset is incremented for every AES block and taken
             # modulo 2^128.
             offset_blocks, offset_in_block = divmod(offset, self.iv_length)
-            ivl = long(binascii.hexlify(iv), 16) + offset_blocks
+            ivl = int(binascii.hexlify(iv), 16) + offset_blocks
             ivl %= 1 << algorithms.AES.block_size
             iv = str(bytearray.fromhex(format(
                 ivl, '0%dx' % (2 * self.iv_length))))
@@ -154,7 +155,7 @@ class CryptoWSGIContext(WSGIContext):
         self.logger = logger
         self.server_type = server_type
 
-    def get_keys(self, env, required=None):
+    def get_keys(self, env, required=None, key_id=None):
         # Get the key(s) from the keymaster
         required = required if required is not None else [self.server_type]
         try:
@@ -164,11 +165,14 @@ class CryptoWSGIContext(WSGIContext):
             raise HTTPInternalServerError(
                 "Unable to retrieve encryption keys.")
 
+        err = None
         try:
-            keys = fetch_crypto_keys()
+            keys = fetch_crypto_keys(key_id=key_id)
+        except UnknownSecretIdError as err:
+            self.logger.error('get_keys(): unknown key id: %s', err)
+            raise
         except Exception as err:  # noqa
-            self.logger.exception(_(
-                'ERROR get_keys(): from callback: %s') % err)
+            self.logger.exception('get_keys(): from callback: %s', err)
             raise HTTPInternalServerError(
                 "Unable to retrieve encryption keys.")
 
@@ -188,6 +192,17 @@ class CryptoWSGIContext(WSGIContext):
             raise HTTPInternalServerError(
                 "Unable to retrieve encryption keys.")
 
+        return keys
+
+    def get_multiple_keys(self, env):
+        # get a list of keys from the keymaster containing one dict of keys for
+        # each of the keymaster root secret ids
+        keys = [self.get_keys(env)]
+        active_key_id = keys[0]['id']
+        for other_key_id in keys[0].get('all_ids', []):
+            if other_key_id == active_key_id:
+                continue
+            keys.append(self.get_keys(env, key_id=other_key_id))
         return keys
 
 
@@ -270,15 +285,8 @@ def extract_crypto_meta(value):
     :return: a tuple of the form:
             (<value without crypto meta>, <deserialized crypto meta> or None)
     """
-    crypto_meta = None
-    # we only attempt to extract crypto meta from values that we know were
-    # encrypted and base64-encoded, or from etag values, so it's safe to split
-    # on ';' even if it turns out that the value was an unencrypted etag
-    parts = value.split(';')
-    if len(parts) == 2:
-        value, param = parts
-        crypto_meta_tag = 'swift_meta='
-        if param.strip().startswith(crypto_meta_tag):
-            param = param.strip()[len(crypto_meta_tag):]
-            crypto_meta = load_crypto_meta(param)
-    return value, crypto_meta
+    swift_meta = None
+    value, meta = parse_header(value)
+    if 'swift_meta' in meta:
+        swift_meta = load_crypto_meta(meta['swift_meta'])
+    return value, swift_meta

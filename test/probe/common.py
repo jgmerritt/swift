@@ -14,6 +14,8 @@
 # limitations under the License.
 
 from __future__ import print_function
+
+import errno
 import os
 from subprocess import Popen, PIPE
 import sys
@@ -24,17 +26,15 @@ from collections import defaultdict
 import unittest
 from hashlib import md5
 from uuid import uuid4
-from nose import SkipTest
-
-from six.moves.http_client import HTTPConnection
 import shutil
+from six.moves.http_client import HTTPConnection
+from six.moves.urllib.parse import urlparse
 
-from swiftclient import get_auth, head_account
+from swiftclient import get_auth, head_account, client
 from swift.common import internal_client
 from swift.obj.diskfile import get_data_dir
 from swift.common.ring import Ring
-from swift.common.utils import readconf, renamer, \
-    config_true_value, rsync_module_interpolation
+from swift.common.utils import readconf, renamer, rsync_module_interpolation
 from swift.common.manager import Manager
 from swift.common.storage_policy import POLICIES, EC_POLICY, REPL_POLICY
 
@@ -60,7 +60,7 @@ def get_server_number(ipport, ipport2server):
 
 def start_server(ipport, ipport2server):
     server, number = get_server_number(ipport, ipport2server)
-    err = Manager([server]).start(number=number, wait=False)
+    err = Manager([server]).start(number=number, wait=True)
     if err:
         raise Exception('unable to start %s' % (
             server if not number else '%s%s' % (server, number)))
@@ -127,13 +127,17 @@ def kill_server(ipport, ipport2server):
     if err:
         raise Exception('unable to kill %s' % (server if not number else
                                                '%s%s' % (server, number)))
+    return wait_for_server_to_hangup(ipport)
+
+
+def wait_for_server_to_hangup(ipport):
     try_until = time() + 30
     while True:
         try:
             conn = HTTPConnection(*ipport)
             conn.request('GET', '/')
             conn.getresponse()
-        except Exception as err:
+        except Exception:
             break
         if time() > try_until:
             raise Exception(
@@ -205,12 +209,12 @@ def get_ring(ring_name, required_replicas, required_devices,
         return ring
     # easy sanity checks
     if ring.replica_count != required_replicas:
-        raise SkipTest('%s has %s replicas instead of %s' % (
+        raise unittest.SkipTest('%s has %s replicas instead of %s' % (
             ring.serialized_path, ring.replica_count, required_replicas))
 
     devs = [dev for dev in ring.devs if dev is not None]
     if len(devs) != required_devices:
-        raise SkipTest('%s has %s devices instead of %s' % (
+        raise unittest.SkipTest('%s has %s devices instead of %s' % (
             ring.serialized_path, len(devs), required_devices))
     for dev in devs:
         # verify server is exposing mounted device
@@ -222,33 +226,31 @@ def get_ring(ring_name, required_replicas, required_devices,
                 dev_path = os.path.join(conf['devices'], device)
                 full_path = os.path.realpath(dev_path)
                 if not os.path.exists(full_path):
-                    raise SkipTest(
+                    raise unittest.SkipTest(
                         'device %s in %s was not found (%s)' %
                         (device, conf['devices'], full_path))
                 break
         else:
-            raise SkipTest(
+            raise unittest.SkipTest(
                 "unable to find ring device %s under %s's devices (%s)" % (
                     dev['device'], server, conf['devices']))
         # verify server is exposing rsync device
         rsync_export = conf.get('rsync_module', '').rstrip('/')
         if not rsync_export:
             rsync_export = '{replication_ip}::%s' % server
-            if config_true_value(conf.get('vm_test_mode', 'no')):
-                rsync_export += '{replication_port}'
         cmd = "rsync %s" % rsync_module_interpolation(rsync_export, dev)
         p = Popen(cmd, shell=True, stdout=PIPE)
         stdout, _stderr = p.communicate()
         if p.returncode:
-            raise SkipTest('unable to connect to rsync '
-                           'export %s (%s)' % (rsync_export, cmd))
+            raise unittest.SkipTest('unable to connect to rsync '
+                                    'export %s (%s)' % (rsync_export, cmd))
         for line in stdout.splitlines():
             if line.rsplit(None, 1)[-1] == dev['device']:
                 break
         else:
-            raise SkipTest("unable to find ring device %s under rsync's "
-                           "exported devices for %s (%s)" %
-                           (dev['device'], rsync_export, cmd))
+            raise unittest.SkipTest("unable to find ring device %s under "
+                                    "rsync's exported devices for %s (%s)" %
+                                    (dev['device'], rsync_export, cmd))
     return ring
 
 
@@ -267,19 +269,27 @@ def get_policy(**kwargs):
                 matches = False
         if matches:
             return policy
-    raise SkipTest('No policy matching %s' % kwargs)
+    raise unittest.SkipTest('No policy matching %s' % kwargs)
 
 
-def resetswift():
-    p = Popen("resetswift 2>&1", shell=True, stdout=PIPE)
+def run_cleanup(cmd):
+    p = Popen(cmd + " 2>&1", shell=True, stdout=PIPE)
     stdout, _stderr = p.communicate()
     if p.returncode:
         raise AssertionError(
-            'Cleanup with "resetswift" failed: stdout: %s, stderr: %s'
-            % (stdout, _stderr))
+            'Cleanup with %r failed: stdout: %s, stderr: %s'
+            % (cmd, stdout, _stderr))
 
     print(stdout)
     Manager(['all']).stop()
+
+
+def resetswift():
+    run_cleanup("resetswift")
+
+
+def kill_orphans():
+    run_cleanup("swift-orphans -a 0 -k 9")
 
 
 class Body(object):
@@ -330,38 +340,41 @@ class ProbeTest(unittest.TestCase):
     Don't instantiate this directly, use a child class instead.
     """
 
+    def _load_rings_and_configs(self):
+        self.ipport2server = {}
+        self.configs = defaultdict(dict)
+        self.account_ring = get_ring(
+            'account',
+            self.acct_cont_required_replicas,
+            self.acct_cont_required_devices,
+            ipport2server=self.ipport2server,
+            config_paths=self.configs)
+        self.container_ring = get_ring(
+            'container',
+            self.acct_cont_required_replicas,
+            self.acct_cont_required_devices,
+            ipport2server=self.ipport2server,
+            config_paths=self.configs)
+        self.policy = get_policy(**self.policy_requirements)
+        self.object_ring = get_ring(
+            self.policy.ring_name,
+            self.obj_required_replicas,
+            self.obj_required_devices,
+            server='object',
+            ipport2server=self.ipport2server,
+            config_paths=self.configs)
+
     def setUp(self):
         resetswift()
+        kill_orphans()
+        self._load_rings_and_configs()
         try:
-            self.ipport2server = {}
-            self.configs = defaultdict(dict)
-            self.account_ring = get_ring(
-                'account',
-                self.acct_cont_required_replicas,
-                self.acct_cont_required_devices,
-                ipport2server=self.ipport2server,
-                config_paths=self.configs)
-            self.container_ring = get_ring(
-                'container',
-                self.acct_cont_required_replicas,
-                self.acct_cont_required_devices,
-                ipport2server=self.ipport2server,
-                config_paths=self.configs)
-            self.policy = get_policy(**self.policy_requirements)
-            self.object_ring = get_ring(
-                self.policy.ring_name,
-                self.obj_required_replicas,
-                self.obj_required_devices,
-                server='object',
-                ipport2server=self.ipport2server,
-                config_paths=self.configs)
-
             self.servers_per_port = any(
                 int(readconf(c, section_name='object-replicator').get(
                     'servers_per_port', '0'))
                 for c in self.configs['object-replicator'].values())
 
-            Manager(['main']).start(wait=False)
+            Manager(['main']).start(wait=True)
             for ipport in self.ipport2server:
                 check_server(ipport, self.ipport2server)
             proxy_ipport = ('127.0.0.1', 8080)
@@ -388,6 +401,10 @@ class ProbeTest(unittest.TestCase):
                     Manager(['all']).kill()
                 except Exception:
                     pass
+        info_url = "%s://%s/info" % (urlparse(self.url).scheme,
+                                     urlparse(self.url).netloc)
+        proxy_conn = client.http_connection(info_url)
+        self.cluster_info = client.get_capabilities(proxy_conn)
 
     def tearDown(self):
         Manager(['all']).kill()
@@ -447,11 +464,11 @@ class ProbeTest(unittest.TestCase):
     def revive_drive(self, device):
         disabled_name = device + "X"
         if os.path.isdir(disabled_name):
-            renamer(device + "X", device)
+            renamer(disabled_name, device)
         else:
             os.system('sudo mount %s' % device)
 
-    def make_internal_client(self, object_post_as_copy=True):
+    def make_internal_client(self):
         tempdir = mkdtemp()
         try:
             conf_path = os.path.join(tempdir, 'internal_client.conf')
@@ -467,19 +484,61 @@ class ProbeTest(unittest.TestCase):
 
             [filter:copy]
             use = egg:swift#copy
-            object_post_as_copy = %s
 
             [filter:cache]
             use = egg:swift#memcache
 
             [filter:catch_errors]
             use = egg:swift#catch_errors
-            """ % object_post_as_copy
+            """
             with open(conf_path, 'w') as f:
                 f.write(dedent(conf_body))
             return internal_client.InternalClient(conf_path, 'test', 1)
         finally:
             shutil.rmtree(tempdir)
+
+    def get_all_object_nodes(self):
+        """
+        Returns a list of all nodes in all object storage policies.
+
+        :return: a list of node dicts.
+        """
+        all_obj_nodes = {}
+        for policy in ENABLED_POLICIES:
+            for dev in policy.object_ring.devs:
+                all_obj_nodes[dev['device']] = dev
+        return all_obj_nodes.values()
+
+    def gather_async_pendings(self, onodes):
+        """
+        Returns a list of paths to async pending files found on given nodes.
+
+        :param onodes: a list of nodes.
+        :return: a list of file paths.
+        """
+        async_pendings = []
+        for onode in onodes:
+            device_dir = self.device_dir('', onode)
+            for ap_pol_dir in os.listdir(device_dir):
+                if not ap_pol_dir.startswith('async_pending'):
+                    # skip 'objects', 'containers', etc.
+                    continue
+                async_pending_dir = os.path.join(device_dir, ap_pol_dir)
+                try:
+                    ap_dirs = os.listdir(async_pending_dir)
+                except OSError as err:
+                    if err.errno == errno.ENOENT:
+                        pass
+                    else:
+                        raise
+                else:
+                    for ap_dir in ap_dirs:
+                        ap_dir_fullpath = os.path.join(
+                            async_pending_dir, ap_dir)
+                        async_pendings.extend([
+                            os.path.join(ap_dir_fullpath, ent)
+                            for ent in os.listdir(ap_dir_fullpath)])
+        return async_pendings
 
 
 class ReplProbeTest(ProbeTest):
@@ -505,13 +564,13 @@ if __name__ == "__main__":
         try:
             get_ring(server, 3, 4,
                      force_validate=True)
-        except SkipTest as err:
+        except unittest.SkipTest as err:
             sys.exit('%s ERROR: %s' % (server, err))
         print('%s OK' % server)
     for policy in POLICIES:
         try:
             get_ring(policy.ring_name, 3, 4,
                      server='object', force_validate=True)
-        except SkipTest as err:
+        except unittest.SkipTest as err:
             sys.exit('object ERROR (%s): %s' % (policy.name, err))
         print('object OK (%s)' % policy.name)

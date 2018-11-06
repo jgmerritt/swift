@@ -28,7 +28,7 @@ import eventlet
 from swift.account import reaper
 from swift.account.backend import DATADIR
 from swift.common.exceptions import ClientException
-from swift.common.utils import normalize_timestamp
+from swift.common.utils import normalize_timestamp, Timestamp
 
 from test import unit
 from swift.common.storage_policy import StoragePolicy, POLICIES
@@ -87,7 +87,7 @@ class FakeAccountBroker(object):
 
     def list_containers_iter(self, *args):
         for cont in self.containers:
-            yield cont, None, None, None
+            yield cont, None, None, None, None
 
     def is_status_deleted(self):
         return True
@@ -333,11 +333,11 @@ class TestReaper(unittest.TestCase):
         for policy in POLICIES:
             r.reset_stats()
             with patch(mock_path) as fake_direct_delete:
-                with patch('swift.account.reaper.time') as mock_time:
-                    mock_time.return_value = 1429117638.86767
+                with patch('swift.common.utils.Timestamp.now') as mock_now:
+                    mock_now.return_value = Timestamp(1429117638.86767)
                     r.reap_object('a', 'c', 'partition', cont_nodes, 'o',
                                   policy.idx)
-                    mock_time.assert_called_once_with()
+                    mock_now.assert_called_once_with()
                     for i, call_args in enumerate(
                             fake_direct_delete.call_args_list):
                         cnode = cont_nodes[i % len(cont_nodes)]
@@ -439,8 +439,9 @@ class TestReaper(unittest.TestCase):
                 return headers, obj_list
 
             mocks['direct_get_container'].side_effect = fake_get_container
-            with patch('swift.account.reaper.time') as mock_time:
-                mock_time.side_effect = [1429117638.86767, 1429117639.67676]
+            with patch('swift.common.utils.Timestamp.now') as mock_now:
+                mock_now.side_effect = [Timestamp(1429117638.86767),
+                                        Timestamp(1429117639.67676)]
                 r.reap_container('a', 'partition', acc_nodes, 'c')
 
             # verify calls to direct_delete_object
@@ -749,7 +750,7 @@ class TestReaper(unittest.TestCase):
                 if container in self.containers_yielded:
                     continue
 
-                yield container, None, None, None
+                yield container, None, None, None, None
                 self.containers_yielded.append(container)
 
         def fake_reap_container(self, account, account_partition,
@@ -805,16 +806,14 @@ class TestReaper(unittest.TestCase):
         devices = prepare_data_dir()
         r = init_reaper(devices)
 
-        with patch('swift.account.reaper.ismount', lambda x: True):
-            with patch(
-                    'swift.account.reaper.AccountReaper.reap_device') as foo:
-                r.run_once()
+        with patch('swift.account.reaper.AccountReaper.reap_device') as foo, \
+                unit.mock_check_drive(ismount=True):
+            r.run_once()
         self.assertEqual(foo.called, 1)
 
-        with patch('swift.account.reaper.ismount', lambda x: False):
-            with patch(
-                    'swift.account.reaper.AccountReaper.reap_device') as foo:
-                r.run_once()
+        with patch('swift.account.reaper.AccountReaper.reap_device') as foo, \
+                unit.mock_check_drive(ismount=False):
+            r.run_once()
         self.assertFalse(foo.called)
 
         with patch('swift.account.reaper.AccountReaper.reap_device') as foo:
@@ -842,12 +841,10 @@ class TestReaper(unittest.TestCase):
         r = init_reaper()
         with patch('swift.account.reaper.sleep', fake_sleep):
             with patch('swift.account.reaper.random.random', fake_random):
-                try:
+                with self.assertRaises(Exception) as raised:
                     r.run_forever()
-                except Exception as err:
-                    pass
         self.assertEqual(self.val, 1)
-        self.assertEqual(str(err), 'exit')
+        self.assertEqual(str(raised.exception), 'exit')
 
 
 if __name__ == '__main__':

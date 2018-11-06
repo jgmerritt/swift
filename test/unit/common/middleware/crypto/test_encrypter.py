@@ -227,7 +227,6 @@ class TestEncrypter(unittest.TestCase):
 
     def _test_PUT_with_other_footers(self, override_etag):
         # verify handling of another middleware's footer callback
-        cont_key = fetch_crypto_keys()['container']
         body_key = os.urandom(32)
         object_key = fetch_crypto_keys()['object']
         plaintext = 'FAKE APP'
@@ -324,7 +323,7 @@ class TestEncrypter(unittest.TestCase):
     def test_PUT_with_other_footers(self):
         self._test_PUT_with_other_footers('override etag')
 
-    def test_PUT_with_other_footers_and_empty_etag(self):
+    def test_PUT_with_other_footers_and_etag_of_empty_body(self):
         # verify that an override etag value of EMPTY_ETAG will be encrypted
         # when there was a non-zero body length
         self._test_PUT_with_other_footers(EMPTY_ETAG)
@@ -380,10 +379,81 @@ class TestEncrypter(unittest.TestCase):
     def test_PUT_with_etag_override_in_headers(self):
         self._test_PUT_with_etag_override_in_headers('override_etag')
 
-    def test_PUT_with_etag_override_in_headers_and_empty_etag(self):
+    def test_PUT_with_etag_of_empty_body_override_in_headers(self):
         # verify that an override etag value of EMPTY_ETAG will be encrypted
         # when there was a non-zero body length
         self._test_PUT_with_etag_override_in_headers(EMPTY_ETAG)
+
+    def _test_PUT_with_empty_etag_override_in_headers(self, plaintext):
+        # verify that an override etag value of '' from other middleware is
+        # passed through unencrypted
+        plaintext_etag = md5hex(plaintext)
+        override_etag = ''
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        hdrs = {'content-type': 'text/plain',
+                'content-length': str(len(plaintext)),
+                'Etag': plaintext_etag,
+                'X-Object-Sysmeta-Container-Update-Override-Etag':
+                    override_etag}
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=plaintext, headers=hdrs)
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        resp = req.get_response(self.encrypter)
+
+        self.assertEqual('201 Created', resp.status)
+        self.assertEqual(plaintext_etag, resp.headers['Etag'])
+        self.assertEqual(1, len(self.app.calls), self.app.calls)
+        self.assertEqual(('PUT', '/v1/a/c/o'), self.app.calls[0])
+        req_hdrs = self.app.headers[0]
+        self.assertIn(
+            'X-Object-Sysmeta-Container-Update-Override-Etag', req_hdrs)
+        self.assertEqual(
+            override_etag,
+            req_hdrs['X-Object-Sysmeta-Container-Update-Override-Etag'])
+
+    def test_PUT_with_empty_etag_override_in_headers(self):
+        self._test_PUT_with_empty_etag_override_in_headers('body')
+
+    def test_PUT_with_empty_etag_override_in_headers_no_body(self):
+        self._test_PUT_with_empty_etag_override_in_headers('')
+
+    def _test_PUT_with_empty_etag_override_in_footers(self, plaintext):
+        # verify that an override etag value of '' from other middleware is
+        # passed through unencrypted
+        plaintext_etag = md5hex(plaintext)
+        override_etag = ''
+        other_footers = {
+            'X-Object-Sysmeta-Container-Update-Override-Etag': override_etag}
+        env = {'REQUEST_METHOD': 'PUT',
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys,
+               'swift.callback.update_footers':
+                   lambda footers: footers.update(other_footers)}
+
+        hdrs = {'content-type': 'text/plain',
+                'content-length': str(len(plaintext)),
+                'Etag': plaintext_etag}
+        req = Request.blank(
+            '/v1/a/c/o', environ=env, body=plaintext, headers=hdrs)
+        self.app.register('PUT', '/v1/a/c/o', HTTPCreated, {})
+        resp = req.get_response(self.encrypter)
+
+        self.assertEqual('201 Created', resp.status)
+        self.assertEqual(plaintext_etag, resp.headers['Etag'])
+        self.assertEqual(1, len(self.app.calls), self.app.calls)
+        self.assertEqual(('PUT', '/v1/a/c/o'), self.app.calls[0])
+        req_hdrs = self.app.headers[0]
+        self.assertIn(
+            'X-Object-Sysmeta-Container-Update-Override-Etag', req_hdrs)
+        self.assertEqual(
+            override_etag,
+            req_hdrs['X-Object-Sysmeta-Container-Update-Override-Etag'])
+
+    def test_PUT_with_empty_etag_override_in_footers(self):
+        self._test_PUT_with_empty_etag_override_in_footers('body')
+
+    def test_PUT_with_empty_etag_override_in_footers_no_body(self):
+        self._test_PUT_with_empty_etag_override_in_footers('')
 
     def test_PUT_with_bad_etag_in_other_footers(self):
         # verify that etag supplied in footers from other middleware overrides
@@ -531,6 +601,29 @@ class TestEncrypter(unittest.TestCase):
         for k in call_headers[0]:
             self.assertFalse(k.lower().startswith('x-object-sysmeta-crypto-'))
 
+        # if upstream footer override etag is an empty string then check that
+        # it is not encrypted
+        other_footers = {
+            'Etag': EMPTY_ETAG,
+            'X-Object-Sysmeta-Container-Update-Override-Etag': ''}
+        env.update({'swift.callback.update_footers':
+                    lambda footers: footers.update(other_footers)})
+        req = Request.blank('/v1/a/c/o', environ=env, body='', headers=hdrs)
+
+        call_headers = []
+        resp = req.get_response(encrypter.Encrypter(NonReadingApp(), {}))
+
+        self.assertEqual('201 Created', resp.status)
+        self.assertEqual('response etag', resp.headers['Etag'])
+        self.assertEqual(1, len(call_headers))
+
+        # verify that other middleware's footers made it to app
+        for k, v in other_footers.items():
+            self.assertEqual(v, call_headers[0][k])
+        # verify no encryption footers
+        for k in call_headers[0]:
+            self.assertFalse(k.lower().startswith('x-object-sysmeta-crypto-'))
+
     def test_POST_req(self):
         body = 'FAKE APP'
         env = {'REQUEST_METHOD': 'POST',
@@ -604,13 +697,20 @@ class TestEncrypter(unittest.TestCase):
             # verify etags have been supplemented with masked values
             self.assertIn(match_header_name, actual_headers)
             actual_etags = set(actual_headers[match_header_name].split(', '))
+            # masked values for secret_id None
             key = fetch_crypto_keys()['object']
             masked_etags = [
                 '"%s"' % base64.b64encode(hmac.new(
                     key, etag.strip('"'), hashlib.sha256).digest())
                 for etag in plain_etags if etag not in ('*', '')]
+            # masked values for secret_id myid
+            key = fetch_crypto_keys(key_id={'secret_id': 'myid'})['object']
+            masked_etags_myid = [
+                '"%s"' % base64.b64encode(hmac.new(
+                    key, etag.strip('"'), hashlib.sha256).digest())
+                for etag in plain_etags if etag not in ('*', '')]
             expected_etags = set((expected_plain_etags or plain_etags) +
-                                 masked_etags)
+                                 masked_etags + masked_etags_myid)
             self.assertEqual(expected_etags, actual_etags)
             # check that the request environ was returned to original state
             self.assertEqual(set(plain_etags),
@@ -798,7 +898,7 @@ class TestEncrypter(unittest.TestCase):
         self.assertEqual('Unable to retrieve encryption keys.', resp.body)
 
     def test_PUT_error_in_key_callback(self):
-        def raise_exc():
+        def raise_exc(*args, **kwargs):
             raise Exception('Testing')
 
         body = 'FAKE APP'

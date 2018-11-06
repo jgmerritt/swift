@@ -104,8 +104,8 @@ can be found in the KeystoneMiddleware_ distribution.
 The :ref:`keystoneauth` middleware performs authorization and mapping the
 Keystone roles to Swift's ACLs.
 
-.. _KeystoneMiddleware: http://docs.openstack.org/developer/keystonemiddleware/
-.. _Keystone: http://docs.openstack.org/developer/keystone/
+.. _KeystoneMiddleware: https://docs.openstack.org/keystonemiddleware/latest/
+.. _Keystone: https://docs.openstack.org/keystone/latest/
 
 .. _configuring_keystone_auth:
 
@@ -138,7 +138,7 @@ add the configuration for the authtoken middleware::
 
   [filter:authtoken]
   paste.filter_factory = keystonemiddleware.auth_token:filter_factory
-  auth_uri = http://keystonehost:5000/
+  www_authenticate_uri = http://keystonehost:5000/
   auth_url = http://keystonehost:35357/
   auth_plugin = password
   project_domain_id = default
@@ -153,7 +153,7 @@ add the configuration for the authtoken middleware::
 The actual values for these variables will need to be set depending on
 your situation, but in short:
 
-* ``auth_uri`` should point to a Keystone service from which users may
+* ``www_authenticate_uri`` should point to a Keystone service from which users may
   retrieve tokens. This value is used in the `WWW-Authenticate` header that
   auth_token sends with any denial response.
 * ``auth_url`` points to the Keystone Admin service. This information is
@@ -167,7 +167,7 @@ your situation, but in short:
   service. The example values shown here assume a user named 'swift' with admin
   role on a project named 'service', both being in the Keystone domain with id
   'default'. Refer to the `KeystoneMiddleware documentation
-  <http://docs.openstack.org/developer/keystonemiddleware/middlewarearchitecture.html#configuration>`_
+  <https://docs.openstack.org/keystonemiddleware/latest/middlewarearchitecture.html#configuration>`_
   for other examples.
 
 * ``cache`` is set to ``swift.cache``. This means that the middleware

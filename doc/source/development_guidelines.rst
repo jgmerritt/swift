@@ -77,6 +77,9 @@ To execute the tests:
   --recreate`` or remove the ``.tox`` directory to force ``tox`` to recreate the
   dependency list.
 
+  Swift's tests require having an XFS directory available in ``/tmp`` or
+  in the ``TMPDIR`` environment variable.
+
 Swift's functional tests may be executed against a :doc:`development_saio` or
 other running Swift cluster using the command::
 
@@ -121,24 +124,29 @@ set using environment variables:
 
 - encryption may be added to the proxy pipeline by setting the
   environment variable ``SWIFT_TEST_IN_PROCESS_CONF_LOADER`` to
-  ``encryption``.  Or when using ``tox``, specify the ``tox`` environment
-  ``func-in-process-encryption``
+  ``encryption``.
 
-- the proxy-server ``object_post_as_copy`` option may be set using the
-  environment variable ``SWIFT_TEST_IN_PROCESS_OBJECT_POST_AS_COPY``.
+- a 2+1 EC policy may be installed as the default policy by setting the
+  environment variable ``SWIFT_TEST_IN_PROCESS_CONF_LOADER`` to
+  ``ec``.
 
 - logging to stdout may be enabled by setting ``SWIFT_TEST_DEBUG_LOGS``.
 
 For example, this command would run the in-process mode functional tests with
-the proxy-server using object_post_as_copy=False (the 'fast-POST' mode)::
+encryption enabled in the proxy-server::
 
-    SWIFT_TEST_IN_PROCESS=1 SWIFT_TEST_IN_PROCESS_OBJECT_POST_AS_COPY=False \
+    SWIFT_TEST_IN_PROCESS=1 SWIFT_TEST_IN_PROCESS_CONF_LOADER=encryption \
         tox -e func
 
-This particular example may also be run using the ``func-in-process-fast-post``
+This particular example may also be run using the ``func-encryption``
 tox environment::
 
-    tox -e func-in-process-fast-post
+    tox -e func-encryption
+
+The ``tox.ini`` file also specifies test environments for running other
+in-process functional test configurations, e.g.::
+
+  tox -e func-ec
 
 To debug the functional tests, use the 'in-process test' mode and pass the
 ``--pdb`` flag to ``tox``::
@@ -191,7 +199,7 @@ automated and not get `caught` by Jenkins.
 
 For example for Vim the `syntastic`_ plugin can do this for you.
 
-.. _`hacking`: https://pypi.python.org/pypi/hacking
+.. _`hacking`: https://pypi.org/project/hacking
 .. _`syntastic`: https://github.com/scrooloose/syntastic
 
 ------------------------
@@ -203,19 +211,24 @@ The documentation in docstrings should follow the PEP 257 conventions
 
 More specifically:
 
-    1.  Triple quotes should be used for all docstrings.
-    2.  If the docstring is simple and fits on one line, then just use
-        one line.
-    3.  For docstrings that take multiple lines, there should be a newline
-        after the opening quotes, and before the closing quotes.
-    4.  Sphinx is used to build documentation, so use the restructured text
-        markup to designate parameters, return values, etc.  Documentation on
-        the sphinx specific markup can be found here:
-        http://sphinx.pocoo.org/markup/index.html
+#.  Triple quotes should be used for all docstrings.
+#.  If the docstring is simple and fits on one line, then just use
+    one line.
+#.  For docstrings that take multiple lines, there should be a newline
+    after the opening quotes, and before the closing quotes.
+#.  Sphinx is used to build documentation, so use the restructured text
+    markup to designate parameters, return values, etc.  Documentation on
+    the sphinx specific markup can be found here:
+    http://sphinx.pocoo.org/markup/index.html
 
-Installing Sphinx:
-  #. Install sphinx (On Ubuntu: `sudo apt-get install python-sphinx`)
-  #. `python setup.py build_sphinx`
+To build documentation run::
+
+    pip install -r requirements.txt -r doc/requirements.txt
+    sphinx-build -W -b html doc/source doc/build/html
+
+and then browse to doc/build/html/index.html. These docs are auto-generated
+after every commit and available online at
+https://docs.openstack.org/swift/latest/.
 
 --------
 Manpages

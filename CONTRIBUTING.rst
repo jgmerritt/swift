@@ -75,7 +75,7 @@ working on.
 Getting Started
 ---------------
 
-http://docs.openstack.org/developer/swift/first_contribution_swift.html
+https://docs.openstack.org/swift/latest/first_contribution_swift.html
 
 Once those steps have been completed, changes to OpenStack
 should be submitted for review via the Gerrit tool, following
@@ -116,7 +116,7 @@ Recommended workflow
 ====================
 
 -  Set up a `Swift All-In-One
-   VM <http://docs.openstack.org/developer/swift/development_saio.html>`__\ (SAIO).
+   VM <https://docs.openstack.org/swift/latest/development_saio.html>`__\ (SAIO).
 
 -  Make your changes. Docs and tests for your patch must land before or
    with your patch.
@@ -162,7 +162,7 @@ tested on the OpenStack CI infrastructure. In addition to many of the
 tests above, it will also be tested by several other OpenStack test
 jobs.
 
-Once your patch has been reviewed and approved by two core reviewers and
+Once your patch has been reviewed and approved by core reviewers and
 has passed all automated tests, it will be merged into the Swift source
 tree.
 

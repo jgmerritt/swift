@@ -36,6 +36,7 @@ from swift.common.utils import get_logger, config_true_value
 from swift.common.request_helpers import (
     remove_items, get_sys_meta_prefix, OBJECT_TRANSIENT_SYSMETA_PREFIX
 )
+from six.moves.urllib.parse import urlsplit
 import re
 
 #: A list of python regular expressions that will be used to
@@ -89,14 +90,33 @@ class GatekeeperMiddleware(object):
                               [('X-Timestamp', ts)])
 
         def gatekeeper_response(status, response_headers, exc_info=None):
-            removed = filter(
-                lambda h: self.outbound_condition(h[0]),
-                response_headers)
+            def fixed_response_headers():
+                def relative_path(value):
+                    parsed = urlsplit(value)
+                    new_path = parsed.path
+                    if parsed.query:
+                        new_path += ('?%s' % parsed.query)
+                    if parsed.fragment:
+                        new_path += ('#%s' % parsed.fragment)
+                    return new_path
+
+                if not env.get('swift.leave_relative_location'):
+                    return response_headers
+                else:
+                    return [
+                        (k, v) if k.lower() != 'location' else
+                        (k, relative_path(v)) for (k, v) in response_headers
+                    ]
+
+            response_headers = fixed_response_headers()
+            removed = [(header, value) for header, value in response_headers
+                       if self.outbound_condition(header)]
+
             if removed:
                 self.logger.debug('removed response headers: %s' % removed)
-                new_headers = filter(
-                    lambda h: not self.outbound_condition(h[0]),
-                    response_headers)
+                new_headers = [
+                    (header, value) for header, value in response_headers
+                    if not self.outbound_condition(header)]
                 return start_response(status, new_headers, exc_info)
             return start_response(status, response_headers, exc_info)
         return self.app(env, gatekeeper_response)

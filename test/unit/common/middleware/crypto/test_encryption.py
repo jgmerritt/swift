@@ -29,7 +29,7 @@ from swift.common.ring import Ring
 from swift.common.swob import Request
 from swift.obj import diskfile
 
-from test.unit import FakeLogger
+from test.unit import FakeLogger, skip_if_no_xattrs
 from test.unit.common.middleware.crypto.crypto_helpers import (
     md5hex, encrypt, TEST_KEYMASTER_CONF)
 from test.unit.helpers import setup_servers, teardown_servers
@@ -54,19 +54,25 @@ class TestCryptoPipelineChanges(unittest.TestCase):
             cls._test_context = None
 
     def setUp(self):
+        skip_if_no_xattrs()
         self.plaintext = 'unencrypted body content'
         self.plaintext_etag = md5hex(self.plaintext)
         self._setup_crypto_app()
 
-    def _setup_crypto_app(self, disable_encryption=False):
+    def _setup_crypto_app(self, disable_encryption=False, root_secret_id=None):
         # Set up a pipeline of crypto middleware ending in the proxy app so
         # that tests can make requests to either the proxy server directly or
         # via the crypto middleware. Make a fresh instance for each test to
         # avoid any state coupling.
         conf = {'disable_encryption': disable_encryption}
         self.encryption = crypto.filter_factory(conf)(self.proxy_app)
-        self.km = keymaster.KeyMaster(self.encryption, TEST_KEYMASTER_CONF)
+        self.encryption.logger = self.proxy_app.logger
+        km_conf = dict(TEST_KEYMASTER_CONF)
+        if root_secret_id is not None:
+            km_conf['active_root_secret_id'] = root_secret_id
+        self.km = keymaster.KeyMaster(self.encryption, km_conf)
         self.crypto_app = self.km  # for clarity
+        self.crypto_app.logger = self.encryption.logger
 
     def _create_container(self, app, policy_name='one', container_path=None):
         if not container_path:
@@ -254,6 +260,36 @@ class TestCryptoPipelineChanges(unittest.TestCase):
 
     def test_write_with_crypto_read_with_crypto(self):
         self._create_container(self.proxy_app, policy_name='one')
+        self._put_object(self.crypto_app, self.plaintext)
+        self._post_object(self.crypto_app)
+        self._check_GET_and_HEAD(self.crypto_app)
+        self._check_match_requests('GET', self.crypto_app)
+        self._check_match_requests('HEAD', self.crypto_app)
+        self._check_listing(self.crypto_app)
+
+    def test_write_with_crypto_read_with_crypto_different_root_secrets(self):
+        root_secret = self.crypto_app.root_secret
+        self._create_container(self.proxy_app, policy_name='one')
+        self._put_object(self.crypto_app, self.plaintext)
+        # change root secret
+        self._setup_crypto_app(root_secret_id='1')
+        root_secret_1 = self.crypto_app.root_secret
+        self.assertNotEqual(root_secret, root_secret_1)  # sanity check
+        self._post_object(self.crypto_app)
+        self._check_GET_and_HEAD(self.crypto_app)
+        self._check_match_requests('GET', self.crypto_app)
+        self._check_match_requests('HEAD', self.crypto_app)
+        self._check_listing(self.crypto_app)
+        # change root secret
+        self._setup_crypto_app(root_secret_id='2')
+        root_secret_2 = self.crypto_app.root_secret
+        self.assertNotEqual(root_secret_2, root_secret_1)  # sanity check
+        self.assertNotEqual(root_secret_2, root_secret)  # sanity check
+        self._check_GET_and_HEAD(self.crypto_app)
+        self._check_match_requests('GET', self.crypto_app)
+        self._check_match_requests('HEAD', self.crypto_app)
+        self._check_listing(self.crypto_app)
+        # write object again
         self._put_object(self.crypto_app, self.plaintext)
         self._post_object(self.crypto_app)
         self._check_GET_and_HEAD(self.crypto_app)
@@ -616,15 +652,6 @@ class TestCryptoPipelineChanges(unittest.TestCase):
         self._check_match_requests('GET', self.crypto_app)
         self._check_match_requests('HEAD', self.crypto_app)
         self._check_listing(self.crypto_app)
-
-
-class TestCryptoPipelineChangesFastPost(TestCryptoPipelineChanges):
-    @classmethod
-    def setUpClass(cls):
-        # set proxy config to use fast post
-        extra_conf = {'object_post_as_copy': 'False'}
-        cls._test_context = setup_servers(extra_conf=extra_conf)
-        cls.proxy_app = cls._test_context["test_servers"][0]
 
 
 if __name__ == '__main__':

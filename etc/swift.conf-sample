@@ -26,10 +26,15 @@ swift_hash_path_prefix = changeme
 #
 # A 'policy_type' argument is also supported but is not mandatory.  Default
 # policy type 'replication' is used when 'policy_type' is unspecified.
+# A 'diskfile_module' optional argument lets you specify an alternate backend
+# object storage plug-in architecture. The default is
+# "egg:swift#replication.fs", or "egg:swift#erasure_coding.fs", depending on
+# the policy type.
 [storage-policy:0]
 name = Policy-0
 default = yes
 #policy_type = replication
+#diskfile_module = egg:swift#replication.fs
 aliases = yellow, orange
 
 # the following section would declare a policy called 'silver', the number of
@@ -49,6 +54,7 @@ aliases = yellow, orange
 #[storage-policy:1]
 #name = silver
 #policy_type = replication
+#diskfile_module = egg:swift#replication.fs
 
 # The following declares a storage policy of type 'erasure_coding' which uses
 # Erasure Coding for data reliability. Please refer to Swift documentation for
@@ -62,13 +68,14 @@ aliases = yellow, orange
 # EC configuration parameters 'ec_type', 'ec_num_data_fragments' and
 # 'ec_num_parity_fragments' must be specified.  'ec_type' is chosen from the
 # list of EC backends supported by PyECLib.  The ring configured for the
-# storage policy must have it's "replica" count configured to
+# storage policy must have its "replica" count configured to
 # 'ec_num_data_fragments' + 'ec_num_parity_fragments' - this requirement is
 # validated when services start.  'ec_object_segment_size' is the amount of
 # data that will be buffered up before feeding a segment into the
 # encoder/decoder.  More information about these configuration options and
-# supported `ec_type` schemes is available in the Swift documentation.  Please
-# refer to Swift documentation for details on how to configure EC policies.
+# supported 'ec_type' schemes is available in the Swift documentation.  See
+# https://docs.openstack.org/swift/latest/overview_erasure_code.html
+# for more information on how to configure EC policies.
 #
 # The example 'deepfreeze10-4' policy defined below is a _sample_
 # configuration with an alias of 'df10-4' as well as 10 'data' and 4 'parity'
@@ -80,11 +87,16 @@ aliases = yellow, orange
 #name = deepfreeze10-4
 #aliases = df10-4
 #policy_type = erasure_coding
+#diskfile_module = egg:swift#erasure_coding.fs
 #ec_type = liberasurecode_rs_vand
 #ec_num_data_fragments = 10
 #ec_num_parity_fragments = 4
 #ec_object_segment_size = 1048576
-
+#
+# Duplicated EC fragments is proof-of-concept experimental support to enable
+# Global Erasure Coding policies with multiple regions acting as independent
+# failure domains.  Do not change the default except in development/testing.
+#ec_duplication_factor = 1
 
 # The swift-constraints section sets the basic constraints on data
 # saved in the swift cluster. These constraints are automatically

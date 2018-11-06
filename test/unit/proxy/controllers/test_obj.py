@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import email.parser
 import itertools
 import math
@@ -33,18 +34,18 @@ from six.moves import range
 import swift
 from swift.common import utils, swob, exceptions
 from swift.common.exceptions import ChunkWriteTimeout
-from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import Timestamp
-from swift.obj import server
+from swift.common.utils import Timestamp, list_from_csv
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
     get_container_info as _real_get_container_info
-from swift.common.storage_policy import POLICIES, ECDriverError, StoragePolicy
+from swift.common.storage_policy import POLICIES, ECDriverError, \
+    StoragePolicy, ECStoragePolicy
 
 from test.unit import FakeRing, FakeMemcache, fake_http_connect, \
     debug_logger, patch_policies, SlowBody, FakeStatus, \
-    encode_frag_archive_bodies
+    DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub, \
+    fake_ec_node_response, StubResponse, mocked_http_conn
 from test.unit.proxy.test_server import node_error_count
 
 
@@ -168,8 +169,10 @@ class BaseObjectControllerMixin(object):
 
         self.logger = debug_logger('proxy-server')
         self.logger.thread_locals = ('txn1', '127.0.0.2')
+        # increase connection timeout to avoid intermittent failures
+        conf = {'conn_timeout': 1.0}
         self.app = PatchedObjControllerApp(
-            None, FakeMemcache(), account_ring=FakeRing(),
+            conf, FakeMemcache(), account_ring=FakeRing(),
             container_ring=FakeRing(), logger=self.logger)
 
         # you can over-ride the container_info just by setting it on the app
@@ -193,13 +196,17 @@ class BaseObjectControllerMixin(object):
         policy = policy or POLICIES.default
         return policy.quorum
 
+
+class CommonObjectControllerMixin(BaseObjectControllerMixin):
+    # defines tests that are common to all storage policy types
     def test_iter_nodes_local_first_noops_when_no_affinity(self):
         # this test needs a stable node order - most don't
-        self.app.sort_nodes = lambda l: l
+        self.app.sort_nodes = lambda l, *args, **kwargs: l
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        self.app.write_affinity_is_local_fn = None
-        object_ring = self.app.get_object_ring(None)
+        policy = self.policy
+        self.app.get_policy_options(policy).write_affinity_is_local_fn = None
+        object_ring = policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
 
@@ -213,12 +220,13 @@ class BaseObjectControllerMixin(object):
     def test_iter_nodes_local_first_moves_locals_first(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        self.app.write_affinity_is_local_fn = (
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
             lambda node: node['region'] == 1)
         # we'll write to one more than replica count local nodes
-        self.app.write_affinity_node_count = lambda r: r + 1
+        policy_conf.write_affinity_node_count_fn = lambda r: r + 1
 
-        object_ring = self.app.get_object_ring(None)
+        object_ring = self.policy.object_ring
         # make our fake ring have plenty of nodes, and not get limited
         # artificially by the proxy max request node count
         object_ring.max_more_nodes = 100000
@@ -234,7 +242,7 @@ class BaseObjectControllerMixin(object):
 
         # make sure we have enough local nodes (sanity)
         all_local_nodes = [n for n in all_nodes if
-                           self.app.write_affinity_is_local_fn(n)]
+                           policy_conf.write_affinity_is_local_fn(n)]
         self.assertGreaterEqual(len(all_local_nodes), self.replicas() + 1)
 
         # finally, create the local_first_nodes iter and flatten it out
@@ -252,10 +260,11 @@ class BaseObjectControllerMixin(object):
     def test_iter_nodes_local_first_best_effort(self):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
-        self.app.write_affinity_is_local_fn = (
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
             lambda node: node['region'] == 1)
 
-        object_ring = self.app.get_object_ring(None)
+        object_ring = self.policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
 
@@ -266,7 +275,7 @@ class BaseObjectControllerMixin(object):
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
         all_local_nodes = [n for n in all_nodes if
-                           self.app.write_affinity_is_local_fn(n)]
+                           policy_conf.write_affinity_is_local_fn(n)]
         self.assertEqual(len(all_local_nodes), self.replicas())
         # but the local nodes we do have are at the front of the local iter
         first_n_local_first_nodes = local_first_nodes[:len(all_local_nodes)]
@@ -275,6 +284,86 @@ class BaseObjectControllerMixin(object):
         # but we *still* don't *skip* any nodes
         self.assertEqual(len(all_nodes), len(local_first_nodes))
         self.assertEqual(sorted(all_nodes), sorted(local_first_nodes))
+
+    def test_iter_nodes_local_handoff_first_noops_when_no_affinity(self):
+        # this test needs a stable node order - most don't
+        self.app.sort_nodes = lambda l, *args, **kwargs: l
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        policy = self.policy
+        self.app.get_policy_options(policy).write_affinity_is_local_fn = None
+        object_ring = policy.object_ring
+        all_nodes = object_ring.get_part_nodes(1)
+        all_nodes.extend(object_ring.get_more_nodes(1))
+
+        local_first_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, local_handoffs_first=True))
+
+        self.maxDiff = None
+
+        self.assertEqual(all_nodes, local_first_nodes)
+
+    def test_iter_nodes_handoff_local_first_default(self):
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+
+        object_ring = self.policy.object_ring
+        primary_nodes = object_ring.get_part_nodes(1)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        all_nodes = primary_nodes + list(handoff_nodes_iter)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        local_handoffs = [n for n in handoff_nodes_iter if
+                          policy_conf.write_affinity_is_local_fn(n)]
+
+        prefered_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, local_handoffs_first=True))
+
+        self.assertEqual(len(all_nodes), self.replicas() +
+                         POLICIES.default.object_ring.max_more_nodes)
+
+        first_primary_nodes = prefered_nodes[:len(primary_nodes)]
+        self.assertEqual(sorted(primary_nodes), sorted(first_primary_nodes))
+
+        handoff_count = self.replicas() - len(primary_nodes)
+        first_handoffs = prefered_nodes[len(primary_nodes):][:handoff_count]
+        self.assertEqual(first_handoffs, local_handoffs[:handoff_count])
+
+    def test_iter_nodes_handoff_local_first_non_default(self):
+        # Obviously this test doesn't work if we're testing 1 replica.
+        # In that case, we don't have any failovers to check.
+        if self.replicas() == 1:
+            return
+
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+        policy_conf.write_affinity_handoff_delete_count = 1
+
+        object_ring = self.policy.object_ring
+        primary_nodes = object_ring.get_part_nodes(1)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        all_nodes = primary_nodes + list(handoff_nodes_iter)
+        handoff_nodes_iter = object_ring.get_more_nodes(1)
+        local_handoffs = [n for n in handoff_nodes_iter if
+                          policy_conf.write_affinity_is_local_fn(n)]
+
+        prefered_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, local_handoffs_first=True))
+
+        self.assertEqual(len(all_nodes), self.replicas() +
+                         POLICIES.default.object_ring.max_more_nodes)
+
+        first_primary_nodes = prefered_nodes[:len(primary_nodes)]
+        self.assertEqual(sorted(primary_nodes), sorted(first_primary_nodes))
+
+        handoff_count = policy_conf.write_affinity_handoff_delete_count
+        first_handoffs = prefered_nodes[len(primary_nodes):][:handoff_count]
+        self.assertEqual(first_handoffs, local_handoffs[:handoff_count])
 
     def test_connect_put_node_timeout(self):
         controller = self.controller_cls(
@@ -365,6 +454,165 @@ class BaseObjectControllerMixin(object):
         with set_http_connect(507, *codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+
+    def test_DELETE_limits_expirer_queue_updates(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [204] * self.replicas()
+        captured_headers = []
+
+        def capture_headers(ip, port, device, part, method, path,
+                            headers=None, **kwargs):
+            captured_headers.append(headers)
+
+        with set_http_connect(*codes, give_connect=capture_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)  # sanity check
+
+        counts = {True: 0, False: 0, None: 0}
+        for headers in captured_headers:
+            v = headers.get('X-Backend-Clean-Expiring-Object-Queue')
+            norm_v = None if v is None else utils.config_true_value(v)
+            counts[norm_v] += 1
+
+        max_queue_updates = 2
+        o_replicas = self.replicas()
+        self.assertEqual(counts, {
+            True: min(max_queue_updates, o_replicas),
+            False: max(o_replicas - max_queue_updates, 0),
+            None: 0,
+        })
+
+    def test_expirer_DELETE_suppresses_expirer_queue_updates(self):
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='DELETE', headers={
+                'X-Backend-Clean-Expiring-Object-Queue': 'no'})
+        codes = [204] * self.replicas()
+        captured_headers = []
+
+        def capture_headers(ip, port, device, part, method, path,
+                            headers=None, **kwargs):
+            captured_headers.append(headers)
+
+        with set_http_connect(*codes, give_connect=capture_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 204)  # sanity check
+
+        counts = {True: 0, False: 0, None: 0}
+        for headers in captured_headers:
+            v = headers.get('X-Backend-Clean-Expiring-Object-Queue')
+            norm_v = None if v is None else utils.config_true_value(v)
+            counts[norm_v] += 1
+
+        o_replicas = self.replicas()
+        self.assertEqual(counts, {
+            True: 0,
+            False: o_replicas,
+            None: 0,
+        })
+
+        # Make sure we're not sending any expirer-queue update headers here.
+        # Since we're not updating the expirer queue, these headers would be
+        # superfluous.
+        for headers in captured_headers:
+            self.assertNotIn('X-Delete-At-Container', headers)
+            self.assertNotIn('X-Delete-At-Partition', headers)
+            self.assertNotIn('X-Delete-At-Host', headers)
+            self.assertNotIn('X-Delete-At-Device', headers)
+
+    def test_DELETE_write_affinity_before_replication(self):
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_handoff_delete_count = self.replicas() / 2
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+        handoff_count = policy_conf.write_affinity_handoff_delete_count
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = [204] * self.replicas() + [404] * handoff_count
+        with set_http_connect(*codes):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 204)
+
+    def test_DELETE_write_affinity_after_replication(self):
+        policy_conf = self.app.get_policy_options(self.policy)
+        policy_conf.write_affinity_handoff_delete_count = self.replicas() / 2
+        policy_conf.write_affinity_is_local_fn = (
+            lambda node: node['region'] == 1)
+        handoff_count = policy_conf.write_affinity_handoff_delete_count
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        codes = ([204] * (self.replicas() - handoff_count) +
+                 [404] * handoff_count +
+                 [204] * handoff_count)
+        with set_http_connect(*codes):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 204)
+
+    def test_PUT_limits_expirer_queue_deletes(self):
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='PUT', body='',
+            headers={'Content-Type': 'application/octet-stream'})
+        codes = [201] * self.replicas()
+        captured_headers = []
+
+        def capture_headers(ip, port, device, part, method, path,
+                            headers=None, **kwargs):
+            captured_headers.append(headers)
+
+        expect_headers = {
+            'X-Obj-Metadata-Footer': 'yes',
+            'X-Obj-Multiphase-Commit': 'yes'
+        }
+        with set_http_connect(*codes, give_connect=capture_headers,
+                              expect_headers=expect_headers):
+            # this req may or may not succeed depending on the Putter type used
+            # but that's ok because we're only interested in verifying the
+            # headers that were sent
+            req.get_response(self.app)
+
+        counts = {True: 0, False: 0, None: 0}
+        for headers in captured_headers:
+            v = headers.get('X-Backend-Clean-Expiring-Object-Queue')
+            norm_v = None if v is None else utils.config_true_value(v)
+            counts[norm_v] += 1
+
+        max_queue_updates = 2
+        o_replicas = self.replicas()
+        self.assertEqual(counts, {
+            True: min(max_queue_updates, o_replicas),
+            False: max(o_replicas - max_queue_updates, 0),
+            None: 0,
+        })
+
+    def test_POST_limits_expirer_queue_deletes(self):
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='POST', body='',
+            headers={'Content-Type': 'application/octet-stream'})
+        codes = [201] * self.replicas()
+        captured_headers = []
+
+        def capture_headers(ip, port, device, part, method, path,
+                            headers=None, **kwargs):
+            captured_headers.append(headers)
+
+        with set_http_connect(*codes, give_connect=capture_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)  # sanity check
+
+        counts = {True: 0, False: 0, None: 0}
+        for headers in captured_headers:
+            v = headers.get('X-Backend-Clean-Expiring-Object-Queue')
+            norm_v = None if v is None else utils.config_true_value(v)
+            counts[norm_v] += 1
+
+        max_queue_updates = 2
+        o_replicas = self.replicas()
+        self.assertEqual(counts, {
+            True: min(max_queue_updates, o_replicas),
+            False: max(o_replicas - max_queue_updates, 0),
+            None: 0,
+        })
 
     def test_POST_non_int_delete_after(self):
         t = str(int(time.time() + 100)) + '.1'
@@ -474,7 +722,7 @@ class BaseObjectControllerMixin(object):
     def test_HEAD_x_newest_with_two_vector_timestamps(self):
         req = swob.Request.blank('/v1/a/c/o', method='HEAD',
                                  headers={'X-Newest': 'true'})
-        ts = (utils.Timestamp(time.time(), offset=offset)
+        ts = (utils.Timestamp.now(offset=offset)
               for offset in itertools.count())
         timestamps = [next(ts) for i in range(self.replicas())]
         newest_timestamp = timestamps[-1]
@@ -560,26 +808,211 @@ class BaseObjectControllerMixin(object):
                     req, self.replicas(policy), 1, containers)
 
                 # how many of the backend headers have a container update
-                container_updates = len(
+                n_container_updates = len(
                     [headers for headers in backend_headers
                      if 'X-Container-Partition' in headers])
 
-                if num_containers <= self.quorum(policy):
-                    # filling case
-                    expected = min(self.quorum(policy) + 1,
-                                   self.replicas(policy))
-                else:
-                    # container updates >= object replicas
-                    expected = min(num_containers,
-                                   self.replicas(policy))
+                # how many object-server PUTs can fail and still let the
+                # client PUT succeed
+                n_can_fail = self.replicas(policy) - self.quorum(policy)
+                n_expected_updates = (
+                    n_can_fail + utils.quorum_size(num_containers))
 
-                self.assertEqual(container_updates, expected)
+                # you get at least one update per container no matter what
+                n_expected_updates = max(
+                    n_expected_updates, num_containers)
 
-# end of BaseObjectControllerMixin
+                # you can't have more object requests with updates than you
+                # have object requests (the container stuff gets doubled up,
+                # but that's not important for purposes of durability)
+                n_expected_updates = min(
+                    n_expected_updates, self.replicas(policy))
+                self.assertEqual(n_expected_updates, n_container_updates)
+
+    def test_delete_at_backend_requests(self):
+        t = str(int(time.time() + 100))
+        for policy in POLICIES:
+            req = swift.common.swob.Request.blank(
+                '/v1/a/c/o', method='PUT',
+                headers={'Content-Length': '0',
+                         'X-Backend-Storage-Policy-Index': int(policy),
+                         'X-Delete-At': t})
+            controller = self.controller_cls(self.app, 'a', 'c', 'o')
+
+            for num_del_at_nodes in range(1, 16):
+                containers = [
+                    {'ip': '2.0.0.%s' % i, 'port': '70%s' % str(i).zfill(2),
+                     'device': 'sdc'} for i in range(num_del_at_nodes)]
+                del_at_nodes = [
+                    {'ip': '1.0.0.%s' % i, 'port': '60%s' % str(i).zfill(2),
+                     'device': 'sdb'} for i in range(num_del_at_nodes)]
+
+                backend_headers = controller._backend_requests(
+                    req, self.replicas(policy), 1, containers,
+                    delete_at_container='dac', delete_at_partition=2,
+                    delete_at_nodes=del_at_nodes)
+
+                devices = []
+                hosts = []
+                part = ctr = 0
+                for given_headers in backend_headers:
+                    self.assertEqual(given_headers.get('X-Delete-At'), t)
+                    if 'X-Delete-At-Partition' in given_headers:
+                        self.assertEqual(
+                            given_headers.get('X-Delete-At-Partition'), '2')
+                        part += 1
+                    if 'X-Delete-At-Container' in given_headers:
+                        self.assertEqual(
+                            given_headers.get('X-Delete-At-Container'), 'dac')
+                        ctr += 1
+                    devices += (
+                        list_from_csv(given_headers.get('X-Delete-At-Device')))
+                    hosts += (
+                        list_from_csv(given_headers.get('X-Delete-At-Host')))
+
+                # same as in test_container_update_backend_requests
+                n_can_fail = self.replicas(policy) - self.quorum(policy)
+                n_expected_updates = (
+                    n_can_fail + utils.quorum_size(num_del_at_nodes))
+
+                n_expected_hosts = max(
+                    n_expected_updates, num_del_at_nodes)
+
+                self.assertEqual(len(hosts), n_expected_hosts)
+                self.assertEqual(len(devices), n_expected_hosts)
+
+                # parts don't get doubled up, maximum is count of obj requests
+                n_expected_parts = min(
+                    n_expected_hosts, self.replicas(policy))
+                self.assertEqual(part, n_expected_parts)
+                self.assertEqual(ctr, n_expected_parts)
+
+                # check that hosts are correct
+                self.assertEqual(
+                    set(hosts),
+                    set('%s:%s' % (h['ip'], h['port']) for h in del_at_nodes))
+                self.assertEqual(set(devices), set(('sdb',)))
+
+    def test_smooth_distributed_backend_requests(self):
+        t = str(int(time.time() + 100))
+        for policy in POLICIES:
+            req = swift.common.swob.Request.blank(
+                '/v1/a/c/o', method='PUT',
+                headers={'Content-Length': '0',
+                         'X-Backend-Storage-Policy-Index': int(policy),
+                         'X-Delete-At': t})
+            controller = self.controller_cls(self.app, 'a', 'c', 'o')
+
+            for num_containers in range(1, 16):
+                containers = [
+                    {'ip': '2.0.0.%s' % i, 'port': '70%s' % str(i).zfill(2),
+                     'device': 'sdc'} for i in range(num_containers)]
+                del_at_nodes = [
+                    {'ip': '1.0.0.%s' % i, 'port': '60%s' % str(i).zfill(2),
+                     'device': 'sdb'} for i in range(num_containers)]
+
+                backend_headers = controller._backend_requests(
+                    req, self.replicas(policy), 1, containers,
+                    delete_at_container='dac', delete_at_partition=2,
+                    delete_at_nodes=del_at_nodes)
+
+                # caculate no of expected updates, see
+                # test_container_update_backend_requests for explanation
+                n_expected_updates = min(max(
+                    self.replicas(policy) - self.quorum(policy) +
+                    utils.quorum_size(num_containers), num_containers),
+                    self.replicas(policy))
+
+                # the first n_expected_updates servers should have received
+                # a container update
+                self.assertTrue(
+                    all([h.get('X-Container-Partition')
+                         for h in backend_headers[:n_expected_updates]]))
+                # the last n_expected_updates servers should have received
+                # the x-delete-at* headers
+                self.assertTrue(
+                    all([h.get('X-Delete-At-Container')
+                         for h in backend_headers[-n_expected_updates:]]))
+
+    def _check_write_affinity(
+            self, conf, policy_conf, policy, affinity_regions, affinity_count):
+        conf['policy_config'] = policy_conf
+        app = PatchedObjControllerApp(
+            conf, FakeMemcache(), account_ring=FakeRing(),
+            container_ring=FakeRing(), logger=self.logger)
+
+        controller = self.controller_cls(app, 'a', 'c', 'o')
+
+        object_ring = app.get_object_ring(int(policy))
+        # make our fake ring have plenty of nodes, and not get limited
+        # artificially by the proxy max request node count
+        object_ring.max_more_nodes = 100
+
+        all_nodes = object_ring.get_part_nodes(1)
+        all_nodes.extend(object_ring.get_more_nodes(1))
+
+        # make sure we have enough local nodes (sanity)
+        all_local_nodes = [n for n in all_nodes if
+                           n['region'] in affinity_regions]
+        self.assertGreaterEqual(len(all_local_nodes), affinity_count)
+
+        # finally, create the local_first_nodes iter and flatten it out
+        local_first_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, policy))
+
+        # check that the required number of local nodes were moved up the order
+        node_regions = [node['region'] for node in local_first_nodes]
+        self.assertTrue(
+            all(r in affinity_regions for r in node_regions[:affinity_count]),
+            'Unexpected region found in local nodes, expected %s but got %s' %
+            (affinity_regions, node_regions))
+        return app
+
+    def test_write_affinity_not_configured(self):
+        # default is no write affinity so expect both regions 0 and 1
+        self._check_write_affinity({}, {}, POLICIES[0], [0, 1],
+                                   2 * self.replicas(POLICIES[0]))
+        self._check_write_affinity({}, {}, POLICIES[1], [0, 1],
+                                   2 * self.replicas(POLICIES[1]))
+
+    def test_write_affinity_proxy_server_config(self):
+        # without overrides policies use proxy-server config section options
+        conf = {'write_affinity_node_count': '1 * replicas',
+                'write_affinity': 'r0'}
+        self._check_write_affinity(conf, {}, POLICIES[0], [0],
+                                   self.replicas(POLICIES[0]))
+        self._check_write_affinity(conf, {}, POLICIES[1], [0],
+                                   self.replicas(POLICIES[1]))
+
+    def test_write_affinity_per_policy_config(self):
+        # check only per-policy configuration is sufficient
+        conf = {}
+        policy_conf = {'0': {'write_affinity_node_count': '1 * replicas',
+                             'write_affinity': 'r1'},
+                       '1': {'write_affinity_node_count': '5',
+                             'write_affinity': 'r0'}}
+        self._check_write_affinity(conf, policy_conf, POLICIES[0], [1],
+                                   self.replicas(POLICIES[0]))
+        self._check_write_affinity(conf, policy_conf, POLICIES[1], [0], 5)
+
+    def test_write_affinity_per_policy_config_overrides_and_inherits(self):
+        # check per-policy config is preferred over proxy-server section config
+        conf = {'write_affinity_node_count': '1 * replicas',
+                'write_affinity': 'r0'}
+        policy_conf = {'0': {'write_affinity': 'r1'},
+                       '1': {'write_affinity_node_count': '3 * replicas'}}
+        # policy 0 inherits default node count, override affinity to r1
+        self._check_write_affinity(conf, policy_conf, POLICIES[0], [1],
+                                   self.replicas(POLICIES[0]))
+        # policy 1 inherits default affinity to r0, overrides node count
+        self._check_write_affinity(conf, policy_conf, POLICIES[1], [0],
+                                   3 * self.replicas(POLICIES[1]))
+
+# end of CommonObjectControllerMixin
 
 
 @patch_policies()
-class TestReplicatedObjController(BaseObjectControllerMixin,
+class TestReplicatedObjController(CommonObjectControllerMixin,
                                   unittest.TestCase):
 
     controller_cls = obj.ReplicatedObjectController
@@ -655,13 +1088,13 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         for connection_id, info in put_requests.items():
             body = ''.join(info['chunks'])
             headers = info['headers']
-            if chunked:
+            if chunked or not test_body:
                 body = unchunk_body(body)
                 self.assertEqual('100-continue', headers['Expect'])
                 self.assertEqual('chunked', headers['Transfer-Encoding'])
             else:
                 self.assertNotIn('Transfer-Encoding', headers)
-            if body:
+            if body or not test_body:
                 self.assertEqual('100-continue', headers['Expect'])
             else:
                 self.assertNotIn('Expect', headers)
@@ -681,105 +1114,6 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
     def test_PUT_with_no_body_and_no_footers(self):
         self._test_PUT_with_no_footers(test_body='', chunked=False)
-
-    def _test_PUT_with_footers(self, test_body=''):
-        # verify that when footers are required the PUT body is multipart
-        # and the footers are appended
-        footers_callback = make_footers_callback(test_body)
-        env = {'swift.callback.update_footers': footers_callback}
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              environ=env)
-        req.body = test_body
-        # send bogus Etag header to differentiate from footer value
-        req.headers['Etag'] = 'header_etag'
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes'
-        }
-
-        put_requests = defaultdict(
-            lambda: {'headers': None, 'chunks': [], 'connection': None})
-
-        def capture_body(conn, chunk):
-            put_requests[conn.connection_id]['chunks'].append(chunk)
-            put_requests[conn.connection_id]['connection'] = conn
-
-        def capture_headers(ip, port, device, part, method, path, headers,
-                            **kwargs):
-            conn_id = kwargs['connection_id']
-            put_requests[conn_id]['headers'] = headers
-
-        resp_headers = {
-            'Etag': '"resp_etag"',
-            # NB: ignored!
-            'Some-Header': 'Four',
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_send=capture_body,
-                              give_connect=capture_headers,
-                              headers=resp_headers):
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 201)
-        timestamps = {captured_req['headers']['x-timestamp']
-                      for captured_req in put_requests.values()}
-        self.assertEqual(1, len(timestamps), timestamps)
-        self.assertEqual(dict(resp.headers), {
-            'Content-Type': 'text/html; charset=UTF-8',
-            'Content-Length': '0',
-            'Etag': 'resp_etag',
-            'Last-Modified': time.strftime(
-                "%a, %d %b %Y %H:%M:%S GMT",
-                time.gmtime(math.ceil(float(timestamps.pop())))),
-        })
-        for connection_id, info in put_requests.items():
-            body = unchunk_body(''.join(info['chunks']))
-            headers = info['headers']
-            boundary = headers['X-Backend-Obj-Multipart-Mime-Boundary']
-            self.assertTrue(boundary is not None,
-                            "didn't get boundary for conn %r" % (
-                                connection_id,))
-            self.assertEqual('chunked', headers['Transfer-Encoding'])
-            self.assertEqual('100-continue', headers['Expect'])
-            self.assertEqual('yes', headers['X-Backend-Obj-Metadata-Footer'])
-            self.assertNotIn('X-Backend-Obj-Multiphase-Commit', headers)
-            self.assertEqual('header_etag', headers['Etag'])
-
-            # email.parser.FeedParser doesn't know how to take a multipart
-            # message and boundary together and parse it; it only knows how
-            # to take a string, parse the headers, and figure out the
-            # boundary on its own.
-            parser = email.parser.FeedParser()
-            parser.feed(
-                "Content-Type: multipart/nobodycares; boundary=%s\r\n\r\n" %
-                boundary)
-            parser.feed(body)
-            message = parser.close()
-
-            self.assertTrue(message.is_multipart())  # sanity check
-            mime_parts = message.get_payload()
-            # notice, no commit confirmation
-            self.assertEqual(len(mime_parts), 2)
-            obj_part, footer_part = mime_parts
-
-            self.assertEqual(obj_part['X-Document'], 'object body')
-            self.assertEqual(test_body, obj_part.get_payload())
-
-            # validate footer metadata
-            self.assertEqual(footer_part['X-Document'], 'object metadata')
-            footer_metadata = json.loads(footer_part.get_payload())
-            self.assertTrue(footer_metadata)
-            expected = {}
-            footers_callback(expected)
-            self.assertDictEqual(expected, footer_metadata)
-
-            self.assertTrue(info['connection'].closed)
-
-    def test_PUT_with_body_and_footers(self):
-        self._test_PUT_with_footers(test_body='asdf')
-
-    def test_PUT_with_no_body_and_footers(self):
-        self._test_PUT_with_footers()
 
     def test_txn_id_logging_on_PUT(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
@@ -843,7 +1177,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
     def test_PUT_connect_exceptions(self):
         object_ring = self.app.get_object_ring(None)
-        self.app.sort_nodes = lambda n: n  # disable shuffle
+        self.app.sort_nodes = lambda n, *args, **kwargs: n  # disable shuffle
 
         def test_status_map(statuses, expected):
             self.app._error_limiting = {}
@@ -1110,10 +1444,11 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        with set_http_connect(200):
+        with set_http_connect(200, headers={'Connection': 'close'}):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
+        self.assertNotIn('Connection', resp.headers)
 
     def test_GET_transfer_encoding_chunked(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -1160,6 +1495,35 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         codes = [404] * (self.obj_ring.replicas +
                          self.obj_ring.max_more_nodes)
         with set_http_connect(*codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+
+    def test_GET_not_found_when_404_newer(self):
+        # if proxy receives a 404, it keeps waiting for other connections until
+        # max number of nodes in hopes of finding an object, but if 404 is
+        # more recent than a 200, then it should ignore 200 and return 404
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        codes = [404] * self.obj_ring.replicas + \
+                [200] * self.obj_ring.max_more_nodes
+        ts_iter = iter([2] * self.obj_ring.replicas +
+                       [1] * self.obj_ring.max_more_nodes)
+        with set_http_connect(*codes, timestamps=ts_iter):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+
+    def test_GET_x_newest_not_found_when_404_newer(self):
+        # if proxy receives a 404, it keeps waiting for other connections until
+        # max number of nodes in hopes of finding an object, but if 404 is
+        # more recent than a 200, then it should ignore 200 and return 404
+        req = swift.common.swob.Request.blank('/v1/a/c/o',
+                                              headers={'X-Newest': 'true'})
+        codes = ([200] +
+                 [404] * self.obj_ring.replicas +
+                 [200] * (self.obj_ring.max_more_nodes - 1))
+        ts_iter = iter([1] +
+                       [2] * self.obj_ring.replicas +
+                       [1] * (self.obj_ring.max_more_nodes - 1))
+        with set_http_connect(*codes, timestamps=ts_iter):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
@@ -1214,7 +1578,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         test_indexes = [None] + [int(p) for p in POLICIES]
         for policy_index in test_indexes:
             self.app.container_info['storage_policy'] = policy_index
-            put_timestamp = utils.Timestamp(time.time()).normal
+            put_timestamp = utils.Timestamp.now().normal
             req = swob.Request.blank(
                 '/v1/a/c/o', method='PUT', headers={
                     'Content-Length': 0,
@@ -1228,7 +1592,7 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
         test_indexes = [None] + [int(p) for p in POLICIES]
         for policy_index in test_indexes:
             self.app.container_info['storage_policy'] = policy_index
-            put_timestamp = utils.Timestamp(time.time()).normal
+            put_timestamp = utils.Timestamp.now().normal
             req = swob.Request.blank(
                 '/v1/a/c/o', method='PUT', headers={
                     'Content-Length': 0,
@@ -1360,6 +1724,52 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
                 resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 202)
 
+    def test_x_timestamp_not_overridden(self):
+        def do_test(method, base_headers, resp_code):
+            # no given x-timestamp
+            req = swob.Request.blank(
+                '/v1/a/c/o', method=method, headers=base_headers)
+            codes = [resp_code] * self.replicas()
+            with mocked_http_conn(*codes) as fake_conn:
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, resp_code)
+            self.assertEqual(self.replicas(), len(fake_conn.requests))
+            for req in fake_conn.requests:
+                self.assertIn('X-Timestamp', req['headers'])
+                # check value can be parsed as valid timestamp
+                Timestamp(req['headers']['X-Timestamp'])
+
+            # given x-timestamp is retained
+            def do_check(ts):
+                headers = dict(base_headers)
+                headers['X-Timestamp'] = ts.internal
+                req = swob.Request.blank(
+                    '/v1/a/c/o', method=method, headers=headers)
+                codes = [resp_code] * self.replicas()
+                with mocked_http_conn(*codes) as fake_conn:
+                    resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, resp_code)
+                self.assertEqual(self.replicas(), len(fake_conn.requests))
+                for req in fake_conn.requests:
+                    self.assertEqual(ts.internal,
+                                     req['headers']['X-Timestamp'])
+
+            do_check(Timestamp.now())
+            do_check(Timestamp.now(offset=123))
+
+            # given x-timestamp gets sanity checked
+            headers = dict(base_headers)
+            headers['X-Timestamp'] = 'bad timestamp'
+            req = swob.Request.blank(
+                '/v1/a/c/o', method=method, headers=headers)
+            with mocked_http_conn() as fake_conn:
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 400)
+            self.assertIn('X-Timestamp should be a UNIX timestamp ', resp.body)
+
+        do_test('PUT', {'Content-Length': 0}, 200)
+        do_test('DELETE', {}, 204)
+
 
 @patch_policies(
     [StoragePolicy(0, '1-replica', True),
@@ -1368,33 +1778,127 @@ class TestReplicatedObjController(BaseObjectControllerMixin,
      StoragePolicy(3, '15-replica', False)],
     fake_ring_args=[
         {'replicas': 1}, {'replicas': 5}, {'replicas': 8}, {'replicas': 15}])
-class TestReplicatedObjControllerVariousReplicas(BaseObjectControllerMixin,
+class TestReplicatedObjControllerVariousReplicas(CommonObjectControllerMixin,
                                                  unittest.TestCase):
     controller_cls = obj.ReplicatedObjectController
 
 
-class StubResponse(object):
+@patch_policies()
+class TestReplicatedObjControllerMimePutter(BaseObjectControllerMixin,
+                                            unittest.TestCase):
+    # tests specific to PUTs using a MimePutter
+    expect_headers = {
+        'X-Obj-Metadata-Footer': 'yes'
+    }
 
-    def __init__(self, status, body='', headers=None, frag_index=None):
-        self.status = status
-        self.body = body
-        self.readable = BytesIO(body)
-        self.headers = HeaderKeyDict(headers)
-        if frag_index is not None:
-            self.headers['X-Object-Sysmeta-Ec-Frag-Index'] = frag_index
-        fake_reason = ('Fake', 'This response is a lie.')
-        self.reason = swob.RESPONSE_REASONS.get(status, fake_reason)[0]
+    def setUp(self):
+        super(TestReplicatedObjControllerMimePutter, self).setUp()
+        # force use of a MimePutter
+        self.app.use_put_v1 = False
 
-    def getheader(self, header_name, default=None):
-        return self.headers.get(header_name, default)
+    def test_PUT_error(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [503] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
 
-    def getheaders(self):
-        if 'Content-Length' not in self.headers:
-            self.headers['Content-Length'] = len(self.body)
-        return self.headers.items()
+    def _test_PUT_with_footers(self, test_body=''):
+        # verify that when footers are required the PUT body is multipart
+        # and the footers are appended
+        footers_callback = make_footers_callback(test_body)
+        env = {'swift.callback.update_footers': footers_callback}
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              environ=env)
+        req.body = test_body
+        # send bogus Etag header to differentiate from footer value
+        req.headers['Etag'] = 'header_etag'
+        codes = [201] * self.replicas()
 
-    def read(self, amt=0):
-        return self.readable.read(amt)
+        put_requests = defaultdict(
+            lambda: {'headers': None, 'chunks': [], 'connection': None})
+
+        def capture_body(conn, chunk):
+            put_requests[conn.connection_id]['chunks'].append(chunk)
+            put_requests[conn.connection_id]['connection'] = conn
+
+        def capture_headers(ip, port, device, part, method, path, headers,
+                            **kwargs):
+            conn_id = kwargs['connection_id']
+            put_requests[conn_id]['headers'] = headers
+
+        resp_headers = {
+            'Etag': '"resp_etag"',
+            # NB: ignored!
+            'Some-Header': 'Four',
+        }
+        with set_http_connect(*codes, expect_headers=self.expect_headers,
+                              give_send=capture_body,
+                              give_connect=capture_headers,
+                              headers=resp_headers):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 201)
+        timestamps = {captured_req['headers']['x-timestamp']
+                      for captured_req in put_requests.values()}
+        self.assertEqual(1, len(timestamps), timestamps)
+        self.assertEqual(dict(resp.headers), {
+            'Content-Type': 'text/html; charset=UTF-8',
+            'Content-Length': '0',
+            'Etag': 'resp_etag',
+            'Last-Modified': time.strftime(
+                "%a, %d %b %Y %H:%M:%S GMT",
+                time.gmtime(math.ceil(float(timestamps.pop())))),
+        })
+        for connection_id, info in put_requests.items():
+            body = unchunk_body(''.join(info['chunks']))
+            headers = info['headers']
+            boundary = headers['X-Backend-Obj-Multipart-Mime-Boundary']
+            self.assertTrue(boundary is not None,
+                            "didn't get boundary for conn %r" % (
+                                connection_id,))
+            self.assertEqual('chunked', headers['Transfer-Encoding'])
+            self.assertEqual('100-continue', headers['Expect'])
+            self.assertEqual('yes', headers['X-Backend-Obj-Metadata-Footer'])
+            self.assertNotIn('X-Backend-Obj-Multiphase-Commit', headers)
+            self.assertEqual('header_etag', headers['Etag'])
+
+            # email.parser.FeedParser doesn't know how to take a multipart
+            # message and boundary together and parse it; it only knows how
+            # to take a string, parse the headers, and figure out the
+            # boundary on its own.
+            parser = email.parser.FeedParser()
+            parser.feed(
+                "Content-Type: multipart/nobodycares; boundary=%s\r\n\r\n" %
+                boundary)
+            parser.feed(body)
+            message = parser.close()
+
+            self.assertTrue(message.is_multipart())  # sanity check
+            mime_parts = message.get_payload()
+            # notice, no commit confirmation
+            self.assertEqual(len(mime_parts), 2)
+            obj_part, footer_part = mime_parts
+
+            self.assertEqual(obj_part['X-Document'], 'object body')
+            self.assertEqual(test_body, obj_part.get_payload())
+
+            # validate footer metadata
+            self.assertEqual(footer_part['X-Document'], 'object metadata')
+            footer_metadata = json.loads(footer_part.get_payload())
+            self.assertTrue(footer_metadata)
+            expected = {}
+            footers_callback(expected)
+            self.assertDictEqual(expected, footer_metadata)
+
+            self.assertTrue(info['connection'].closed)
+
+    def test_PUT_with_body_and_footers(self):
+        self._test_PUT_with_footers(test_body='asdf')
+
+    def test_PUT_with_no_body_and_footers(self):
+        self._test_PUT_with_footers()
 
 
 @contextmanager
@@ -1405,10 +1909,20 @@ def capture_http_requests(get_response):
         def __init__(self, req):
             self.req = req
             self.resp = None
+            self.path = "/"
 
         def getresponse(self):
             self.resp = get_response(self.req)
             return self.resp
+
+        def putrequest(self, method, path, **kwargs):
+            pass
+
+        def putheader(self, k, v):
+            pass
+
+        def endheaders(self):
+            pass
 
     class ConnectionLog(object):
 
@@ -1445,8 +1959,109 @@ def capture_http_requests(get_response):
         yield fake_conn
 
 
+class ECObjectControllerMixin(CommonObjectControllerMixin):
+    # Add a few helper methods for EC tests.
+    def _make_ec_archive_bodies(self, test_body, policy=None):
+        policy = policy or self.policy
+        return encode_frag_archive_bodies(policy, test_body)
+
+    def _make_ec_object_stub(self, pattern='test', policy=None,
+                             timestamp=None):
+        policy = policy or self.policy
+        test_body = pattern * policy.ec_segment_size
+        test_body = test_body[:-random.randint(1, 1000)]
+        return make_ec_object_stub(test_body, policy, timestamp)
+
+    def _fake_ec_node_response(self, node_frags):
+        return fake_ec_node_response(node_frags, self.policy)
+
+    def test_GET_with_duplicate_but_sufficient_frag_indexes(self):
+        obj1 = self._make_ec_object_stub()
+        # proxy should ignore duplicated frag indexes and continue search for
+        # a set of unique indexes, finding last one on a handoff
+        node_frags = [
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj1, 'frag': 0},  # duplicate frag
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj1, 'frag': 1},  # duplicate frag
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj1, 'frag': 2},  # duplicate frag
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj1, 'frag': 3},  # duplicate frag
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj1, 'frag': 4},  # duplicate frag
+            {'obj': obj1, 'frag': 10},
+            {'obj': obj1, 'frag': 11},
+            {'obj': obj1, 'frag': 12},
+            {'obj': obj1, 'frag': 13},
+        ] * self.policy.ec_duplication_factor
+        node_frags.append({'obj': obj1, 'frag': 5})  # first handoff
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['etag'], obj1['etag'])
+        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+
+        # expect a request to all primaries plus one handoff
+        self.assertEqual(self.replicas() + 1, len(log))
+        collected_indexes = defaultdict(list)
+        for conn in log:
+            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+            if fi is not None:
+                collected_indexes[fi].append(conn)
+        self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
+
+    def test_GET_with_duplicate_but_insufficient_frag_indexes(self):
+        obj1 = self._make_ec_object_stub()
+        # proxy should ignore duplicated frag indexes and continue search for
+        # a set of unique indexes, but fails to find one
+        node_frags = [
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj1, 'frag': 0},  # duplicate frag
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj1, 'frag': 1},  # duplicate frag
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj1, 'frag': 2},  # duplicate frag
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj1, 'frag': 3},  # duplicate frag
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj1, 'frag': 4},  # duplicate frag
+            {'obj': obj1, 'frag': 10},
+            {'obj': obj1, 'frag': 11},
+            {'obj': obj1, 'frag': 12},
+            {'obj': obj1, 'frag': 13},
+        ]
+
+        # ... and the rests are 404s which is limited by request_count
+        # (2 * replicas in default) rather than max_extra_requests limitation
+        # because the retries will be in ResumingGetter if the responses
+        # are 404s
+        node_frags += [[]] * (self.replicas() * 2 - len(node_frags))
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 404)
+
+        # expect a request to all nodes
+        self.assertEqual(2 * self.replicas(), len(log))
+        collected_indexes = defaultdict(list)
+        for conn in log:
+            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+            if fi is not None:
+                collected_indexes[fi].append(conn)
+        self.assertEqual(len(collected_indexes), self.policy.ec_ndata - 1)
+
+
 @patch_policies(with_ec_default=True)
-class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
+class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     container_info = {
         'status': 200,
         'read_acl': None,
@@ -1473,45 +2088,48 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
 
         # create a dummy list of putters, check no handoffs
         putters = []
-        for index in range(0, 4):
+        for index in range(self.policy.object_ring.replica_count):
             putters.append(FakePutter(index))
-        got = controller._determine_chunk_destinations(putters)
+        got = controller._determine_chunk_destinations(putters, self.policy)
         expected = {}
         for i, p in enumerate(putters):
             expected[p] = i
         self.assertEqual(got, expected)
 
         # now lets make a handoff at the end
-        putters[3].node_index = None
-        got = controller._determine_chunk_destinations(putters)
+        orig_index = putters[-1].node_index = None
+        putters[-1].node_index = None
+        got = controller._determine_chunk_destinations(putters, self.policy)
         self.assertEqual(got, expected)
-        putters[3].node_index = 3
+        putters[-1].node_index = orig_index
 
         # now lets make a handoff at the start
         putters[0].node_index = None
-        got = controller._determine_chunk_destinations(putters)
+        got = controller._determine_chunk_destinations(putters, self.policy)
         self.assertEqual(got, expected)
         putters[0].node_index = 0
 
         # now lets make a handoff in the middle
         putters[2].node_index = None
-        got = controller._determine_chunk_destinations(putters)
+        got = controller._determine_chunk_destinations(putters, self.policy)
         self.assertEqual(got, expected)
-        putters[2].node_index = 0
+        putters[2].node_index = 2
 
         # now lets make all of them handoffs
-        for index in range(0, 4):
+        for index in range(self.policy.object_ring.replica_count):
             putters[index].node_index = None
-        got = controller._determine_chunk_destinations(putters)
-        self.assertEqual(got, expected)
+        got = controller._determine_chunk_destinations(putters, self.policy)
+        self.assertEqual(sorted(got), sorted(expected))
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
-        get_resp = [200] * self.policy.ec_ndata
-        with set_http_connect(*get_resp):
+        get_statuses = [200] * self.policy.ec_ndata
+        get_hdrs = [{'Connection': 'close'}] * self.policy.ec_ndata
+        with set_http_connect(*get_statuses, headers=get_hdrs):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
+        self.assertNotIn('Connection', resp.headers)
 
     def _test_if_match(self, method):
         num_responses = self.policy.ec_ndata if method == 'GET' else 1
@@ -1643,7 +2261,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
             fragments = self.policy.pyeclib_driver.encode(chunk)
             if not fragments:
                 break
-            fragment_payloads.append(fragments)
+            fragment_payloads.append(
+                fragments * self.policy.ec_duplication_factor)
         # sanity
         sanity_body = ''
         for fragment_payload in fragment_payloads:
@@ -1666,669 +2285,6 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual(len(real_body), len(resp.body))
         self.assertEqual(real_body, resp.body)
 
-    def test_PUT_simple(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_with_body_and_bad_etag(self):
-        segment_size = self.policy.ec_segment_size
-        test_body = ('asdf' * segment_size)[:-10]
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        conns = []
-
-        def capture_expect(conn):
-            # stash the backend connection so we can verify that it is closed
-            # (no data will be sent)
-            conns.append(conn)
-
-        # send a bad etag in the request headers
-        headers = {'Etag': 'bad etag'}
-        req = swift.common.swob.Request.blank(
-            '/v1/a/c/o', method='PUT', headers=headers, body=test_body)
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_expect=capture_expect):
-            resp = req.get_response(self.app)
-        self.assertEqual(422, resp.status_int)
-        self.assertEqual(self.replicas(), len(conns))
-        for conn in conns:
-            self.assertTrue(conn.closed)
-
-        # make the footers callback send a bad Etag footer
-        footers_callback = make_footers_callback('not the test body')
-        env = {'swift.callback.update_footers': footers_callback}
-        req = swift.common.swob.Request.blank(
-            '/v1/a/c/o', method='PUT', environ=env, body=test_body)
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(422, resp.status_int)
-
-    def test_txn_id_logging_ECPUT(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        self.app.logger.txn_id = req.environ['swift.trans_id'] = 'test-txn-id'
-        codes = [(100, Timeout(), 503, 503)] * self.replicas()
-        stdout = BytesIO()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers), \
-                mock.patch('sys.stdout', stdout):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 503)
-        for line in stdout.getvalue().splitlines():
-            self.assertIn('test-txn-id', line)
-        self.assertIn('Trying to get ',
-                      stdout.getvalue())
-
-    def test_PUT_with_explicit_commit_status(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [(100, 100, 201)] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_error(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [503] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 503)
-
-    def test_PUT_mostly_success(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [201] * self.quorum()
-        codes += [503] * (self.replicas() - len(codes))
-        random.shuffle(codes)
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_error_commit(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [(100, 503, Exception('not used'))] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 503)
-
-    def test_PUT_mostly_success_commit(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [201] * self.quorum()
-        codes += [(100, 503, Exception('not used'))] * (
-            self.replicas() - len(codes))
-        random.shuffle(codes)
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_mostly_error_commit(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [(100, 503, Exception('not used'))] * self.quorum()
-        codes += [201] * (self.replicas() - len(codes))
-        random.shuffle(codes)
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 503)
-
-    def test_PUT_commit_timeout(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [201] * (self.replicas() - 1)
-        codes.append((100, Timeout(), Exception('not used')))
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_commit_exception(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        codes = [201] * (self.replicas() - 1)
-        codes.append((100, Exception('kaboom!'), Exception('not used')))
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_ec_error_during_transfer_data(self):
-        class FakeReader(object):
-            def read(self, size):
-                raise IOError('error message')
-
-        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
-                                 body='test body')
-
-        req.environ['wsgi.input'] = FakeReader()
-        req.headers['content-length'] = '6'
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 499)
-
-    def test_PUT_ec_chunkreadtimeout_during_transfer_data(self):
-        class FakeReader(object):
-            def read(self, size):
-                raise exceptions.ChunkReadTimeout()
-
-        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
-                                 body='test body')
-
-        req.environ['wsgi.input'] = FakeReader()
-        req.headers['content-length'] = '6'
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 408)
-
-    def test_PUT_ec_timeout_during_transfer_data(self):
-        class FakeReader(object):
-            def read(self, size):
-                raise exceptions.Timeout()
-
-        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
-                                 body='test body')
-
-        req.environ['wsgi.input'] = FakeReader()
-        req.headers['content-length'] = '6'
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 499)
-
-    def test_PUT_ec_exception_during_transfer_data(self):
-        class FakeReader(object):
-            def read(self, size):
-                raise Exception('exception message')
-
-        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
-                                 body='test body')
-
-        req.environ['wsgi.input'] = FakeReader()
-        req.headers['content-length'] = '6'
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 500)
-
-    def test_PUT_with_body(self):
-        segment_size = self.policy.ec_segment_size
-        test_body = ('asdf' * segment_size)[:-10]
-        # make the footers callback not include Etag footer so that we can
-        # verify that the correct EC-calculated Etag is included in footers
-        # sent to backend
-        footers_callback = make_footers_callback()
-        env = {'swift.callback.update_footers': footers_callback}
-        req = swift.common.swob.Request.blank(
-            '/v1/a/c/o', method='PUT', environ=env)
-        etag = md5(test_body).hexdigest()
-        size = len(test_body)
-        req.body = test_body
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        resp_headers = {
-            'Some-Other-Header': 'Four',
-            'Etag': 'ignored',
-        }
-
-        put_requests = defaultdict(lambda: {'boundary': None, 'chunks': []})
-
-        def capture_body(conn, chunk):
-            put_requests[conn.connection_id]['chunks'].append(chunk)
-
-        def capture_headers(ip, port, device, part, method, path, headers,
-                            **kwargs):
-            conn_id = kwargs['connection_id']
-            put_requests[conn_id]['boundary'] = headers[
-                'X-Backend-Obj-Multipart-Mime-Boundary']
-            put_requests[conn_id]['backend-content-length'] = headers[
-                'X-Backend-Obj-Content-Length']
-            put_requests[conn_id]['x-timestamp'] = headers[
-                'X-Timestamp']
-
-        with set_http_connect(*codes, expect_headers=expect_headers,
-                              give_send=capture_body,
-                              give_connect=capture_headers,
-                              headers=resp_headers):
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 201)
-        timestamps = {captured_req['x-timestamp']
-                      for captured_req in put_requests.values()}
-        self.assertEqual(1, len(timestamps), timestamps)
-        self.assertEqual(dict(resp.headers), {
-            'Content-Type': 'text/html; charset=UTF-8',
-            'Content-Length': '0',
-            'Last-Modified': time.strftime(
-                "%a, %d %b %Y %H:%M:%S GMT",
-                time.gmtime(math.ceil(float(timestamps.pop())))),
-            'Etag': etag,
-        })
-        frag_archives = []
-        for connection_id, info in put_requests.items():
-            body = unchunk_body(''.join(info['chunks']))
-            self.assertIsNotNone(info['boundary'],
-                                 "didn't get boundary for conn %r" % (
-                                     connection_id,))
-            self.assertTrue(size > int(info['backend-content-length']) > 0,
-                            "invalid backend-content-length for conn %r" % (
-                                connection_id,))
-
-            # email.parser.FeedParser doesn't know how to take a multipart
-            # message and boundary together and parse it; it only knows how
-            # to take a string, parse the headers, and figure out the
-            # boundary on its own.
-            parser = email.parser.FeedParser()
-            parser.feed(
-                "Content-Type: multipart/nobodycares; boundary=%s\r\n\r\n" %
-                info['boundary'])
-            parser.feed(body)
-            message = parser.close()
-
-            self.assertTrue(message.is_multipart())  # sanity check
-            mime_parts = message.get_payload()
-            self.assertEqual(len(mime_parts), 3)
-            obj_part, footer_part, commit_part = mime_parts
-
-            # attach the body to frag_archives list
-            self.assertEqual(obj_part['X-Document'], 'object body')
-            frag_archives.append(obj_part.get_payload())
-
-            # assert length was correct for this connection
-            self.assertEqual(int(info['backend-content-length']),
-                             len(frag_archives[-1]))
-            # assert length was the same for all connections
-            self.assertEqual(int(info['backend-content-length']),
-                             len(frag_archives[0]))
-
-            # validate some footer metadata
-            self.assertEqual(footer_part['X-Document'], 'object metadata')
-            footer_metadata = json.loads(footer_part.get_payload())
-            self.assertTrue(footer_metadata)
-            expected = {}
-            # update expected with footers from the callback...
-            footers_callback(expected)
-            expected.update({
-                'X-Object-Sysmeta-Ec-Content-Length': str(size),
-                'X-Backend-Container-Update-Override-Size': str(size),
-                'X-Object-Sysmeta-Ec-Etag': etag,
-                'X-Backend-Container-Update-Override-Etag': etag,
-                'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
-                'Etag': md5(obj_part.get_payload()).hexdigest()})
-            for header, value in expected.items():
-                self.assertEqual(footer_metadata[header], value)
-
-            # sanity on commit message
-            self.assertEqual(commit_part['X-Document'], 'put commit')
-
-        self.assertEqual(len(frag_archives), self.replicas())
-        fragment_size = self.policy.fragment_size
-        node_payloads = []
-        for fa in frag_archives:
-            payload = [fa[x:x + fragment_size]
-                       for x in range(0, len(fa), fragment_size)]
-            node_payloads.append(payload)
-        fragment_payloads = zip(*node_payloads)
-
-        expected_body = ''
-        for fragment_payload in fragment_payloads:
-            self.assertEqual(len(fragment_payload), self.replicas())
-            if True:
-                fragment_payload = list(fragment_payload)
-            expected_body += self.policy.pyeclib_driver.decode(
-                fragment_payload)
-
-        self.assertEqual(len(test_body), len(expected_body))
-        self.assertEqual(test_body, expected_body)
-
-    def test_PUT_with_footers(self):
-        # verify footers supplied by a footers callback being added to
-        # trailing metadata
-        segment_size = self.policy.ec_segment_size
-        test_body = ('asdf' * segment_size)[:-10]
-        etag = md5(test_body).hexdigest()
-        size = len(test_body)
-        codes = [201] * self.replicas()
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        resp_headers = {
-            'Some-Other-Header': 'Four',
-            'Etag': 'ignored',
-        }
-
-        def do_test(footers_to_add, expect_added):
-            put_requests = defaultdict(
-                lambda: {'boundary': None, 'chunks': []})
-
-            def capture_body(conn, chunk):
-                put_requests[conn.connection_id]['chunks'].append(chunk)
-
-            def capture_headers(ip, port, device, part, method, path, headers,
-                                **kwargs):
-                conn_id = kwargs['connection_id']
-                put_requests[conn_id]['boundary'] = headers[
-                    'X-Backend-Obj-Multipart-Mime-Boundary']
-                put_requests[conn_id]['x-timestamp'] = headers[
-                    'X-Timestamp']
-
-            def footers_callback(footers):
-                footers.update(footers_to_add)
-            env = {'swift.callback.update_footers': footers_callback}
-            req = swift.common.swob.Request.blank(
-                '/v1/a/c/o', method='PUT', environ=env, body=test_body)
-
-            with set_http_connect(*codes, expect_headers=expect_headers,
-                                  give_send=capture_body,
-                                  give_connect=capture_headers,
-                                  headers=resp_headers):
-                resp = req.get_response(self.app)
-
-            self.assertEqual(resp.status_int, 201)
-            timestamps = {captured_req['x-timestamp']
-                          for captured_req in put_requests.values()}
-            self.assertEqual(1, len(timestamps), timestamps)
-            self.assertEqual(dict(resp.headers), {
-                'Content-Type': 'text/html; charset=UTF-8',
-                'Content-Length': '0',
-                'Last-Modified': time.strftime(
-                    "%a, %d %b %Y %H:%M:%S GMT",
-                    time.gmtime(math.ceil(float(timestamps.pop())))),
-                'Etag': etag,
-            })
-            for connection_id, info in put_requests.items():
-                body = unchunk_body(''.join(info['chunks']))
-                # email.parser.FeedParser doesn't know how to take a multipart
-                # message and boundary together and parse it; it only knows how
-                # to take a string, parse the headers, and figure out the
-                # boundary on its own.
-                parser = email.parser.FeedParser()
-                parser.feed(
-                    "Content-Type: multipart/nobodycares; boundary=%s\r\n\r\n"
-                    % info['boundary'])
-                parser.feed(body)
-                message = parser.close()
-
-                self.assertTrue(message.is_multipart())  # sanity check
-                mime_parts = message.get_payload()
-                self.assertEqual(len(mime_parts), 3)
-                obj_part, footer_part, commit_part = mime_parts
-
-                # validate EC footer metadata - should always be present
-                self.assertEqual(footer_part['X-Document'], 'object metadata')
-                footer_metadata = json.loads(footer_part.get_payload())
-                self.assertIsNotNone(
-                    footer_metadata.pop('X-Object-Sysmeta-Ec-Frag-Index'))
-                expected = {
-                    'X-Object-Sysmeta-Ec-Scheme':
-                        self.policy.ec_scheme_description,
-                    'X-Object-Sysmeta-Ec-Content-Length': str(size),
-                    'X-Object-Sysmeta-Ec-Etag': etag,
-                    'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
-                    'Etag': md5(obj_part.get_payload()).hexdigest()}
-                expected.update(expect_added)
-                for header, value in expected.items():
-                    self.assertIn(header, footer_metadata)
-                    self.assertEqual(value, footer_metadata[header])
-                    footer_metadata.pop(header)
-                self.assertFalse(footer_metadata)
-
-        # sanity check - middleware sets no footer, expect EC overrides
-        footers_to_add = {}
-        expect_added = {
-            'X-Backend-Container-Update-Override-Size': str(size),
-            'X-Backend-Container-Update-Override-Etag': etag}
-        do_test(footers_to_add, expect_added)
-
-        # middleware cannot overwrite any EC sysmeta
-        footers_to_add = {
-            'X-Object-Sysmeta-Ec-Content-Length': str(size + 1),
-            'X-Object-Sysmeta-Ec-Etag': 'other etag',
-            'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size + 1),
-            'X-Object-Sysmeta-Ec-Unused-But-Reserved': 'ignored'}
-        do_test(footers_to_add, expect_added)
-
-        # middleware can add x-object-sysmeta- headers including
-        # x-object-sysmeta-container-update-override headers
-        footers_to_add = {
-            'X-Object-Sysmeta-Foo': 'bar',
-            'X-Object-Sysmeta-Container-Update-Override-Size':
-                str(size + 1),
-            'X-Object-Sysmeta-Container-Update-Override-Etag': 'other etag',
-            'X-Object-Sysmeta-Container-Update-Override-Ping': 'pong'
-        }
-        expect_added.update(footers_to_add)
-        do_test(footers_to_add, expect_added)
-
-        # middleware can also overwrite x-backend-container-update-override
-        # headers
-        override_footers = {
-            'X-Backend-Container-Update-Override-Wham': 'bam',
-            'X-Backend-Container-Update-Override-Size': str(size + 2),
-            'X-Backend-Container-Update-Override-Etag': 'another etag'}
-        footers_to_add.update(override_footers)
-        expect_added.update(override_footers)
-        do_test(footers_to_add, expect_added)
-
-    def test_PUT_old_obj_server(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        responses = [
-            # one server will response 100-continue but not include the
-            # needful expect headers and the connection will be dropped
-            ((100, Exception('not used')), {}),
-        ] + [
-            # and pleanty of successful responses too
-            (201, {
-                'X-Obj-Metadata-Footer': 'yes',
-                'X-Obj-Multiphase-Commit': 'yes',
-            }),
-        ] * self.replicas()
-        random.shuffle(responses)
-        if responses[-1][0] != 201:
-            # whoops, stupid random
-            responses = responses[1:] + [responses[0]]
-        codes, expect_headers = zip(*responses)
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def _make_ec_archive_bodies(self, test_body, policy=None):
-        policy = policy or self.policy
-        return encode_frag_archive_bodies(policy, test_body)
-
-    def _make_ec_object_stub(self, test_body=None, policy=None,
-                             timestamp=None):
-        policy = policy or self.policy
-        segment_size = policy.ec_segment_size
-        test_body = test_body or (
-            'test' * segment_size)[:-random.randint(1, 1000)]
-        timestamp = timestamp or Timestamp(time.time())
-        etag = md5(test_body).hexdigest()
-        ec_archive_bodies = self._make_ec_archive_bodies(test_body,
-                                                         policy=policy)
-        return {
-            'body': test_body,
-            'etag': etag,
-            'frags': ec_archive_bodies,
-            'timestamp': timestamp
-        }
-
-    def _fake_ec_node_response(self, node_frags):
-        """
-        Given a list of entries for each node in ring order, where the entries
-        are a dict (or list of dicts) which describes the fragment (or
-        fragments) that are on the node; create a function suitable for use
-        with capture_http_requests that will accept a req object and return a
-        response that will suitably fake the behavior of an object server who
-        had the given fragments on disk at the time.
-
-        :param node_frags: a list. Each item in the list describes the
-            fragments that are on a node; each item is a dict or list of dicts,
-            each dict describing a single fragment; where the item is a list,
-            repeated calls to get_response will return fragments in the order
-            of the list; each dict has keys:
-                - obj: an object stub, as generated by _make_ec_object_stub,
-                    that defines all of the fragments that compose an object
-                    at a specific timestamp.
-                - frag: the index of a fragment to be selected from the object
-                    stub
-                - durable (optional): True if the selected fragment is durable
-
-        """
-        node_map = {}  # maps node ip and port to node index
-        all_nodes = []
-        call_count = {}  # maps node index to get_response call count for node
-
-        def _build_node_map(req):
-            node_key = lambda n: (n['ip'], n['port'])
-            part = utils.split_path(req['path'], 5, 5, True)[1]
-            policy = POLICIES[int(
-                req['headers']['X-Backend-Storage-Policy-Index'])]
-            all_nodes.extend(policy.object_ring.get_part_nodes(part))
-            all_nodes.extend(policy.object_ring.get_more_nodes(part))
-            for i, node in enumerate(all_nodes):
-                node_map[node_key(node)] = i
-                call_count[i] = 0
-
-        # normalize node_frags to a list of fragments for each node even
-        # if there's only one fragment in the dataset provided.
-        for i, frags in enumerate(node_frags):
-            if isinstance(frags, dict):
-                node_frags[i] = [frags]
-
-        def get_response(req):
-            if not node_map:
-                _build_node_map(req)
-
-            try:
-                node_index = node_map[(req['ip'], req['port'])]
-            except KeyError:
-                raise Exception("Couldn't find node %s:%s in %r" % (
-                    req['ip'], req['port'], all_nodes))
-            try:
-                frags = node_frags[node_index]
-            except IndexError:
-                raise Exception('Found node %r:%r at index %s - '
-                                'but only got %s stub response nodes' % (
-                                    req['ip'], req['port'], node_index,
-                                    len(node_frags)))
-
-            if not frags:
-                return StubResponse(404)
-
-            # determine response fragment (if any) for this call
-            resp_frag = frags[call_count[node_index]]
-            call_count[node_index] += 1
-            frag_prefs = req['headers'].get('X-Backend-Fragment-Preferences')
-            if not (frag_prefs or resp_frag.get('durable', True)):
-                return StubResponse(404)
-
-            # prepare durable timestamp and backend frags header for this node
-            obj_stub = resp_frag['obj']
-            ts2frags = defaultdict(list)
-            durable_timestamp = None
-            for frag in frags:
-                ts_frag = frag['obj']['timestamp']
-                if frag.get('durable', True):
-                    durable_timestamp = ts_frag.internal
-                ts2frags[ts_frag].append(frag['frag'])
-
-            try:
-                body = obj_stub['frags'][resp_frag['frag']]
-            except IndexError as err:
-                raise Exception(
-                    'Frag index %s not defined: node index %s, frags %r\n%s' %
-                    (resp_frag['frag'], node_index, [f['frag'] for f in frags],
-                     err))
-            headers = {
-                'X-Object-Sysmeta-Ec-Content-Length': len(obj_stub['body']),
-                'X-Object-Sysmeta-Ec-Etag': obj_stub['etag'],
-                'X-Object-Sysmeta-Ec-Frag-Index': resp_frag['frag'],
-                'X-Backend-Timestamp': obj_stub['timestamp'].internal,
-                'X-Timestamp': obj_stub['timestamp'].normal,
-                'X-Backend-Data-Timestamp': obj_stub['timestamp'].internal,
-                'X-Backend-Fragments':
-                    server._make_backend_fragments_header(ts2frags)
-            }
-            if durable_timestamp:
-                headers['X-Backend-Durable-Timestamp'] = durable_timestamp
-
-            return StubResponse(200, body, headers)
-
-        return get_response
-
     def test_GET_with_frags_swapped_around(self):
         segment_size = self.policy.ec_segment_size
         test_data = ('test' * segment_size)[:-657]
@@ -2338,21 +2294,25 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         _part, primary_nodes = self.obj_ring.get_nodes('a', 'c', 'o')
 
         node_key = lambda n: (n['ip'], n['port'])
-
+        backend_index = self.policy.get_backend_index
         ts = self._ts_iter.next()
+
         response_map = {
-            node_key(n): StubResponse(200, ec_archive_bodies[i], {
-                'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
-                'X-Object-Sysmeta-Ec-Etag': etag,
-                'X-Object-Sysmeta-Ec-Frag-Index': i,
-                'X-Timestamp': ts.normal,
-                'X-Backend-Timestamp': ts.internal
-            }) for i, n in enumerate(primary_nodes)
+            node_key(n): StubResponse(
+                200, ec_archive_bodies[backend_index(i)], {
+                    'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+                    'X-Object-Sysmeta-Ec-Etag': etag,
+                    'X-Object-Sysmeta-Ec-Frag-Index': backend_index(i),
+                    'X-Timestamp': ts.normal,
+                    'X-Backend-Timestamp': ts.internal
+                }) for i, n in enumerate(primary_nodes)
         }
 
         # swap a parity response into a data node
         data_node = random.choice(primary_nodes[:self.policy.ec_ndata])
-        parity_node = random.choice(primary_nodes[self.policy.ec_ndata:])
+        parity_node = random.choice(
+            primary_nodes[
+                self.policy.ec_ndata:self.policy.ec_n_unique_fragments])
         (response_map[node_key(data_node)],
          response_map[node_key(parity_node)]) = \
             (response_map[node_key(parity_node)],
@@ -2386,7 +2346,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
     def test_GET_with_only_handoffs(self):
         obj1 = self._make_ec_object_stub()
 
-        node_frags = [[]] * 14  # all primaries missing
+        node_frags = [[]] * self.replicas()  # all primaries missing
         node_frags = node_frags + [  # handoffs
             {'obj': obj1, 'frag': 0},
             {'obj': obj1, 'frag': 1},
@@ -2423,13 +2383,14 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # GETS would be required to all primaries and then ndata handoffs
         self.assertEqual(len(log), self.replicas() + self.policy.ec_ndata)
         self.assertEqual(2, len(collected_responses))
-        self.assertEqual(14, len(collected_responses[None]))  # 404s
+        # 404s
+        self.assertEqual(self.replicas(), len(collected_responses[None]))
         self.assertEqual(self.policy.ec_ndata,
                          len(collected_responses[obj1['etag']]))
 
     def test_GET_with_single_missed_overwrite_does_not_need_handoff(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         node_frags = [
             {'obj': obj2, 'frag': 0},
@@ -2478,8 +2439,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                      len(frags), etag))
 
     def test_GET_with_many_missed_overwrite_will_need_handoff(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         node_frags = [
             {'obj': obj2, 'frag': 0},
@@ -2529,8 +2490,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                      len(frags), etag))
 
     def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_succeed(self):
-        obj1 = self._make_ec_object_stub(timestamp=self.ts())
-        obj2 = self._make_ec_object_stub(timestamp=self.ts())
+        obj1 = self._make_ec_object_stub(pattern='obj1', timestamp=self.ts())
+        obj2 = self._make_ec_object_stub(pattern='obj2', timestamp=self.ts())
 
         node_frags = [
             {'obj': obj1, 'frag': 0},
@@ -2592,8 +2553,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                      len(frags), etag))
 
     def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_stop(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         node_frags = [
             {'obj': obj1, 'frag': 0},
@@ -2653,47 +2614,6 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                                  'collected %s frags for etag %s' % (
                                      len(frags), etag))
 
-    def test_GET_with_duplicate_but_sufficient_frag_indexes(self):
-        obj1 = self._make_ec_object_stub()
-        # proxy should ignore duplicated frag indexes and continue search for
-        # a set of unique indexes, finding last one on a handoff
-        node_frags = [
-            {'obj': obj1, 'frag': 0},
-            {'obj': obj1, 'frag': 0},  # duplicate frag
-            {'obj': obj1, 'frag': 1},
-            {'obj': obj1, 'frag': 1},  # duplicate frag
-            {'obj': obj1, 'frag': 2},
-            {'obj': obj1, 'frag': 2},  # duplicate frag
-            {'obj': obj1, 'frag': 3},
-            {'obj': obj1, 'frag': 3},  # duplicate frag
-            {'obj': obj1, 'frag': 4},
-            {'obj': obj1, 'frag': 4},  # duplicate frag
-            {'obj': obj1, 'frag': 10},
-            {'obj': obj1, 'frag': 11},
-            {'obj': obj1, 'frag': 12},
-            {'obj': obj1, 'frag': 13},
-            {'obj': obj1, 'frag': 5},  # handoff
-        ]
-
-        fake_response = self._fake_ec_node_response(node_frags)
-
-        req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
-
-        # expect a request to all primaries plus one handoff
-        self.assertEqual(self.replicas() + 1, len(log))
-        collected_indexes = defaultdict(list)
-        for conn in log:
-            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            if fi is not None:
-                collected_indexes[fi].append(conn)
-        self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
-
     def test_GET_with_duplicate_and_hidden_frag_indexes(self):
         obj1 = self._make_ec_object_stub()
         # proxy should ignore duplicated frag indexes and continue search for
@@ -2737,53 +2657,11 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                 collected_indexes[fi].append(conn)
         self.assertEqual(len(collected_indexes), self.policy.ec_ndata)
 
-    def test_GET_with_duplicate_but_insufficient_frag(self):
-        obj1 = self._make_ec_object_stub()
-        # proxy should ignore duplicated frag indexes and continue search for
-        # a set of unique indexes, but fails to find one
-        node_frags = [
-            {'obj': obj1, 'frag': 0},
-            {'obj': obj1, 'frag': 0},  # duplicate frag
-            {'obj': obj1, 'frag': 1},
-            {'obj': obj1, 'frag': 1},  # duplicate frag
-            {'obj': obj1, 'frag': 2},
-            {'obj': obj1, 'frag': 2},  # duplicate frag
-            {'obj': obj1, 'frag': 3},
-            {'obj': obj1, 'frag': 3},  # duplicate frag
-            {'obj': obj1, 'frag': 4},
-            {'obj': obj1, 'frag': 4},  # duplicate frag
-            {'obj': obj1, 'frag': 10},
-            {'obj': obj1, 'frag': 11},
-            {'obj': obj1, 'frag': 12},
-            {'obj': obj1, 'frag': 13},
-        ] + [[]] * 14  # 404 from handoffs
-
-        fake_response = self._fake_ec_node_response(node_frags)
-
-        req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
-            resp = req.get_response(self.app)
-
-        self.assertEqual(resp.status_int, 404)
-
-        # expect a request to all nodes
-        self.assertEqual(2 * self.replicas(), len(log))
-        collected_indexes = defaultdict(list)
-        collected_etags = set()
-        for conn in log:
-            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
-            collected_etags.add(etag)  # will be None from handoffs
-            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
-            if fi is not None:
-                collected_indexes[fi].append(conn)
-        self.assertEqual(len(collected_indexes), self.policy.ec_ndata - 1)
-        self.assertEqual({obj1['etag'], None}, collected_etags)
-
     def test_GET_with_missing_and_mixed_frags_may_503(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
         # we get a 503 when all the handoffs return 200
-        node_frags = [[]] * 14  # primaries have no frags
+        node_frags = [[]] * self.replicas()  # primaries have no frags
         node_frags = node_frags + [  # handoffs all have frags
             {'obj': obj1, 'frag': 0},
             {'obj': obj2, 'frag': 0},
@@ -2820,10 +2698,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # all nodes have a frag but there is no one set that reaches quorum,
         # which means there is no backend 404 response, but proxy should still
         # return 404 rather than 503
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
-        obj3 = self._make_ec_object_stub()
-        obj4 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        obj3 = self._make_ec_object_stub(pattern='obj3')
+        obj4 = self._make_ec_object_stub(pattern='obj4')
 
         node_frags = [
             {'obj': obj1, 'frag': 0},
@@ -2994,8 +2872,8 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual(28, len(log))
 
     def test_GET_with_missing_durable_files_and_mixed_etags(self):
-        obj1 = self._make_ec_object_stub()
-        obj2 = self._make_ec_object_stub()
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
 
         # non-quorate durables for another object won't stop us finding the
         # quorate object
@@ -3084,8 +2962,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # At that point (or before) the proxy knows that a durable set of
         # frags for obj2 exists so will fetch them, requiring another 10
         # directed requests.
-        obj2 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj1 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self._ts_iter.next())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self._ts_iter.next())
 
         node_frags = [
             [{'obj': obj1, 'frag': 0, 'durable': False}],  # obj2 missing
@@ -3133,9 +3013,13 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # non-durable frag of obj2. The proxy will need to do at least 10
         # GETs to see all the obj3 frags plus 1 more to GET a durable frag.
         # The proxy may also do one more GET if the obj2 frag is found.
-        obj2 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj3 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj1 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
+        # i.e. 10 + 1 durable for obj3, 2 for obj1 and 1 more if obj2 found
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self._ts_iter.next())
+        obj3 = self._make_ec_object_stub(pattern='obj3',
+                                         timestamp=self._ts_iter.next())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self._ts_iter.next())
 
         node_frags = [
             [{'obj': obj1, 'frag': 0, 'durable': False},  # obj1 frag
@@ -3167,14 +3051,16 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.headers['etag'], obj3['etag'])
         self.assertEqual(md5(resp.body).hexdigest(), obj3['etag'])
         self.assertGreaterEqual(len(log), self.policy.ec_ndata + 1)
-        self.assertLessEqual(len(log), self.policy.ec_ndata + 3)
+        self.assertLessEqual(len(log), self.policy.ec_ndata + 4)
 
     def test_GET_with_missing_durables_and_older_non_durables(self):
         # scenario: non-durable frags of newer obj1 obscure all frags
         # of older obj2, so first 28 requests result in a non-durable set.
         # There are only 10 frags for obj2 and one is not durable.
-        obj2 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
-        obj1 = self._make_ec_object_stub(timestamp=self._ts_iter.next())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self._ts_iter.next())
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self._ts_iter.next())
 
         node_frags = [
             [{'obj': obj1, 'frag': 0, 'durable': False}],  # obj2 missing
@@ -3223,8 +3109,9 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # fragments for different content at the same timestamp then the
         # object controller should handle it gracefully
         ts = self.ts()  # force equal timestamps for two objects
-        obj1 = self._make_ec_object_stub(timestamp=ts)
-        obj2 = self._make_ec_object_stub(timestamp=ts)
+        obj1 = self._make_ec_object_stub(timestamp=ts, pattern='obj1')
+        obj2 = self._make_ec_object_stub(timestamp=ts, pattern='obj2')
+        self.assertNotEqual(obj1['etag'], obj2['etag'])  # sanity
 
         node_frags = [
             # 7 frags of obj2 are available and durable
@@ -3582,9 +3469,10 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         headers = {'X-Object-Sysmeta-Ec-Etag': etag}
         self.app.recoverable_node_timeout = 0.01
-        responses = [(200, SlowBody(body, 0.1),
-                      self._add_frag_index(i, headers))
-                     for i, body in enumerate(ec_archive_bodies)]
+        responses = [
+            (200, SlowBody(body, 0.1), self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies)
+        ] * self.policy.ec_duplication_factor
 
         req = swob.Request.blank('/v1/a/c/o')
 
@@ -3661,68 +3549,6 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         # 404 shows actual response body size (i.e. 0 for HEAD)
         self.assertEqual(resp.headers['Content-Length'], '0')
 
-    def test_PUT_with_slow_commits(self):
-        # It's important that this timeout be much less than the delay in
-        # the slow commit responses so that the slow commits are not waited
-        # for.
-        self.app.post_quorum_timeout = 0.01
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-        # plenty of slow commits
-        response_sleep = 5.0
-        codes = [FakeStatus(201, response_sleep=response_sleep)
-                 for i in range(self.replicas())]
-        # swap out some with regular fast responses
-        number_of_fast_responses_needed_to_be_quick_enough = \
-            self.policy.quorum
-        fast_indexes = random.sample(
-            range(self.replicas()),
-            number_of_fast_responses_needed_to_be_quick_enough)
-        for i in fast_indexes:
-            codes[i] = 201
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            start = time.time()
-            resp = req.get_response(self.app)
-            response_time = time.time() - start
-        self.assertEqual(resp.status_int, 201)
-        self.assertLess(response_time, response_sleep)
-
-    def test_PUT_with_just_enough_durable_responses(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-
-        codes = [201] * (self.policy.ec_ndata + 1)
-        codes += [503] * (self.policy.ec_nparity - 1)
-        self.assertEqual(len(codes), self.replicas())
-        random.shuffle(codes)
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 201)
-
-    def test_PUT_with_less_durable_responses(self):
-        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
-                                              body='')
-
-        codes = [201] * (self.policy.ec_ndata)
-        codes += [503] * (self.policy.ec_nparity)
-        self.assertEqual(len(codes), self.replicas())
-        random.shuffle(codes)
-        expect_headers = {
-            'X-Obj-Metadata-Footer': 'yes',
-            'X-Obj-Multiphase-Commit': 'yes'
-        }
-        with set_http_connect(*codes, expect_headers=expect_headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 503)
-
     def test_GET_with_invalid_ranges(self):
         # real body size is segment_size - 10 (just 1 segment)
         segment_size = self.policy.ec_segment_size
@@ -3744,7 +3570,7 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
                      'Range': 'bytes=%s' % (req_range)})
 
         fragments = self.policy.pyeclib_driver.encode(real_body)
-        fragment_payloads = [fragments]
+        fragment_payloads = [fragments * self.policy.ec_duplication_factor]
 
         node_fragments = zip(*fragment_payloads)
         self.assertEqual(len(node_fragments), self.replicas())  # sanity
@@ -3776,6 +3602,1214 @@ class TestECObjController(BaseObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.body, range_not_satisfiable_body)
         self.assertEqual(resp.etag, body_etag)
         self.assertEqual(resp.headers['Accept-Ranges'], 'bytes')
+
+
+class TestECFunctions(unittest.TestCase):
+    def test_chunk_transformer(self):
+        def do_test(dup_factor, segments):
+            segment_size = 1024
+            orig_chunks = []
+            for i in range(segments):
+                orig_chunks.append(chr(i + 97) * segment_size)
+            policy = ECStoragePolicy(0, 'ec8-2', ec_type=DEFAULT_TEST_EC_TYPE,
+                                     ec_ndata=8, ec_nparity=2,
+                                     object_ring=FakeRing(
+                                         replicas=10 * dup_factor),
+                                     ec_segment_size=segment_size,
+                                     ec_duplication_factor=dup_factor)
+            encoded_chunks = [[] for _ in range(policy.ec_n_unique_fragments)]
+            for orig_chunk in orig_chunks:
+                # each segment produces a set of frags
+                frag_set = policy.pyeclib_driver.encode(orig_chunk)
+                for frag_index, frag_data in enumerate(frag_set):
+                    encoded_chunks[frag_index].append(frag_data)
+            # chunk_transformer buffers and concatenates multiple frags
+            expected = [''.join(frags) for frags in encoded_chunks]
+
+            transform = obj.chunk_transformer(policy)
+            transform.send(None)
+            backend_chunks = transform.send(''.join(orig_chunks))
+            self.assertIsNotNone(backend_chunks)  # sanity
+            self.assertEqual(
+                len(backend_chunks), policy.ec_n_unique_fragments)
+            self.assertEqual(expected, backend_chunks)
+
+            # flush out last chunk buffer
+            backend_chunks = transform.send('')
+            self.assertEqual(
+                len(backend_chunks), policy.ec_n_unique_fragments)
+            self.assertEqual([''] * policy.ec_n_unique_fragments,
+                             backend_chunks)
+
+        do_test(dup_factor=1, segments=1)
+        do_test(dup_factor=2, segments=1)
+        do_test(dup_factor=3, segments=1)
+        do_test(dup_factor=1, segments=2)
+        do_test(dup_factor=2, segments=2)
+        do_test(dup_factor=3, segments=2)
+
+    def test_chunk_transformer_non_aligned_last_chunk(self):
+        last_chunk = 'a' * 128
+
+        def do_test(dup):
+            policy = ECStoragePolicy(0, 'ec8-2', ec_type=DEFAULT_TEST_EC_TYPE,
+                                     ec_ndata=8, ec_nparity=2,
+                                     object_ring=FakeRing(replicas=10 * dup),
+                                     ec_segment_size=1024,
+                                     ec_duplication_factor=dup)
+            expected = policy.pyeclib_driver.encode(last_chunk)
+            transform = obj.chunk_transformer(policy)
+            transform.send(None)
+
+            transform.send(last_chunk)
+            # flush out last chunk buffer
+            backend_chunks = transform.send('')
+
+            self.assertEqual(
+                len(backend_chunks), policy.ec_n_unique_fragments)
+            self.assertEqual(expected, backend_chunks)
+
+        do_test(1)
+        do_test(2)
+
+
+@patch_policies([ECStoragePolicy(0, name='ec', is_default=True,
+                                 ec_type=DEFAULT_TEST_EC_TYPE, ec_ndata=10,
+                                 ec_nparity=4, ec_segment_size=4096,
+                                 ec_duplication_factor=2),
+                 StoragePolicy(1, name='unu')],
+                fake_ring_args=[{'replicas': 28}, {}])
+class TestECDuplicationObjController(
+        ECObjectControllerMixin, unittest.TestCase):
+    container_info = {
+        'status': 200,
+        'read_acl': None,
+        'write_acl': None,
+        'sync_key': None,
+        'versions': None,
+        'storage_policy': '0',
+    }
+
+    controller_cls = obj.ECObjectController
+
+    def _test_GET_with_duplication_factor(self, node_frags, obj):
+        # This is basic tests in the healthy backends status
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['etag'], obj['etag'])
+        self.assertEqual(md5(resp.body).hexdigest(), obj['etag'])
+
+        collected_responses = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            index = conn.resp.headers['X-Object-Sysmeta-Ec-Frag-Index']
+            collected_responses[etag].add(index)
+
+        # the backend requests should be >= num_data_fragments
+        self.assertGreaterEqual(len(log), self.policy.ec_ndata)
+        # but <= # of replicas
+        self.assertLessEqual(len(log), self.replicas())
+        self.assertEqual(len(collected_responses), 1)
+
+        etag, frags = collected_responses.items()[0]
+        # the backend requests will stop at enough ec_ndata responses
+        self.assertEqual(
+            len(frags), self.policy.ec_ndata,
+            'collected %s frags for etag %s' % (len(frags), etag))
+
+    # TODO: actually "frags" in node_frags is meaning "node_index" right now
+    # in following tests. Reconsidering the name and semantics change needed.
+    # Or, just mapping to be correct as frag_index is enough?.
+    def test_GET_with_duplication_factor(self):
+        obj = self._make_ec_object_stub()
+        node_frags = [
+            {'obj': obj, 'frag': 0},
+            {'obj': obj, 'frag': 1},
+            {'obj': obj, 'frag': 2},
+            {'obj': obj, 'frag': 3},
+            {'obj': obj, 'frag': 4},
+            {'obj': obj, 'frag': 5},
+            {'obj': obj, 'frag': 6},
+            {'obj': obj, 'frag': 7},
+            {'obj': obj, 'frag': 8},
+            {'obj': obj, 'frag': 9},
+            {'obj': obj, 'frag': 10},
+            {'obj': obj, 'frag': 11},
+            {'obj': obj, 'frag': 12},
+            {'obj': obj, 'frag': 13},
+        ] * 2  # duplicated!
+        self._test_GET_with_duplication_factor(node_frags, obj)
+
+    def test_GET_with_duplication_factor_almost_duplicate_dispersion(self):
+        obj = self._make_ec_object_stub()
+        node_frags = [
+            # first half of # of replicas are 0, 1, 2, 3, 4, 5, 6
+            {'obj': obj, 'frag': 0},
+            {'obj': obj, 'frag': 0},
+            {'obj': obj, 'frag': 1},
+            {'obj': obj, 'frag': 1},
+            {'obj': obj, 'frag': 2},
+            {'obj': obj, 'frag': 2},
+            {'obj': obj, 'frag': 3},
+            {'obj': obj, 'frag': 3},
+            {'obj': obj, 'frag': 4},
+            {'obj': obj, 'frag': 4},
+            {'obj': obj, 'frag': 5},
+            {'obj': obj, 'frag': 5},
+            {'obj': obj, 'frag': 6},
+            {'obj': obj, 'frag': 6},
+            # second half of # of replicas are 7, 8, 9, 10, 11, 12, 13
+            {'obj': obj, 'frag': 7},
+            {'obj': obj, 'frag': 7},
+            {'obj': obj, 'frag': 8},
+            {'obj': obj, 'frag': 8},
+            {'obj': obj, 'frag': 9},
+            {'obj': obj, 'frag': 9},
+            {'obj': obj, 'frag': 10},
+            {'obj': obj, 'frag': 10},
+            {'obj': obj, 'frag': 11},
+            {'obj': obj, 'frag': 11},
+            {'obj': obj, 'frag': 12},
+            {'obj': obj, 'frag': 12},
+            {'obj': obj, 'frag': 13},
+            {'obj': obj, 'frag': 13},
+        ]
+        # ...but it still works!
+        self._test_GET_with_duplication_factor(node_frags, obj)
+
+    def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_stop(self):
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+
+        # both of obj1 and obj2 has only 9 frags which is not able to decode
+        node_frags = [
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj2, 'frag': 0},
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj2, 'frag': 1},
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj2, 'frag': 2},
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj2, 'frag': 3},
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj2, 'frag': 4},
+            {'obj': obj1, 'frag': 5},
+            {'obj': obj2, 'frag': 5},
+            {'obj': obj1, 'frag': 6},
+            {'obj': obj2, 'frag': 6},
+            {'obj': obj1, 'frag': 7},
+            {'obj': obj2, 'frag': 7},
+            {'obj': obj1, 'frag': 8},
+            {'obj': obj2, 'frag': 8},
+        ]
+        # ... and the rests are 404s which is limited by request_count
+        # (2 * replicas in default) rather than max_extra_requests limitation
+        # because the retries will be in ResumingGetter if the responses
+        # are 404s
+        node_frags += [[]] * (self.replicas() * 2 - len(node_frags))
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 404)
+
+        collected_responses = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            index = conn.resp.headers['X-Object-Sysmeta-Ec-Frag-Index']
+            collected_responses[etag].add(index)
+
+        # default node_iter will exhaust to the last of handoffs
+        self.assertEqual(len(log), self.replicas() * 2)
+        # we have obj1, obj2, and 404 NotFound in collected_responses
+        self.assertEqual(sorted([obj1['etag'], obj2['etag'], None]),
+                         sorted(collected_responses.keys()))
+
+        # ... regardless we should never need to fetch more than ec_ndata
+        # frags for any given etag
+        for etag, frags in collected_responses.items():
+            self.assertLessEqual(len(frags), self.policy.ec_ndata,
+                                 'collected %s frags for etag %s' % (
+                                     len(frags), etag))
+
+    def test_GET_with_many_missed_overwrite_will_need_handoff(self):
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        # primaries
+        node_frags = [
+            {'obj': obj2, 'frag': 0},
+            {'obj': obj2, 'frag': 1},
+            {'obj': obj1, 'frag': 2},  # missed
+            {'obj': obj2, 'frag': 3},
+            {'obj': obj2, 'frag': 4},
+            {'obj': obj2, 'frag': 5},
+            {'obj': obj1, 'frag': 6},  # missed
+            {'obj': obj2, 'frag': 7},
+            {'obj': obj2, 'frag': 8},
+            {'obj': obj1, 'frag': 9},  # missed
+            {'obj': obj1, 'frag': 10},  # missed
+            {'obj': obj1, 'frag': 11},  # missed
+            {'obj': obj2, 'frag': 12},
+            {'obj': obj2, 'frag': 13},
+        ]
+
+        node_frags = node_frags * 2  # 2 duplication
+
+        # so the primaries have indexes 0, 1, 3, 4, 5, 7, 8, 12, 13
+        # (9 indexes) for obj2 and then a handoff has index 6
+        node_frags += [
+            {'obj': obj2, 'frag': 6},  # handoff
+        ]
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['etag'], obj2['etag'])
+        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+
+        collected_responses = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            index = conn.resp.headers['X-Object-Sysmeta-Ec-Frag-Index']
+            collected_responses[etag].add(index)
+
+        # there's not enough of the obj2 etag on the primaries, we would
+        # have collected responses for both etags, and would have made
+        # one more request to the handoff node
+        self.assertEqual(len(log), self.replicas() + 1)
+        self.assertEqual(len(collected_responses), 2)
+
+        # ... regardless we should never need to fetch more than ec_ndata
+        # frags for any given etag
+        for etag, frags in collected_responses.items():
+            self.assertLessEqual(len(frags), self.policy.ec_ndata,
+                                 'collected %s frags for etag %s' % (
+                                 len(frags), etag))
+
+    def test_GET_with_missing_and_mixed_frags_will_dig_deep_but_succeed(self):
+        obj1 = self._make_ec_object_stub(pattern='obj1',
+                                         timestamp=self.ts())
+        obj2 = self._make_ec_object_stub(pattern='obj2',
+                                         timestamp=self.ts())
+
+        # 28 nodes are here
+        node_frags = [
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj2, 'frag': 0},
+            [],
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj2, 'frag': 1},
+            [],
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj2, 'frag': 2},
+            [],
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj2, 'frag': 3},
+            [],
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj2, 'frag': 4},
+            [],
+            {'obj': obj1, 'frag': 5},
+            {'obj': obj2, 'frag': 5},
+            [],
+            {'obj': obj1, 'frag': 6},
+            {'obj': obj2, 'frag': 6},
+            [],
+            {'obj': obj1, 'frag': 7},
+            {'obj': obj2, 'frag': 7},
+            [],
+            {'obj': obj1, 'frag': 8},
+            {'obj': obj2, 'frag': 8},
+            [],
+            [],
+        ]
+
+        node_frags += [[]] * 13  # Plus 13 nodes in handoff
+
+        # finally 10th fragment for obj2 found
+        node_frags += [[{'obj': obj2, 'frag': 9}]]
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['etag'], obj2['etag'])
+        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+
+        collected_responses = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            index = conn.resp.headers['X-Object-Sysmeta-Ec-Frag-Index']
+            collected_responses[etag].add(index)
+
+        # we go exactly as long as we have to, finding two different
+        # etags and some 404's (i.e. collected_responses[None])
+        self.assertEqual(len(log), len(node_frags))
+        self.assertEqual(len(collected_responses), 3)
+
+        # ... regardless we should never need to fetch more than ec_ndata
+        # frags for any given etag
+        for etag, frags in collected_responses.items():
+            self.assertLessEqual(len(frags), self.policy.ec_ndata,
+                                 'collected %s frags for etag %s' % (
+                                 len(frags), etag))
+
+    def test_GET_with_mixed_frags_and_no_quorum_will_503(self):
+        # all nodes have a frag but there is no one set that reaches quorum,
+        # which means there is no backend 404 response, but proxy should still
+        # return 404 rather than 503
+        stub_objects = [
+            self._make_ec_object_stub(pattern='obj1'),
+            self._make_ec_object_stub(pattern='obj2'),
+            self._make_ec_object_stub(pattern='obj3'),
+            self._make_ec_object_stub(pattern='obj4'),
+            self._make_ec_object_stub(pattern='obj5'),
+            self._make_ec_object_stub(pattern='obj6'),
+            self._make_ec_object_stub(pattern='obj7'),
+        ]
+        etags = collections.Counter(stub['etag'] for stub in stub_objects)
+        self.assertEqual(len(etags), 7, etags)  # sanity
+
+        # primaries and handoffs for required nodes
+        # this is 10-4 * 2 case so that 56 requests (2 * replicas) required
+        # to give up. we prepares 7 different objects above so responses
+        # will have 8 fragments for each object
+        required_nodes = self.replicas() * 2
+        # fill them out to the primary and handoff nodes
+        node_frags = []
+        for frag in range(8):
+            for stub_obj in stub_objects:
+                if len(node_frags) >= required_nodes:
+                    # we already have enough responses
+                    break
+                node_frags.append({'obj': stub_obj, 'frag': frag})
+
+        # sanity
+        self.assertEqual(required_nodes, len(node_frags))
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 503)
+
+        collected_etags = set()
+        collected_status = set()
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            collected_etags.add(etag)
+            collected_status.add(conn.resp.status)
+
+        self.assertEqual(required_nodes, len(log))
+        self.assertEqual(len(collected_etags), 7)
+        self.assertEqual({200}, collected_status)
+
+    def test_GET_with_no_durable_files(self):
+        # verify that at least one durable is necessary for a successful GET
+        obj1 = self._make_ec_object_stub()
+        node_frags = [
+            {'obj': obj1, 'frag': 0, 'durable': False},
+            {'obj': obj1, 'frag': 1, 'durable': False},
+            {'obj': obj1, 'frag': 2, 'durable': False},
+            {'obj': obj1, 'frag': 3, 'durable': False},
+            {'obj': obj1, 'frag': 4, 'durable': False},
+            {'obj': obj1, 'frag': 5, 'durable': False},
+            {'obj': obj1, 'frag': 6, 'durable': False},
+            {'obj': obj1, 'frag': 7, 'durable': False},
+            {'obj': obj1, 'frag': 8, 'durable': False},
+            {'obj': obj1, 'frag': 9, 'durable': False},
+            {'obj': obj1, 'frag': 10, 'durable': False},  # parity
+            {'obj': obj1, 'frag': 11, 'durable': False},  # parity
+            {'obj': obj1, 'frag': 12, 'durable': False},  # parity
+            {'obj': obj1, 'frag': 13, 'durable': False},  # parity
+        ]
+
+        node_frags = node_frags * 2  # 2 duplications
+
+        node_frags += [[]] * self.replicas()  # handoffs
+
+        fake_response = self._fake_ec_node_response(list(node_frags))
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 404)
+        # all 28 nodes tried with an optimistic get, none are durable and none
+        # report having a durable timestamp
+        self.assertEqual(self.replicas() * 2, len(log))
+
+    def test_GET_with_missing_and_mixed_frags_may_503(self):
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        obj3 = self._make_ec_object_stub(pattern='obj3')
+        obj4 = self._make_ec_object_stub(pattern='obj4')
+        # we get a 503 when all the handoffs return 200
+        node_frags = [[]] * self.replicas()  # primaries have no frags
+        # plus, 4 different objects and 7 indexes will b 28 node responses
+        # here for handoffs
+        node_frags = node_frags + [  # handoffs all have frags
+            {'obj': obj1, 'frag': 0},
+            {'obj': obj2, 'frag': 0},
+            {'obj': obj3, 'frag': 0},
+            {'obj': obj4, 'frag': 0},
+            {'obj': obj1, 'frag': 1},
+            {'obj': obj2, 'frag': 1},
+            {'obj': obj3, 'frag': 1},
+            {'obj': obj4, 'frag': 1},
+            {'obj': obj1, 'frag': 2},
+            {'obj': obj2, 'frag': 2},
+            {'obj': obj3, 'frag': 2},
+            {'obj': obj4, 'frag': 2},
+            {'obj': obj1, 'frag': 3},
+            {'obj': obj2, 'frag': 3},
+            {'obj': obj3, 'frag': 3},
+            {'obj': obj4, 'frag': 3},
+            {'obj': obj1, 'frag': 4},
+            {'obj': obj2, 'frag': 4},
+            {'obj': obj3, 'frag': 4},
+            {'obj': obj4, 'frag': 4},
+            {'obj': obj1, 'frag': 5},
+            {'obj': obj2, 'frag': 5},
+            {'obj': obj3, 'frag': 5},
+            {'obj': obj4, 'frag': 5},
+            {'obj': obj1, 'frag': 6},
+            {'obj': obj2, 'frag': 6},
+            {'obj': obj3, 'frag': 6},
+            {'obj': obj4, 'frag': 6},
+        ]
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 503)
+        # never get a quorum so all nodes are searched
+        self.assertEqual(len(log), 2 * self.replicas())
+        collected_indexes = defaultdict(list)
+        for conn in log:
+            fi = conn.resp.headers.get('X-Object-Sysmeta-Ec-Frag-Index')
+            if fi is not None:
+                collected_indexes[fi].append(conn)
+        self.assertEqual(len(collected_indexes), 7)
+
+    def test_GET_with_mixed_etags_at_same_timestamp(self):
+        # the difference from parent class is only handoff stub length
+
+        ts = self.ts()  # force equal timestamps for two objects
+        obj1 = self._make_ec_object_stub(timestamp=ts, pattern='obj1')
+        obj2 = self._make_ec_object_stub(timestamp=ts, pattern='obj2')
+        self.assertNotEqual(obj1['etag'], obj2['etag'])  # sanity
+
+        node_frags = [
+            # 7 frags of obj2 are available and durable
+            {'obj': obj2, 'frag': 0, 'durable': True},
+            {'obj': obj2, 'frag': 1, 'durable': True},
+            {'obj': obj2, 'frag': 2, 'durable': True},
+            {'obj': obj2, 'frag': 3, 'durable': True},
+            {'obj': obj2, 'frag': 4, 'durable': True},
+            {'obj': obj2, 'frag': 5, 'durable': True},
+            {'obj': obj2, 'frag': 6, 'durable': True},
+            # 7 frags of obj1 are available and durable
+            {'obj': obj1, 'frag': 7, 'durable': True},
+            {'obj': obj1, 'frag': 8, 'durable': True},
+            {'obj': obj1, 'frag': 9, 'durable': True},
+            {'obj': obj1, 'frag': 10, 'durable': True},
+            {'obj': obj1, 'frag': 11, 'durable': True},
+            {'obj': obj1, 'frag': 12, 'durable': True},
+            {'obj': obj1, 'frag': 13, 'durable': True},
+            # handoffs
+        ]
+
+        node_frags += [[]] * (self.replicas() * 2 - len(node_frags))
+
+        fake_response = self._fake_ec_node_response(list(node_frags))
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+        # read body to provoke any EC decode errors
+        self.assertFalse(resp.body)
+
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(len(log), self.replicas() * 2)
+        collected_etags = set()
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            collected_etags.add(etag)  # will be None from handoffs
+        self.assertEqual({obj1['etag'], obj2['etag'], None}, collected_etags)
+        log_lines = self.app.logger.get_lines_for_level('error')
+        self.assertEqual(log_lines,
+                         ['Problem with fragment response: ETag mismatch'] * 7)
+
+    def _test_determine_chunk_destinations_prioritize(
+            self, missing_two, missing_one):
+        # This scenario is only likely for ec_duplication_factor >= 2. If we
+        # have multiple failures such that the putters collection is missing
+        # two primary nodes for frag index 'missing_two' and missing one
+        # primary node for frag index 'missing_one', then we should prioritize
+        # finding a handoff for frag index 'missing_two'.
+
+        class FakePutter(object):
+            def __init__(self, index):
+                self.node_index = index
+
+        controller = self.controller_cls(self.app, 'a', 'c', 'o')
+
+        # sanity, caller must set missing_two < than ec_num_unique_fragments
+        self.assertLess(missing_two, self.policy.ec_n_unique_fragments)
+
+        # create a dummy list of putters, check no handoffs
+        putters = []
+        for index in range(self.policy.object_ring.replica_count):
+            putters.append(FakePutter(index))
+
+        # sanity - all putters have primary nodes
+        got = controller._determine_chunk_destinations(putters, self.policy)
+        expected = {}
+        for i, p in enumerate(putters):
+            expected[p] = self.policy.get_backend_index(i)
+        self.assertEqual(got, expected)
+
+        # now, for fragment index that is missing two copies, lets make one
+        # putter be a handoff
+        handoff_putter = putters[missing_two]
+        handoff_putter.node_index = None
+
+        # and then pop another putter for a copy of same fragment index
+        putters.pop(missing_two + self.policy.ec_n_unique_fragments)
+
+        # also pop one copy of a different fragment to make one missing hole
+        putters.pop(missing_one)
+
+        # then determine chunk destinations: we have 26 putters here;
+        # missing_two frag index is missing two copies;  missing_one frag index
+        # is missing one copy, therefore the handoff node should be assigned to
+        # missing_two frag index
+        got = controller._determine_chunk_destinations(putters, self.policy)
+        # N.B. len(putters) is now len(expected - 2) due to pop twice
+        self.assertEqual(len(putters), len(got))
+        # sanity, no node index - for handoff putter
+        self.assertIsNone(handoff_putter.node_index)
+        self.assertEqual(got[handoff_putter], missing_two)
+        # sanity, other nodes except handoff_putter have node_index
+        self.assertTrue(all(
+            [putter.node_index is not None for putter in got if
+             putter != handoff_putter]))
+
+    def test_determine_chunk_destinations_prioritize_more_missing(self):
+        # drop node_index 0, 14 and 1 should work
+        self._test_determine_chunk_destinations_prioritize(0, 1)
+        # drop node_index 1, 15 and 0 should work, too
+        self._test_determine_chunk_destinations_prioritize(1, 0)
+
+
+class ECCommonPutterMixin(object):
+    # EC PUT tests common to both Mime and PUT+POST protocols
+    expect_headers = {}
+
+    def test_PUT_ec_error_during_transfer_data(self):
+        class FakeReader(object):
+            def read(self, size):
+                raise IOError('error message')
+
+        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
+                                 body='test body')
+
+        req.environ['wsgi.input'] = FakeReader()
+        req.headers['content-length'] = '6'
+        codes = [201] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 499)
+
+    def test_PUT_ec_chunkreadtimeout_during_transfer_data(self):
+        class FakeReader(object):
+            def read(self, size):
+                raise exceptions.ChunkReadTimeout()
+
+        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
+                                 body='test body')
+
+        req.environ['wsgi.input'] = FakeReader()
+        req.headers['content-length'] = '6'
+        codes = [201] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 408)
+
+    def test_PUT_ec_timeout_during_transfer_data(self):
+        class FakeReader(object):
+            def read(self, size):
+                raise exceptions.Timeout()
+
+        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
+                                 body='test body')
+
+        req.environ['wsgi.input'] = FakeReader()
+        req.headers['content-length'] = '6'
+        codes = [201] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 499)
+
+    def test_PUT_ec_exception_during_transfer_data(self):
+        class FakeReader(object):
+            def read(self, size):
+                raise Exception('exception message')
+
+        req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
+                                 body='test body')
+
+        req.environ['wsgi.input'] = FakeReader()
+        req.headers['content-length'] = '6'
+        codes = [201] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 500)
+
+
+# This is how CommonObjectControllerMixin is supposed to be used:
+# @patch_policies(with_ec_default=True)
+# class TestECObjControllerDoublePutter(BaseObjectControllerMixin,
+#                                       ECCommonPutterMixin,
+#                                       unittest.TestCase):
+#     # tests specific to the PUT+POST protocol
+#
+#     def setUp(self):
+#         super(TestECObjControllerDoublePutter, self).setUp()
+#         # force use of the DoublePutter class
+#         self.app.use_put_v1 = True
+
+
+@patch_policies(with_ec_default=True)
+class TestECObjControllerMimePutter(BaseObjectControllerMixin,
+                                    ECCommonPutterMixin,
+                                    unittest.TestCase):
+    # tests specific to the older PUT protocol using a MimePutter
+    expect_headers = {
+        'X-Obj-Metadata-Footer': 'yes',
+        'X-Obj-Multiphase-Commit': 'yes'
+    }
+
+    def setUp(self):
+        super(TestECObjControllerMimePutter, self).setUp()
+        # force use of the MimePutter class
+        self.app.use_put_v1 = False
+
+    def test_PUT_simple(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [201] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_with_body_and_bad_etag(self):
+        segment_size = self.policy.ec_segment_size
+        test_body = ('asdf' * segment_size)[:-10]
+        codes = [201] * self.replicas()
+        conns = []
+
+        def capture_expect(conn):
+            # stash the backend connection so we can verify that it is closed
+            # (no data will be sent)
+            conns.append(conn)
+
+        # send a bad etag in the request headers
+        headers = {'Etag': 'bad etag'}
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='PUT', headers=headers, body=test_body)
+        with set_http_connect(*codes, expect_headers=self.expect_headers,
+                              give_expect=capture_expect):
+            resp = req.get_response(self.app)
+        self.assertEqual(422, resp.status_int)
+        self.assertEqual(self.replicas(), len(conns))
+        for conn in conns:
+            self.assertTrue(conn.closed)
+
+        # make the footers callback send the correct etag
+        footers_callback = make_footers_callback(test_body)
+        env = {'swift.callback.update_footers': footers_callback}
+        headers = {'Etag': 'bad etag'}
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='PUT', headers=headers, environ=env,
+            body=test_body)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(201, resp.status_int)
+
+        # make the footers callback send a bad Etag footer
+        footers_callback = make_footers_callback('not the test body')
+        env = {'swift.callback.update_footers': footers_callback}
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='PUT', environ=env, body=test_body)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(422, resp.status_int)
+
+    def test_txn_id_logging_ECPUT(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        self.app.logger.txn_id = req.environ['swift.trans_id'] = 'test-txn-id'
+        codes = [(100, Timeout(), 503, 503)] * self.replicas()
+        stdout = BytesIO()
+        with set_http_connect(*codes, expect_headers=self.expect_headers), \
+                mock.patch('sys.stdout', stdout):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+        for line in stdout.getvalue().splitlines():
+            self.assertIn('test-txn-id', line)
+        self.assertIn('Trying to get ',
+                      stdout.getvalue())
+
+    def test_PUT_with_explicit_commit_status(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [(100, 100, 201)] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_mostly_success(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [201] * self.quorum()
+        codes += [503] * (self.replicas() - len(codes))
+        random.shuffle(codes)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_error_commit(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [(100, 503, Exception('not used'))] * self.replicas()
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+
+    def test_PUT_mostly_success_commit(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [201] * self.quorum()
+        codes += [(100, 503, Exception('not used'))] * (
+            self.replicas() - len(codes))
+        random.shuffle(codes)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_mostly_error_commit(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [(100, 503, Exception('not used'))] * self.quorum()
+        if isinstance(self.policy, ECStoragePolicy):
+            codes *= self.policy.ec_duplication_factor
+        codes += [201] * (self.replicas() - len(codes))
+        random.shuffle(codes)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+
+    def test_PUT_commit_timeout(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [201] * (self.replicas() - 1)
+        codes.append((100, Timeout(), Exception('not used')))
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_commit_exception(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        codes = [201] * (self.replicas() - 1)
+        codes.append((100, Exception('kaboom!'), Exception('not used')))
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_with_body(self):
+        segment_size = self.policy.ec_segment_size
+        test_body = (b'asdf' * segment_size)[:-10]
+        # make the footers callback not include Etag footer so that we can
+        # verify that the correct EC-calculated Etag is included in footers
+        # sent to backend
+        footers_callback = make_footers_callback()
+        env = {'swift.callback.update_footers': footers_callback}
+        req = swift.common.swob.Request.blank(
+            '/v1/a/c/o', method='PUT', environ=env)
+        etag = md5(test_body).hexdigest()
+        size = len(test_body)
+        req.body = test_body
+        codes = [201] * self.replicas()
+        resp_headers = {
+            'Some-Other-Header': 'Four',
+            'Etag': 'ignored',
+        }
+
+        put_requests = defaultdict(lambda: {'boundary': None, 'chunks': []})
+
+        def capture_body(conn, chunk):
+            put_requests[conn.connection_id]['chunks'].append(chunk)
+
+        def capture_headers(ip, port, device, part, method, path, headers,
+                            **kwargs):
+            conn_id = kwargs['connection_id']
+            put_requests[conn_id]['boundary'] = headers[
+                'X-Backend-Obj-Multipart-Mime-Boundary']
+            put_requests[conn_id]['backend-content-length'] = headers[
+                'X-Backend-Obj-Content-Length']
+            put_requests[conn_id]['x-timestamp'] = headers[
+                'X-Timestamp']
+
+        with set_http_connect(*codes, expect_headers=self.expect_headers,
+                              give_send=capture_body,
+                              give_connect=capture_headers,
+                              headers=resp_headers):
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 201)
+        timestamps = {captured_req['x-timestamp']
+                      for captured_req in put_requests.values()}
+        self.assertEqual(1, len(timestamps), timestamps)
+        self.assertEqual(dict(resp.headers), {
+            'Content-Type': 'text/html; charset=UTF-8',
+            'Content-Length': '0',
+            'Last-Modified': time.strftime(
+                "%a, %d %b %Y %H:%M:%S GMT",
+                time.gmtime(math.ceil(float(timestamps.pop())))),
+            'Etag': etag,
+        })
+        frag_archives = []
+        for connection_id, info in put_requests.items():
+            body = unchunk_body(''.join(info['chunks']))
+            self.assertIsNotNone(info['boundary'],
+                                 "didn't get boundary for conn %r" % (
+                                     connection_id,))
+            self.assertTrue(size > int(info['backend-content-length']) > 0,
+                            "invalid backend-content-length for conn %r" % (
+                                connection_id,))
+
+            # email.parser.FeedParser doesn't know how to take a multipart
+            # message and boundary together and parse it; it only knows how
+            # to take a string, parse the headers, and figure out the
+            # boundary on its own.
+            parser = email.parser.FeedParser()
+            parser.feed(
+                "Content-Type: multipart/nobodycares; boundary=%s\r\n\r\n" %
+                info['boundary'])
+            parser.feed(body)
+            message = parser.close()
+
+            self.assertTrue(message.is_multipart())  # sanity check
+            mime_parts = message.get_payload()
+            self.assertEqual(len(mime_parts), 3)
+            obj_part, footer_part, commit_part = mime_parts
+
+            # attach the body to frag_archives list
+            self.assertEqual(obj_part['X-Document'], 'object body')
+            frag_archives.append(obj_part.get_payload())
+
+            # assert length was correct for this connection
+            self.assertEqual(int(info['backend-content-length']),
+                             len(frag_archives[-1]))
+            # assert length was the same for all connections
+            self.assertEqual(int(info['backend-content-length']),
+                             len(frag_archives[0]))
+
+            # validate some footer metadata
+            self.assertEqual(footer_part['X-Document'], 'object metadata')
+            footer_metadata = json.loads(footer_part.get_payload())
+            self.assertTrue(footer_metadata)
+            expected = {}
+            # update expected with footers from the callback...
+            footers_callback(expected)
+            expected.update({
+                'X-Object-Sysmeta-Ec-Content-Length': str(size),
+                'X-Backend-Container-Update-Override-Size': str(size),
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Container-Update-Override-Etag': etag,
+                'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
+                'Etag': md5(obj_part.get_payload()).hexdigest()})
+            for header, value in expected.items():
+                self.assertEqual(footer_metadata[header], value)
+
+            # sanity on commit message
+            self.assertEqual(commit_part['X-Document'], 'put commit')
+
+        self.assertEqual(len(frag_archives), self.replicas())
+        fragment_size = self.policy.fragment_size
+        node_payloads = []
+        for fa in frag_archives:
+            payload = [fa[x:x + fragment_size]
+                       for x in range(0, len(fa), fragment_size)]
+            node_payloads.append(payload)
+        fragment_payloads = zip(*node_payloads)
+
+        expected_body = ''
+        for fragment_payload in fragment_payloads:
+            self.assertEqual(len(fragment_payload), self.replicas())
+            if True:
+                fragment_payload = list(fragment_payload)
+            expected_body += self.policy.pyeclib_driver.decode(
+                fragment_payload)
+
+        self.assertEqual(len(test_body), len(expected_body))
+        self.assertEqual(test_body, expected_body)
+
+    def test_PUT_with_footers(self):
+        # verify footers supplied by a footers callback being added to
+        # trailing metadata
+        segment_size = self.policy.ec_segment_size
+        test_body = ('asdf' * segment_size)[:-10]
+        etag = md5(test_body).hexdigest()
+        size = len(test_body)
+        codes = [201] * self.replicas()
+        resp_headers = {
+            'Some-Other-Header': 'Four',
+            'Etag': 'ignored',
+        }
+
+        def do_test(footers_to_add, expect_added):
+            put_requests = defaultdict(
+                lambda: {'boundary': None, 'chunks': []})
+
+            def capture_body(conn, chunk):
+                put_requests[conn.connection_id]['chunks'].append(chunk)
+
+            def capture_headers(ip, port, device, part, method, path, headers,
+                                **kwargs):
+                conn_id = kwargs['connection_id']
+                put_requests[conn_id]['boundary'] = headers[
+                    'X-Backend-Obj-Multipart-Mime-Boundary']
+                put_requests[conn_id]['x-timestamp'] = headers[
+                    'X-Timestamp']
+
+            def footers_callback(footers):
+                footers.update(footers_to_add)
+            env = {'swift.callback.update_footers': footers_callback}
+            req = swift.common.swob.Request.blank(
+                '/v1/a/c/o', method='PUT', environ=env, body=test_body)
+
+            with set_http_connect(*codes, expect_headers=self.expect_headers,
+                                  give_send=capture_body,
+                                  give_connect=capture_headers,
+                                  headers=resp_headers):
+                resp = req.get_response(self.app)
+
+            self.assertEqual(resp.status_int, 201)
+            timestamps = {captured_req['x-timestamp']
+                          for captured_req in put_requests.values()}
+            self.assertEqual(1, len(timestamps), timestamps)
+            self.assertEqual(dict(resp.headers), {
+                'Content-Type': 'text/html; charset=UTF-8',
+                'Content-Length': '0',
+                'Last-Modified': time.strftime(
+                    "%a, %d %b %Y %H:%M:%S GMT",
+                    time.gmtime(math.ceil(float(timestamps.pop())))),
+                'Etag': etag,
+            })
+            for connection_id, info in put_requests.items():
+                body = unchunk_body(''.join(info['chunks']))
+                # email.parser.FeedParser doesn't know how to take a multipart
+                # message and boundary together and parse it; it only knows how
+                # to take a string, parse the headers, and figure out the
+                # boundary on its own.
+                parser = email.parser.FeedParser()
+                parser.feed(
+                    "Content-Type: multipart/nobodycares; boundary=%s\r\n\r\n"
+                    % info['boundary'])
+                parser.feed(body)
+                message = parser.close()
+
+                self.assertTrue(message.is_multipart())  # sanity check
+                mime_parts = message.get_payload()
+                self.assertEqual(len(mime_parts), 3)
+                obj_part, footer_part, commit_part = mime_parts
+
+                # validate EC footer metadata - should always be present
+                self.assertEqual(footer_part['X-Document'], 'object metadata')
+                footer_metadata = json.loads(footer_part.get_payload())
+                self.assertIsNotNone(
+                    footer_metadata.pop('X-Object-Sysmeta-Ec-Frag-Index'))
+                expected = {
+                    'X-Object-Sysmeta-Ec-Scheme':
+                        self.policy.ec_scheme_description,
+                    'X-Object-Sysmeta-Ec-Content-Length': str(size),
+                    'X-Object-Sysmeta-Ec-Etag': etag,
+                    'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
+                    'Etag': md5(obj_part.get_payload()).hexdigest()}
+                expected.update(expect_added)
+                for header, value in expected.items():
+                    self.assertIn(header, footer_metadata)
+                    self.assertEqual(value, footer_metadata[header])
+                    footer_metadata.pop(header)
+                self.assertFalse(footer_metadata)
+
+        # sanity check - middleware sets no footer, expect EC overrides
+        footers_to_add = {}
+        expect_added = {
+            'X-Backend-Container-Update-Override-Size': str(size),
+            'X-Backend-Container-Update-Override-Etag': etag}
+        do_test(footers_to_add, expect_added)
+
+        # middleware cannot overwrite any EC sysmeta
+        footers_to_add = {
+            'X-Object-Sysmeta-Ec-Content-Length': str(size + 1),
+            'X-Object-Sysmeta-Ec-Etag': 'other etag',
+            'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size + 1),
+            'X-Object-Sysmeta-Ec-Unused-But-Reserved': 'ignored'}
+        do_test(footers_to_add, expect_added)
+
+        # middleware can add x-object-sysmeta- headers including
+        # x-object-sysmeta-container-update-override headers
+        footers_to_add = {
+            'X-Object-Sysmeta-Foo': 'bar',
+            'X-Object-Sysmeta-Container-Update-Override-Size':
+                str(size + 1),
+            'X-Object-Sysmeta-Container-Update-Override-Etag': 'other etag',
+            'X-Object-Sysmeta-Container-Update-Override-Ping': 'pong'
+        }
+        expect_added.update(footers_to_add)
+        do_test(footers_to_add, expect_added)
+
+        # middleware can also overwrite x-backend-container-update-override
+        # headers
+        override_footers = {
+            'X-Backend-Container-Update-Override-Wham': 'bam',
+            'X-Backend-Container-Update-Override-Size': str(size + 2),
+            'X-Backend-Container-Update-Override-Etag': 'another etag'}
+        footers_to_add.update(override_footers)
+        expect_added.update(override_footers)
+        do_test(footers_to_add, expect_added)
+
+    def test_PUT_old_obj_server(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        responses = [
+            # one server will response 100-continue but not include the
+            # needful expect headers and the connection will be dropped
+            ((100, Exception('not used')), {}),
+        ] + [
+            # and pleanty of successful responses too
+            (201, {
+                'X-Obj-Metadata-Footer': 'yes',
+                'X-Obj-Multiphase-Commit': 'yes',
+            }),
+        ] * self.replicas()
+        random.shuffle(responses)
+        if responses[-1][0] != 201:
+            # whoops, stupid random
+            responses = responses[1:] + [responses[0]]
+        codes, expect_headers = zip(*responses)
+        with set_http_connect(*codes, expect_headers=expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_with_slow_commits(self):
+        # It's important that this timeout be much less than the delay in
+        # the slow commit responses so that the slow commits are not waited
+        # for.
+        self.app.post_quorum_timeout = 0.01
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+        # plenty of slow commits
+        response_sleep = 5.0
+        codes = [FakeStatus(201, response_sleep=response_sleep)
+                 for i in range(self.replicas())]
+        # swap out some with regular fast responses
+        number_of_fast_responses_needed_to_be_quick_enough = \
+            self.policy.quorum
+        fast_indexes = random.sample(
+            range(self.replicas()),
+            number_of_fast_responses_needed_to_be_quick_enough)
+        for i in fast_indexes:
+            codes[i] = 201
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            start = time.time()
+            resp = req.get_response(self.app)
+            response_time = time.time() - start
+        self.assertEqual(resp.status_int, 201)
+        self.assertLess(response_time, response_sleep)
+
+    def test_PUT_with_just_enough_durable_responses(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+
+        codes = [201] * (self.policy.ec_ndata + 1)
+        codes += [503] * (self.policy.ec_nparity - 1)
+        self.assertEqual(len(codes), self.policy.ec_n_unique_fragments)
+        random.shuffle(codes)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 201)
+
+    def test_PUT_with_less_durable_responses(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT',
+                                              body='')
+
+        codes = [201] * (self.policy.ec_ndata)
+        codes += [503] * (self.policy.ec_nparity)
+        self.assertEqual(len(codes), self.policy.ec_n_unique_fragments)
+        random.shuffle(codes)
+        with set_http_connect(*codes, expect_headers=self.expect_headers):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+
+
+class TestNumContainerUpdates(unittest.TestCase):
+    def test_it(self):
+        test_cases = [
+            # (container replicas, object replicas, object quorum, expected)
+            (3, 17, 13, 6),  # EC 12+5
+            (3, 9, 4, 7),    # EC 3+6
+            (3, 14, 11, 5),  # EC 10+4
+            (5, 14, 11, 6),  # EC 10+4, 5 container replicas
+            (7, 14, 11, 7),  # EC 10+4, 7 container replicas
+            (3, 19, 16, 5),  # EC 15+4
+            (5, 19, 16, 6),  # EC 15+4, 5 container replicas
+            (3, 28, 22, 8),  # EC (10+4)x2
+            (5, 28, 22, 9),  # EC (10+4)x2, 5 container replicas
+            (3, 1, 1, 3),    # 1 object replica
+            (3, 2, 1, 3),    # 2 object replicas
+            (3, 3, 2, 3),    # 3 object replicas
+            (3, 4, 2, 4),    # 4 object replicas
+            (3, 5, 3, 4),    # 5 object replicas
+            (3, 6, 3, 5),    # 6 object replicas
+            (3, 7, 4, 5),    # 7 object replicas
+        ]
+
+        for c_replica, o_replica, o_quorum, exp in test_cases:
+            c_quorum = utils.quorum_size(c_replica)
+            got = obj.num_container_updates(c_replica, c_quorum,
+                                            o_replica, o_quorum)
+            self.assertEqual(
+                exp, got,
+                "Failed for c_replica=%d, o_replica=%d, o_quorum=%d" % (
+                    c_replica, o_replica, o_quorum))
 
 
 if __name__ == '__main__':

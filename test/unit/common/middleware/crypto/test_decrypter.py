@@ -16,14 +16,15 @@ import base64
 import json
 import os
 import unittest
-from xml.dom import minidom
 
 import mock
 
+from swift.common.request_helpers import is_object_transient_sysmeta
+from swift.common.utils import MD5_OF_EMPTY_STRING
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.middleware.crypto import decrypter
 from swift.common.middleware.crypto.crypto_utils import CRYPTO_KEY_CALLBACK, \
-    dump_crypto_meta, Crypto
+    dump_crypto_meta, Crypto, load_crypto_meta
 from swift.common.swob import Request, HTTPException, HTTPOk, \
     HTTPPreconditionFailed, HTTPNotFound, HTTPPartialContent
 
@@ -52,7 +53,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.decrypter.logger = FakeLogger()
 
     def _make_response_headers(self, content_length, plaintext_etag, keys,
-                               body_key):
+                               body_key, key_id=None):
         # helper method to make a typical set of response headers for a GET or
         # HEAD request
         cont_key = keys['container']
@@ -60,24 +61,30 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         body_key_meta = {'key': encrypt(body_key, object_key, FAKE_IV),
                          'iv': FAKE_IV}
         body_crypto_meta = fake_get_crypto_meta(body_key=body_key_meta)
+        other_crypto_meta = fake_get_crypto_meta()
+        if key_id:
+            body_crypto_meta['key_id'] = key_id
+            other_crypto_meta['key_id'] = key_id
         return HeaderKeyDict({
             'Etag': 'hashOfCiphertext',
             'content-type': 'text/plain',
             'content-length': content_length,
             'X-Object-Sysmeta-Crypto-Etag': '%s; swift_meta=%s' % (
                 base64.b64encode(encrypt(plaintext_etag, object_key, FAKE_IV)),
-                get_crypto_meta_header()),
+                get_crypto_meta_header(other_crypto_meta)),
             'X-Object-Sysmeta-Crypto-Body-Meta':
                 get_crypto_meta_header(body_crypto_meta),
+            'X-Object-Transient-Sysmeta-Crypto-Meta':
+                get_crypto_meta_header(other_crypto_meta),
             'x-object-transient-sysmeta-crypto-meta-test':
                 base64.b64encode(encrypt('encrypt me', object_key, FAKE_IV)) +
-                ';swift_meta=' + get_crypto_meta_header(),
+                ';swift_meta=' + get_crypto_meta_header(other_crypto_meta),
             'x-object-sysmeta-container-update-override-etag':
                 encrypt_and_append_meta('encrypt me, too', cont_key),
             'x-object-sysmeta-test': 'do not encrypt me',
         })
 
-    def _test_request_success(self, method, body):
+    def _test_request_success(self, method, body, key_id=None):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
@@ -85,8 +92,13 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         body_key = os.urandom(32)
         enc_body = encrypt(body, body_key, FAKE_IV)
         hdrs = self._make_response_headers(
-            len(enc_body), plaintext_etag, fetch_crypto_keys(), body_key)
-
+            len(enc_body), plaintext_etag, fetch_crypto_keys(key_id=key_id),
+            body_key, key_id=key_id)
+        if key_id:
+            crypto_meta = load_crypto_meta(
+                hdrs['X-Object-Sysmeta-Crypto-Body-Meta'])
+            # sanity check that the test setup used provided key_id
+            self.assertEqual(key_id, crypto_meta['key_id'])
         # there shouldn't be any x-object-meta- headers, but if there are
         # then the decrypted header will win where there is a name clash...
         hdrs.update({
@@ -116,9 +128,141 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         resp = self._test_request_success('GET', body)
         self.assertEqual(body, resp.body)
 
+        key_id_val = {'secret_id': 'myid'}
+        resp = self._test_request_success('GET', body, key_id=key_id_val)
+        self.assertEqual(body, resp.body)
+
+        key_id_val = {'secret_id': ''}
+        resp = self._test_request_success('GET', body, key_id=key_id_val)
+        self.assertEqual(body, resp.body)
+
     def test_HEAD_success(self):
         body = 'FAKE APP'
         resp = self._test_request_success('HEAD', body)
+        self.assertEqual('', resp.body)
+
+        key_id_val = {'secret_id': 'myid'}
+        resp = self._test_request_success('HEAD', body, key_id=key_id_val)
+        self.assertEqual('', resp.body)
+
+        key_id_val = {'secret_id': ''}
+        resp = self._test_request_success('HEAD', body, key_id=key_id_val)
+        self.assertEqual('', resp.body)
+
+    def _check_different_keys_for_data_and_metadata(self, method):
+        env = {'REQUEST_METHOD': method,
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        data_key_id = {}
+        metadata_key_id = {'secret_id': 'myid'}
+        body = 'object data'
+        plaintext_etag = md5hex(body)
+        body_key = os.urandom(32)
+        enc_body = encrypt(body, body_key, FAKE_IV)
+        data_key = fetch_crypto_keys(data_key_id)
+        metadata_key = fetch_crypto_keys(metadata_key_id)
+        # synthesise response headers to mimic different key used for data PUT
+        # vs metadata POST
+        hdrs = self._make_response_headers(
+            len(enc_body), plaintext_etag, data_key, body_key,
+            key_id=data_key_id)
+        metadata_hdrs = self._make_response_headers(
+            len(enc_body), plaintext_etag, metadata_key, body_key,
+            key_id=metadata_key_id)
+        for k, v in metadata_hdrs.items():
+            if is_object_transient_sysmeta(k):
+                self.assertNotEqual(hdrs[k], v)  # sanity check
+                hdrs[k] = v
+
+        self.app.register(
+            method, '/v1/a/c/o', HTTPOk, body=enc_body, headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(plaintext_etag, resp.headers['Etag'])
+        self.assertEqual('text/plain', resp.headers['Content-Type'])
+        self.assertEqual('encrypt me', resp.headers['x-object-meta-test'])
+        self.assertEqual(
+            'encrypt me, too',
+            resp.headers['X-Object-Sysmeta-Container-Update-Override-Etag'])
+        return resp
+
+    def test_GET_different_keys_for_data_and_metadata(self):
+        resp = self._check_different_keys_for_data_and_metadata('GET')
+        self.assertEqual('object data', resp.body)
+
+    def test_HEAD_different_keys_for_data_and_metadata(self):
+        resp = self._check_different_keys_for_data_and_metadata('HEAD')
+        self.assertEqual('', resp.body)
+
+    def _check_unencrypted_data_and_encrypted_metadata(self, method):
+        env = {'REQUEST_METHOD': method,
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        body = 'object data'
+        plaintext_etag = md5hex(body)
+        metadata_key = fetch_crypto_keys()
+        # synthesise headers for unencrypted PUT + headers for encrypted POST
+        hdrs = HeaderKeyDict({
+            'Etag': plaintext_etag,
+            'content-type': 'text/plain',
+            'content-length': len(body)})
+        # we don't the data related headers but need a body key to keep the
+        # helper function happy
+        body_key = os.urandom(32)
+        metadata_hdrs = self._make_response_headers(
+            len(body), plaintext_etag, metadata_key, body_key)
+        for k, v in metadata_hdrs.items():
+            if is_object_transient_sysmeta(k):
+                hdrs[k] = v
+
+        self.app.register(
+            method, '/v1/a/c/o', HTTPOk, body=body, headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(plaintext_etag, resp.headers['Etag'])
+        self.assertEqual('text/plain', resp.headers['Content-Type'])
+        self.assertEqual('encrypt me', resp.headers['x-object-meta-test'])
+        return resp
+
+    def test_GET_unencrypted_data_and_encrypted_metadata(self):
+        resp = self._check_unencrypted_data_and_encrypted_metadata('GET')
+        self.assertEqual('object data', resp.body)
+
+    def test_HEAD_unencrypted_data_and_encrypted_metadata(self):
+        resp = self._check_unencrypted_data_and_encrypted_metadata('HEAD')
+        self.assertEqual('', resp.body)
+
+    def _check_encrypted_data_and_unencrypted_metadata(self, method):
+        env = {'REQUEST_METHOD': method,
+               CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
+        req = Request.blank('/v1/a/c/o', environ=env)
+        body = 'object data'
+        plaintext_etag = md5hex(body)
+        body_key = os.urandom(32)
+        enc_body = encrypt(body, body_key, FAKE_IV)
+        data_key = fetch_crypto_keys()
+        hdrs = self._make_response_headers(
+            len(enc_body), plaintext_etag, data_key, body_key)
+        for k, v in hdrs.items():
+            if is_object_transient_sysmeta(k):
+                hdrs.pop(k)
+        hdrs['x-object-meta-test'] = 'unencrypted'
+
+        self.app.register(
+            method, '/v1/a/c/o', HTTPOk, body=enc_body, headers=hdrs)
+        resp = req.get_response(self.decrypter)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(plaintext_etag, resp.headers['Etag'])
+        self.assertEqual('text/plain', resp.headers['Content-Type'])
+        self.assertEqual('unencrypted', resp.headers['x-object-meta-test'])
+        return resp
+
+    def test_GET_encrypted_data_and_unencrypted_metadata(self):
+        resp = self._check_encrypted_data_and_unencrypted_metadata('GET')
+        self.assertEqual('object data', resp.body)
+
+    def test_HEAD_encrypted_data_and_unencrypted_metadata(self):
+        resp = self._check_encrypted_data_and_unencrypted_metadata('HEAD')
         self.assertEqual('', resp.body)
 
     def test_headers_case(self):
@@ -272,7 +416,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
 
     def _test_bad_key(self, method):
         # use bad key
-        def bad_fetch_crypto_keys():
+        def bad_fetch_crypto_keys(**kwargs):
             keys = fetch_crypto_keys()
             keys['object'] = 'bad key'
             return keys
@@ -734,7 +878,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                       self.decrypter.logger.get_lines_for_level('error')[0])
 
     def test_GET_error_in_key_callback(self):
-        def raise_exc():
+        def raise_exc(**kwargs):
             raise Exception('Testing')
 
         env = {'REQUEST_METHOD': 'GET',
@@ -956,142 +1100,61 @@ class TestDecrypterContainerRequests(unittest.TestCase):
 
         resp = self._make_cont_get_req(fake_body, 'json')
 
-        self.assertEqual('500 Internal Error', resp.status)
-        self.assertEqual('Error decrypting container listing', resp.body)
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(['<unknown>'],
+                         [x['hash'] for x in json.loads(resp.body)])
         self.assertIn("Cipher must be AES_CTR_256",
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assertIn('Error decrypting container listing',
+                      self.decrypter.logger.get_lines_for_level('error')[0])
 
-    def _assert_element(self, name, expected, element):
-        self.assertEqual(element.tagName, name)
-        self._assert_element_contains_dict(expected, element)
-
-    def _assert_element_contains_dict(self, expected, element):
-        for k, v in expected.items():
-            entry = element.getElementsByTagName(k)
-            self.assertIsNotNone(entry, 'Key %s not found' % k)
-            actual = entry[0].childNodes[0].nodeValue
-            self.assertEqual(v, actual,
-                             "Expected %s but got %s for key %s"
-                             % (v, actual, k))
-
-    def test_GET_container_xml(self):
-        content_type_1 = u'\uF10F\uD20D\uB30B\u9409'
-        content_type_2 = 'text/plain; param=foo'
-        pt_etag1 = 'c6e8196d7f0fff6444b90861fe8d609d'
-        pt_etag2 = 'ac0374ed4d43635f803c82469d0b5a10'
-        key = fetch_crypto_keys()['container']
-
-        fake_body = '''<?xml version="1.0" encoding="UTF-8"?>
-<container name="testc">\
-<subdir name="test-subdir"><name>test-subdir</name></subdir>\
-<object><hash>\
-''' + encrypt_and_append_meta(pt_etag1.encode('utf8'), key) + '''\
-</hash><content_type>\
-''' + content_type_1 + '''\
-</content_type><name>testfile</name><bytes>16</bytes>\
-<last_modified>2015-04-19T02:37:39.601660</last_modified></object>\
-<object><hash>\
-''' + encrypt_and_append_meta(pt_etag2.encode('utf8'), key) + '''\
-</hash><content_type>\
-''' + content_type_2 + '''\
-</content_type><name>testfile2</name><bytes>24</bytes>\
-<last_modified>2015-04-19T02:37:39.684740</last_modified></object>\
-</container>'''
-
-        resp = self._make_cont_get_req(fake_body, 'xml')
-        self.assertEqual('200 OK', resp.status)
-        body = resp.body
-        self.assertEqual(len(body), int(resp.headers['Content-Length']))
-
-        tree = minidom.parseString(body)
-        containers = tree.getElementsByTagName('container')
-        self.assertEqual(1, len(containers))
-        self.assertEqual('testc',
-                         containers[0].attributes.getNamedItem("name").value)
-
-        results = containers[0].childNodes
-        self.assertEqual(3, len(results))
-
-        self._assert_element('subdir', {"name": "test-subdir"}, results[0])
-
-        obj_dict_1 = {"bytes": "16",
-                      "last_modified": "2015-04-19T02:37:39.601660",
-                      "hash": pt_etag1,
-                      "name": "testfile",
-                      "content_type": content_type_1}
-        self._assert_element('object', obj_dict_1, results[1])
-        obj_dict_2 = {"bytes": "24",
-                      "last_modified": "2015-04-19T02:37:39.684740",
-                      "hash": pt_etag2,
-                      "name": "testfile2",
-                      "content_type": content_type_2}
-        self._assert_element('object', obj_dict_2, results[2])
-
-    def test_GET_container_xml_with_crypto_override(self):
-        content_type_1 = 'image/jpeg'
-        content_type_2 = 'text/plain; param=foo'
-
-        fake_body = '''<?xml version="1.0" encoding="UTF-8"?>
-<container name="testc">\
-<object><hash>c6e8196d7f0fff6444b90861fe8d609d</hash>\
-<content_type>''' + content_type_1 + '''\
-</content_type><name>testfile</name><bytes>16</bytes>\
-<last_modified>2015-04-19T02:37:39.601660</last_modified></object>\
-<object><hash>ac0374ed4d43635f803c82469d0b5a10</hash>\
-<content_type>''' + content_type_2 + '''\
-</content_type><name>testfile2</name><bytes>24</bytes>\
-<last_modified>2015-04-19T02:37:39.684740</last_modified></object>\
-</container>'''
-
-        resp = self._make_cont_get_req(fake_body, 'xml', override=True)
-
-        self.assertEqual('200 OK', resp.status)
-        body = resp.body
-        self.assertEqual(len(body), int(resp.headers['Content-Length']))
-
-        tree = minidom.parseString(body)
-        containers = tree.getElementsByTagName('container')
-        self.assertEqual(1, len(containers))
-        self.assertEqual('testc',
-                         containers[0].attributes.getNamedItem("name").value)
-
-        objs = tree.getElementsByTagName('object')
-        self.assertEqual(2, len(objs))
-
-        obj_dict_1 = {"bytes": "16",
-                      "last_modified": "2015-04-19T02:37:39.601660",
-                      "hash": "c6e8196d7f0fff6444b90861fe8d609d",
-                      "name": "testfile",
-                      "content_type": content_type_1}
-        self._assert_element_contains_dict(obj_dict_1, objs[0])
-        obj_dict_2 = {"bytes": "24",
-                      "last_modified": "2015-04-19T02:37:39.684740",
-                      "hash": "ac0374ed4d43635f803c82469d0b5a10",
-                      "name": "testfile2",
-                      "content_type": content_type_2}
-        self._assert_element_contains_dict(obj_dict_2, objs[1])
-
-    def test_cont_get_xml_req_with_cipher_mismatch(self):
+    def test_cont_get_json_req_with_unknown_secret_id(self):
         bad_crypto_meta = fake_get_crypto_meta()
-        bad_crypto_meta['cipher'] = 'unknown_cipher'
+        bad_crypto_meta['key_id'] = {'secret_id': 'unknown_key'}
+        key = fetch_crypto_keys()['container']
+        pt_etag = 'c6e8196d7f0fff6444b90861fe8d609d'
+        ct_etag = encrypt_and_append_meta(pt_etag, key,
+                                          crypto_meta=bad_crypto_meta)
 
-        fake_body = '''<?xml version="1.0" encoding="UTF-8"?>
-<container name="testc"><object>\
-<hash>''' + encrypt_and_append_meta('c6e8196d7f0fff6444b90861fe8d609d',
-                                    fetch_crypto_keys()['container'],
-                                    crypto_meta=bad_crypto_meta) + '''\
-</hash>\
-<content_type>image/jpeg</content_type>\
-<name>testfile</name><bytes>16</bytes>\
-<last_modified>2015-04-19T02:37:39.601660</last_modified></object>\
-</container>'''
+        obj_dict_1 = {"bytes": 16,
+                      "last_modified": "2015-04-14T23:33:06.439040",
+                      "hash": ct_etag,
+                      "name": "testfile",
+                      "content_type": "image/jpeg"}
 
-        resp = self._make_cont_get_req(fake_body, 'xml')
+        listing = [obj_dict_1]
+        fake_body = json.dumps(listing)
 
-        self.assertEqual('500 Internal Error', resp.status)
-        self.assertEqual('Error decrypting container listing', resp.body)
-        self.assertIn("Cipher must be AES_CTR_256",
-                      self.decrypter.logger.get_lines_for_level('error')[0])
+        resp = self._make_cont_get_req(fake_body, 'json')
+
+        self.assertEqual('200 OK', resp.status)
+        self.assertEqual(['<unknown>'],
+                         [x['hash'] for x in json.loads(resp.body)])
+        self.assertEqual(self.decrypter.logger.get_lines_for_level('error'), [
+            'get_keys(): unknown key id: unknown_key',
+            'Error decrypting container listing: unknown_key',
+        ])
+
+    def test_GET_container_json_not_encrypted_obj(self):
+        pt_etag = '%s; symlink_path=/a/c/o' % MD5_OF_EMPTY_STRING
+
+        obj_dict = {"bytes": 0,
+                    "last_modified": "2015-04-14T23:33:06.439040",
+                    "hash": pt_etag,
+                    "name": "symlink",
+                    "content_type": 'application/symlink'}
+
+        listing = [obj_dict]
+        fake_body = json.dumps(listing)
+
+        resp = self._make_cont_get_req(fake_body, 'json')
+
+        self.assertEqual('200 OK', resp.status)
+        body = resp.body
+        self.assertEqual(len(body), int(resp.headers['Content-Length']))
+        body_json = json.loads(body)
+        self.assertEqual(1, len(body_json))
+        self.assertEqual(pt_etag, body_json[0]['hash'])
 
 
 class TestModuleMethods(unittest.TestCase):

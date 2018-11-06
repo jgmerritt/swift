@@ -5,20 +5,21 @@
 # Translators:
 # Sasuke(Kyohei MORIYAMA) <>, 2015
 # Andreas Jaeger <jaegerandi@gmail.com>, 2016. #zanata
+# Shu Muto <shu.mutow@gmail.com>, 2018. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: swift 2.9.1.dev6\n"
+"Project-Id-Version: swift VERSION\n"
 "Report-Msgid-Bugs-To: https://bugs.launchpad.net/openstack-i18n/\n"
-"POT-Creation-Date: 2016-07-19 04:02+0000\n"
+"POT-Creation-Date: 2018-08-25 00:41+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"PO-Revision-Date: 2016-03-29 05:40+0000\n"
-"Last-Translator: 笹原 昌美 <ebb0de1@jp.ibm.com>\n"
+"PO-Revision-Date: 2018-02-09 05:39+0000\n"
+"Last-Translator: Shu Muto <shu.mutow@gmail.com>\n"
 "Language: ja\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
 "Generated-By: Babel 2.0\n"
-"X-Generator: Zanata 3.7.3\n"
+"X-Generator: Zanata 4.3.3\n"
 "Language-Team: Japanese\n"
 
 msgid ""
@@ -44,22 +45,8 @@ msgstr ""
 "済み %(synced).2f%%"
 
 #, python-format
-msgid "%(ip)s/%(device)s responded as unmounted"
-msgstr "%(ip)s/%(device)s はアンマウントとして応答しました"
-
-#, python-format
 msgid "%(msg)s %(ip)s:%(port)s/%(device)s"
 msgstr "%(msg)s %(ip)s:%(port)s/%(device)s"
-
-#, python-format
-msgid ""
-"%(reconstructed)d/%(total)d (%(percentage).2f%%) partitions of %(device)d/"
-"%(dtotal)d (%(dpercentage).2f%%) devices reconstructed in %(time).2fs "
-"(%(rate).2f/sec, %(remaining)s remaining)"
-msgstr ""
-"%(device)d/%(dtotal)d (%(dpercentage).2f%%) デバイスの %(reconstructed)d/"
-"%(total)d (%(percentage).2f%%) パーティションが %(time).2fs で再構成されまし"
-"た (%(rate).2f/秒、残り %(remaining)s)"
 
 #, python-format
 msgid ""
@@ -70,12 +57,32 @@ msgstr ""
 "複製されました (%(rate).2f/秒、残り %(remaining)s)"
 
 #, python-format
+msgid "%(server)s #%(number)d not running (%(conf)s)"
+msgstr "%(server)s #%(number)d は稼働していません (%(conf)s)"
+
+#, python-format
+msgid "%(server)s (%(pid)s) appears to have stopped"
+msgstr "%(server)s (%(pid)s) が停止された可能性があります"
+
+#, python-format
+msgid "%(server)s running (%(pid)s - %(conf)s)"
+msgstr "%(server)s 稼働中 (%(pid)s - %(conf)s)"
+
+#, python-format
+msgid "%(server)s running (%(pid)s - %(pid_file)s)"
+msgstr "%(server)s 稼働中 (%(pid)s - %(pid_file)s)"
+
+#, python-format
 msgid "%(success)s successes, %(failure)s failures"
 msgstr "成功 %(success)s、失敗 %(failure)s"
 
 #, python-format
 msgid "%(type)s returning 503 for %(statuses)s"
 msgstr "%(type)s が %(statuses)s について 503 を返しています"
+
+#, python-format
+msgid "%(type)s: %(value)s"
+msgstr "%(type)s: %(value)s"
 
 #, python-format
 msgid "%s already started..."
@@ -132,6 +139,10 @@ msgid "Account"
 msgstr "アカウント"
 
 #, python-format
+msgid "Account %(account)s has not been reaped since %(time)s"
+msgstr "アカウント %(account)s は %(time)s 以降リープされていません"
+
+#, python-format
 msgid "Account audit \"once\" mode completed: %.02fs"
 msgstr "アカウント監査 \"once\" モードが完了しました: %.02fs"
 
@@ -143,6 +154,18 @@ msgstr "アカウント監査の処理が完了しました: %.02fs"
 msgid ""
 "Attempted to replicate %(count)d dbs in %(time).5f seconds (%(rate).5f/s)"
 msgstr "%(time).5f 秒で %(count)d 個の DB の複製を試行しました (%(rate).5f/s)"
+
+#, python-format
+msgid "Audit Failed for %(path)s: %(err)s"
+msgstr "%(path)s の監査が失敗しました: %(err)s"
+
+#, python-format
+msgid "Audit passed for %s"
+msgstr "%s の監査が合格しました。"
+
+#, python-format
+msgid "Bad key for %(name)r: %(err)s"
+msgstr "%(name)r のキーが不正です: %(err)s"
 
 #, python-format
 msgid "Bad rsync return code: %(ret)d <- %(args)s"
@@ -263,12 +286,19 @@ msgstr ""
 "%(success)s、失敗 %(fail)s、未変更 %(no_change)s"
 
 #, python-format
+msgid "Could not load %(conf)r: %(error)s"
+msgstr "%(conf)r をロードできませんでした: %(error)s"
+
+#, python-format
 msgid "Data download error: %s"
 msgstr "データダウンロードエラー: %s"
 
 #, python-format
 msgid "Devices pass completed: %.02fs"
 msgstr "デバイスの処理が完了しました: %.02fs"
+
+msgid "Did not get a keys dict"
+msgstr "キーの辞書を取得できませんでした。"
 
 #, python-format
 msgid "ERROR %(db_file)s: %(validate_sync_to_err)s"
@@ -293,10 +323,6 @@ msgid ""
 msgstr ""
 "エラー: アカウント更新が %(ip)s:%(port)s/%(device)s で失敗しました(後で再試行"
 "されます): 応答 %(status)s %(reason)s"
-
-#, python-format
-msgid "ERROR Bad response %(status)s from %(host)s"
-msgstr "エラー: ホスト %(host)s からの応答 %(status)s が正しくありません"
 
 #, python-format
 msgid "ERROR Client read timeout (%ss)"
@@ -357,6 +383,14 @@ msgid "ERROR Syncing %s"
 msgstr "%s の同期エラー"
 
 #, python-format
+msgid ""
+"ERROR There are not enough handoff nodes to reach replica count for "
+"partition %s"
+msgstr ""
+"エラー パーティション %s のレプリカ数に達するための handoff ノードが不足して"
+"います。"
+
+#, python-format
 msgid "ERROR Trying to audit %s"
 msgstr "%s の監査を試行中にエラーが発生しました"
 
@@ -402,6 +436,9 @@ msgstr ""
 "エラー: コンテナー更新が %(ip)s:%(port)s/%(dev)s で失敗しました (後の非同期更"
 "新のために保存中)"
 
+msgid "ERROR get_keys() missing callback"
+msgstr "エラー get_keys() コールバックがありません"
+
 #, python-format
 msgid "ERROR reading HTTP response from %s"
 msgstr "%s からの HTTP 応答の読み取りエラー"
@@ -442,9 +479,6 @@ msgstr "リモートサーバー %(ip)s:%(port)s/%(device)s でのエラー"
 msgid "ERROR:  Failed to get paths to drive partitions: %s"
 msgstr "エラー: ドライブパーティションに対するパスの取得に失敗しました: %s"
 
-msgid "ERROR: An error occurred while retrieving segments"
-msgstr "エラー: セグメントの取得中にエラーが発生しました"
-
 #, python-format
 msgid "ERROR: Unable to access %(path)s: %(error)s"
 msgstr "エラー: %(path)s にアクセスできません: %(error)s"
@@ -453,20 +487,12 @@ msgstr "エラー: %(path)s にアクセスできません: %(error)s"
 msgid "ERROR: Unable to run auditing: %s"
 msgstr "エラー: 監査を実行できません: %s"
 
-#, python-format
-msgid "Error %(action)s to memcached: %(server)s"
-msgstr "memcached %(server)s に対する %(action)s がエラーになりました"
-
-#, python-format
-msgid "Error encoding to UTF-8: %s"
-msgstr "UTF-8 へのエンコードエラー: %s"
-
 msgid "Error hashing suffix"
 msgstr "サフィックスのハッシュエラー"
 
 #, python-format
-msgid "Error limiting server %s"
-msgstr "サーバー %s の制限エラー"
+msgid "Error in %(conf)r with mtime_check_interval: %(error)s"
+msgstr "mtime_check_interval で %(conf)r にエラーがあります: %(error)s"
 
 msgid "Error listing devices"
 msgstr "デバイスのリストエラー"
@@ -489,6 +515,10 @@ msgstr "swift.conf の読み取りエラー"
 
 msgid "Error retrieving recon data"
 msgstr "再構成データの取得エラー"
+
+#, python-format
+msgid "Error sending UDP message to %(target)r: %(err)s"
+msgstr "%(target)r への UDP メッセージ送信エラー: %(err)s"
 
 msgid "Error syncing handoff partition"
 msgstr "ハンドオフパーティションの同期エラー"
@@ -516,14 +546,8 @@ msgstr "エラー: 構成パス引数がありません"
 msgid "Error: unable to locate %s"
 msgstr "エラー: %s が見つかりません"
 
-msgid "Exception dumping recon cache"
-msgstr "再構成キャッシュのダンプで例外が発生しました"
-
 msgid "Exception in top-level account reaper loop"
 msgstr "最上位アカウントリーパーループで例外が発生しました"
-
-msgid "Exception in top-level replication loop"
-msgstr "最上位複製ループで例外が発生しました"
 
 msgid "Exception in top-levelreconstruction loop"
 msgstr "最上位再構成ループで例外が発生しました"
@@ -600,6 +624,9 @@ msgstr ""
 "無効なスキーム %r が X-Container-Sync-To にあります。「//」、「http」、"
 "「https」のいずれかでなければなりません。"
 
+msgid "Invalid swift_bytes"
+msgstr "無効な swift_bytes"
+
 #, python-format
 msgid "Killing long-running rsync: %s"
 msgstr "長期実行の再同期を強制終了中: %s"
@@ -612,8 +639,16 @@ msgid "Mapped %(given_domain)s to %(found_domain)s"
 msgstr "%(given_domain)s が %(found_domain)s にマップされました"
 
 #, python-format
+msgid "Missing key for %r"
+msgstr "%r にキーがありません。"
+
+#, python-format
 msgid "No %s running"
 msgstr "%s が実行されていません"
+
+#, python-format
+msgid "No cluster endpoint for %(realm)r %(cluster)r"
+msgstr "%(realm)r %(cluster)r のエンドポイントクラスターがありません"
 
 #, python-format
 msgid "No permission to signal PID %d"
@@ -715,24 +750,8 @@ msgid "Object servers returned %s mismatched etags"
 msgstr "オブジェクトサーバーが %s 個の不一致 etag を返しました"
 
 #, python-format
-msgid ""
-"Object update single threaded sweep completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"オブジェクト更新単一スレッド化スイープが完了しました: %(elapsed).02fs、成功 "
-"%(success)s、失敗 %(fail)s"
-
-#, python-format
 msgid "Object update sweep completed: %.02fs"
 msgstr "オブジェクト更新スイープが完了しました: %.02fs"
-
-#, python-format
-msgid ""
-"Object update sweep of %(device)s completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"%(device)s のオブジェクト更新スイープが完了しました: %(elapsed).02fs、成功 "
-"%(success)s、失敗 %(fail)s"
 
 msgid "Params, queries, and fragments not allowed in X-Container-Sync-To"
 msgstr ""
@@ -830,6 +849,10 @@ msgid "Running object replicator in script mode."
 msgstr "スクリプトモードでオブジェクトレプリケーターを実行中です。"
 
 #, python-format
+msgid "Signal %(server)s  pid: %(pid)s  signal: %(signal)s"
+msgstr "%(server)s pid: %(pid)s へのシグナル: %(signal)s"
+
+#, python-format
 msgid ""
 "Since %(time)s: %(sync)s synced [%(delete)s deletes, %(put)s puts], %(skip)s "
 "skipped, %(fail)s failed"
@@ -853,8 +876,8 @@ msgstr ""
 "%(time)s 以降: コンテナー監査: 合格した監査 %(pass)s、不合格の監査%(fail)s"
 
 #, python-format
-msgid "Skipping %(device)s as it is not mounted"
-msgstr "%(device)s はマウントされていないため、スキップされます"
+msgid "Skipping %(datadir)s because %(err)s"
+msgstr "%(err)s のため %(datadir)s をスキップします"
 
 #, python-format
 msgid "Skipping %s as it is not mounted"
@@ -892,10 +915,6 @@ msgstr ""
 "一致しません"
 
 #, python-format
-msgid "Timeout %(action)s to memcached: %(server)s"
-msgstr "memcached %(server)s に対する %(action)s がタイムアウトになりました"
-
-#, python-format
 msgid "Timeout Exception with %(ip)s:%(port)s/%(device)s"
 msgstr "%(ip)s:%(port)s/%(device)s のタイムアウト例外"
 
@@ -928,6 +947,10 @@ msgid "UNCAUGHT EXCEPTION"
 msgstr "キャッチされていない例外"
 
 #, python-format
+msgid "Unable to find %(section)s config section in %(conf)s"
+msgstr "%(section)s 構成セクションが %(conf)s に見つかりません"
+
+#, python-format
 msgid "Unable to locate %s in libc.  Leaving as a no-op."
 msgstr "%s が libc に見つかりません。no-op として終了します。"
 
@@ -935,10 +958,18 @@ msgstr "%s が libc に見つかりません。no-op として終了します。
 msgid "Unable to locate config for %s"
 msgstr "%s の設定が見つかりません"
 
+#, python-format
+msgid "Unable to locate config number %(number)s for %(server)s"
+msgstr "%(server)s の設定番号 %(number)s が見つかりません"
+
 msgid ""
 "Unable to locate fallocate, posix_fallocate in libc.  Leaving as a no-op."
 msgstr ""
 "fallocate、posix_fallocate が libc に見つかりません。no-op として終了します。"
+
+#, python-format
+msgid "Unable to perform fsync() on directory %(dir)s: %(err)s"
+msgstr "ディレクトリー %(dir)s で fsync() を実行できません: %(err)s"
 
 #, python-format
 msgid "Unable to read config from %s"
@@ -947,10 +978,6 @@ msgstr "構成を %s から読み取ることができません"
 #, python-format
 msgid "Unauth %(sync_from)r => %(sync_to)r"
 msgstr "非認証 %(sync_from)r => %(sync_to)r"
-
-#, python-format
-msgid "Unexpected response: %s"
-msgstr "予期しない応答: %s"
 
 msgid "Unhandled exception"
 msgstr "未処理例外"
@@ -983,6 +1010,14 @@ msgstr "警告: 最大処理限界を変更できません。非ルートとし�
 
 msgid "WARNING: Unable to modify memory limit.  Running as non-root?"
 msgstr "警告: メモリー制限を変更できません。非ルートとして実行しますか?"
+
+#, python-format
+msgid "Waited %(kill_wait)s seconds for %(server)s to die; giving up"
+msgstr "%(kill_wait)s 秒間、%(server)s の停止を待機しました。中止します"
+
+#, python-format
+msgid "Waited %(kill_wait)s seconds for %(server)s to die; killing"
+msgstr "%(kill_wait)s 秒間、%(server)s の停止を待機しました。強制終了します"
 
 msgid "Warning: Cannot ratelimit without a memcached client"
 msgstr "警告: memcached クライアントなしで ratelimit を行うことはできません"

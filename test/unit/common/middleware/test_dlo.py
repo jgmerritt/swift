@@ -23,7 +23,7 @@ from textwrap import dedent
 import time
 import unittest
 
-from swift.common import exceptions, swob
+from swift.common import swob
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.middleware import dlo
 from swift.common.utils import closing_if_possible
@@ -38,7 +38,7 @@ def md5hex(s):
 
 
 class DloTestCase(unittest.TestCase):
-    def call_dlo(self, req, app=None, expect_exception=False):
+    def call_dlo(self, req, app=None):
         if app is None:
             app = self.dlo
 
@@ -53,22 +53,11 @@ class DloTestCase(unittest.TestCase):
 
         body_iter = app(req.environ, start_response)
         body = ''
-        caught_exc = None
-        try:
-            # appease the close-checker
-            with closing_if_possible(body_iter):
-                for chunk in body_iter:
-                    body += chunk
-        except Exception as exc:
-            if expect_exception:
-                caught_exc = exc
-            else:
-                raise
-
-        if expect_exception:
-            return status[0], headers[0], body, caught_exc
-        else:
-            return status[0], headers[0], body
+        # appease the close-checker
+        with closing_if_possible(body_iter):
+            for chunk in body_iter:
+                body += chunk
+        return status[0], headers[0], body
 
     def setUp(self):
         self.app = FakeSwift()
@@ -129,11 +118,11 @@ class DloTestCase(unittest.TestCase):
                                           "last_modified": lm,
                                           "content_type": "application/png"}]
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json',
+            'GET', '/v1/AUTH_test/c',
             swob.HTTPOk, {'Content-Type': 'application/json; charset=utf-8'},
             json.dumps(full_container_listing))
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=seg',
+            'GET', '/v1/AUTH_test/c?prefix=seg',
             swob.HTTPOk, {'Content-Type': 'application/json; charset=utf-8'},
             json.dumps(segs))
 
@@ -148,11 +137,11 @@ class DloTestCase(unittest.TestCase):
                           'X-Object-Manifest': 'c/seg_'},
             'manyseg')
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=seg_',
+            'GET', '/v1/AUTH_test/c?prefix=seg_',
             swob.HTTPOk, {'Content-Type': 'application/json; charset=utf-8'},
             json.dumps(segs[:3]))
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=seg_&marker=seg_03',
+            'GET', '/v1/AUTH_test/c?prefix=seg_&marker=seg_03',
             swob.HTTPOk, {'Content-Type': 'application/json; charset=utf-8'},
             json.dumps(segs[3:]))
 
@@ -163,7 +152,7 @@ class DloTestCase(unittest.TestCase):
                           'X-Object-Manifest': 'c/noseg_'},
             'noseg')
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=noseg_',
+            'GET', '/v1/AUTH_test/c?prefix=noseg_',
             swob.HTTPOk, {'Content-Type': 'application/json; charset=utf-8'},
             json.dumps([]))
 
@@ -262,7 +251,7 @@ class TestDloHeadManifest(DloTestCase):
 
         # etag is manifest's etag
         self.assertEqual(headers["Etag"], "etag-manyseg")
-        self.assertEqual(headers.get("Content-Length"), None)
+        self.assertIsNone(headers.get("Content-Length"))
 
     def test_head_large_object_no_segments(self):
         req = swob.Request.blank('/v1/AUTH_test/mancon/manifest-no-segments',
@@ -278,7 +267,7 @@ class TestDloHeadManifest(DloTestCase):
         self.assertEqual(
             self.app.calls,
             [('HEAD', '/v1/AUTH_test/mancon/manifest-no-segments'),
-             ('GET', '/v1/AUTH_test/c?format=json&prefix=noseg_')])
+             ('GET', '/v1/AUTH_test/c?prefix=noseg_')])
 
 
 class TestDloGetManifest(DloTestCase):
@@ -444,7 +433,7 @@ class TestDloGetManifest(DloTestCase):
         self.assertEqual(
             self.app.calls,
             [('GET', '/v1/AUTH_test/mancon/manifest-many-segments'),
-             ('GET', '/v1/AUTH_test/c?format=json&prefix=seg_'),
+             ('GET', '/v1/AUTH_test/c?prefix=seg_'),
              ('GET', '/v1/AUTH_test/c/seg_01?multipart-manifest=get'),
              ('GET', '/v1/AUTH_test/c/seg_02?multipart-manifest=get'),
              ('GET', '/v1/AUTH_test/c/seg_03?multipart-manifest=get')])
@@ -459,7 +448,7 @@ class TestDloGetManifest(DloTestCase):
         self.assertEqual(status, "200 OK")
         # this requires multiple pages of container listing, so we can't send
         # a Content-Length header
-        self.assertEqual(headers.get("Content-Length"), None)
+        self.assertIsNone(headers.get("Content-Length"))
         self.assertEqual(body, "aaaaabbbbbcccccdddddeeeee")
 
     def test_get_suffix_range(self):
@@ -480,8 +469,8 @@ class TestDloGetManifest(DloTestCase):
             status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
         self.assertEqual(status, "200 OK")
-        self.assertEqual(headers.get("Content-Length"), None)
-        self.assertEqual(headers.get("Content-Range"), None)
+        self.assertIsNone(headers.get("Content-Length"))
+        self.assertIsNone(headers.get("Content-Range"))
         self.assertEqual(body, "aaaaabbbbbcccccdddddeeeee")
 
     def test_get_multi_range(self):
@@ -494,8 +483,8 @@ class TestDloGetManifest(DloTestCase):
             status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
         self.assertEqual(status, "200 OK")
-        self.assertEqual(headers.get("Content-Length"), None)
-        self.assertEqual(headers.get("Content-Range"), None)
+        self.assertIsNone(headers.get("Content-Length"))
+        self.assertIsNone(headers.get("Content-Range"))
         self.assertEqual(body, "aaaaabbbbbcccccdddddeeeee")
 
     def test_if_match_matches(self):
@@ -561,7 +550,7 @@ class TestDloGetManifest(DloTestCase):
             environ={'REQUEST_METHOD': 'GET'},
             headers={'If-Modified-Since': 'Wed, 12 Feb 2014 22:24:52 GMT',
                      'If-Unmodified-Since': 'Thu, 13 Feb 2014 23:25:53 GMT'})
-        status, headers, body, exc = self.call_dlo(req, expect_exception=True)
+        status, headers, body = self.call_dlo(req)
 
         for _, _, hdrs in self.app.calls_with_headers[1:]:
             self.assertFalse('If-Modified-Since' in hdrs)
@@ -576,10 +565,10 @@ class TestDloGetManifest(DloTestCase):
                                  environ={'REQUEST_METHOD': 'GET'})
         status, headers, body = self.call_dlo(req)
         self.assertEqual(status, "409 Conflict")
-        err_lines = self.dlo.logger.get_lines_for_level('error')
-        self.assertEqual(len(err_lines), 1)
-        self.assertTrue(err_lines[0].startswith(
-            'ERROR: An error occurred while retrieving segments'))
+        self.assertEqual(self.dlo.logger.get_lines_for_level('error'), [
+            'While processing manifest /v1/AUTH_test/mancon/manifest, '
+            'got 403 while retrieving /v1/AUTH_test/c/seg_01',
+        ])
 
     def test_error_fetching_second_segment(self):
         self.app.register(
@@ -588,20 +577,19 @@ class TestDloGetManifest(DloTestCase):
 
         req = swob.Request.blank('/v1/AUTH_test/mancon/manifest',
                                  environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body, exc = self.call_dlo(req, expect_exception=True)
+        status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
 
-        self.assertTrue(isinstance(exc, exceptions.SegmentError))
         self.assertEqual(status, "200 OK")
         self.assertEqual(''.join(body), "aaaaa")  # first segment made it out
-        err_lines = self.dlo.logger.get_lines_for_level('error')
-        self.assertEqual(len(err_lines), 1)
-        self.assertTrue(err_lines[0].startswith(
-            'ERROR: An error occurred while retrieving segments'))
+        self.assertEqual(self.dlo.logger.get_lines_for_level('error'), [
+            'While processing manifest /v1/AUTH_test/mancon/manifest, '
+            'got 403 while retrieving /v1/AUTH_test/c/seg_02',
+        ])
 
     def test_error_listing_container_first_listing_request(self):
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=seg_',
+            'GET', '/v1/AUTH_test/c?prefix=seg_',
             swob.HTTPNotFound, {}, None)
 
         req = swob.Request.blank('/v1/AUTH_test/mancon/manifest-many-segments',
@@ -613,18 +601,31 @@ class TestDloGetManifest(DloTestCase):
 
     def test_error_listing_container_second_listing_request(self):
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=seg_&marker=seg_03',
+            'GET', '/v1/AUTH_test/c?prefix=seg_&marker=seg_03',
             swob.HTTPNotFound, {}, None)
 
         req = swob.Request.blank('/v1/AUTH_test/mancon/manifest-many-segments',
                                  environ={'REQUEST_METHOD': 'GET'},
                                  headers={'Range': 'bytes=-5'})
         with mock.patch(LIMIT, 3):
-            status, headers, body, exc = self.call_dlo(
-                req, expect_exception=True)
-        self.assertTrue(isinstance(exc, exceptions.ListingIterError))
+            status, headers, body = self.call_dlo(req)
         self.assertEqual(status, "200 OK")
         self.assertEqual(body, "aaaaabbbbbccccc")
+
+    def test_error_listing_container_HEAD(self):
+        self.app.register(
+            'GET', '/v1/AUTH_test/c?prefix=seg_',
+            # for example, if a manifest refers to segments in another
+            # container, but the user is accessing the manifest via a
+            # container-level tempurl key
+            swob.HTTPUnauthorized, {}, None)
+
+        req = swob.Request.blank('/v1/AUTH_test/mancon/manifest-many-segments',
+                                 environ={'REQUEST_METHOD': 'HEAD'})
+        with mock.patch(LIMIT, 3):
+            status, headers, body = self.call_dlo(req)
+        self.assertEqual(status, "401 Unauthorized")
+        self.assertEqual(body, b"")
 
     def test_mismatched_etag_fetching_second_segment(self):
         self.app.register(
@@ -634,10 +635,9 @@ class TestDloGetManifest(DloTestCase):
 
         req = swob.Request.blank('/v1/AUTH_test/mancon/manifest',
                                  environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body, exc = self.call_dlo(req, expect_exception=True)
+        status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
 
-        self.assertTrue(isinstance(exc, exceptions.SegmentError))
         self.assertEqual(status, "200 OK")
         self.assertEqual(''.join(body), "aaaaabbWRONGbb")  # stop after error
 
@@ -648,7 +648,7 @@ class TestDloGetManifest(DloTestCase):
             swob.HTTPOk, {'Content-Length': '0', 'Etag': 'blah',
                           'X-Object-Manifest': 'c/quotetags'}, None)
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=quotetags',
+            'GET', '/v1/AUTH_test/c?prefix=quotetags',
             swob.HTTPOk, {'Content-Type': 'application/json; charset=utf-8'},
             json.dumps([{"hash": "\"abc\"", "bytes": 5, "name": "quotetags1",
                          "last_modified": "2013-11-22T02:42:14.261620",
@@ -673,7 +673,7 @@ class TestDloGetManifest(DloTestCase):
         segs = [{"hash": md5hex("AAAAA"), "bytes": 5, "name": u"é1"},
                 {"hash": md5hex("AAAAA"), "bytes": 5, "name": u"é2"}]
         self.app.register(
-            'GET', '/v1/AUTH_test/c?format=json&prefix=%C3%A9',
+            'GET', '/v1/AUTH_test/c?prefix=%C3%A9',
             swob.HTTPOk, {'Content-Type': 'application/json'},
             json.dumps(segs))
 
@@ -712,12 +712,10 @@ class TestDloGetManifest(DloTestCase):
                 mock.patch('swift.common.request_helpers.is_success',
                            mock_is_success), \
                 mock.patch.object(dlo, 'is_success', mock_is_success):
-            status, headers, body, exc = self.call_dlo(
-                req, expect_exception=True)
+            status, headers, body = self.call_dlo(req)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(body, 'aaaaabbbbbccccc')
-        self.assertTrue(isinstance(exc, exceptions.SegmentError))
 
     def test_get_oversize_segment(self):
         # If we send a Content-Length header to the client, it's based on the
@@ -735,17 +733,16 @@ class TestDloGetManifest(DloTestCase):
         req = swob.Request.blank(
             '/v1/AUTH_test/mancon/manifest',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body, exc = self.call_dlo(req, expect_exception=True)
+        status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
 
         self.assertEqual(status, '200 OK')  # sanity check
         self.assertEqual(headers.get('Content-Length'), '25')  # sanity check
         self.assertEqual(body, 'aaaaabbbbbccccccccccccccc')
-        self.assertTrue(isinstance(exc, exceptions.SegmentError))
         self.assertEqual(
             self.app.calls,
             [('GET', '/v1/AUTH_test/mancon/manifest'),
-             ('GET', '/v1/AUTH_test/c?format=json&prefix=seg'),
+             ('GET', '/v1/AUTH_test/c?prefix=seg'),
              ('GET', '/v1/AUTH_test/c/seg_01?multipart-manifest=get'),
              ('GET', '/v1/AUTH_test/c/seg_02?multipart-manifest=get'),
              ('GET', '/v1/AUTH_test/c/seg_03?multipart-manifest=get')])
@@ -768,13 +765,12 @@ class TestDloGetManifest(DloTestCase):
         req = swob.Request.blank(
             '/v1/AUTH_test/mancon/manifest',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body, exc = self.call_dlo(req, expect_exception=True)
+        status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
 
         self.assertEqual(status, '200 OK')  # sanity check
         self.assertEqual(headers.get('Content-Length'), '25')  # sanity check
         self.assertEqual(body, 'aaaaabbbbbccccdddddeeeee')
-        self.assertTrue(isinstance(exc, exceptions.SegmentError))
 
     def test_get_undersize_segment_range(self):
         # Shrink it by a single byte
@@ -787,13 +783,12 @@ class TestDloGetManifest(DloTestCase):
             '/v1/AUTH_test/mancon/manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=0-14'})
-        status, headers, body, exc = self.call_dlo(req, expect_exception=True)
+        status, headers, body = self.call_dlo(req)
         headers = HeaderKeyDict(headers)
 
         self.assertEqual(status, '206 Partial Content')  # sanity check
         self.assertEqual(headers.get('Content-Length'), '15')  # sanity check
         self.assertEqual(body, 'aaaaabbbbbcccc')
-        self.assertTrue(isinstance(exc, exceptions.SegmentError))
 
     def test_get_with_auth_overridden(self):
         auth_got_called = [0]
@@ -831,6 +826,9 @@ class TestDloConfiguration(unittest.TestCase):
         [pipeline:main]
         pipeline = catch_errors dlo ye-olde-proxy-server
 
+        [filter:catch_errors]
+        use = egg:swift#catch_errors
+
         [filter:dlo]
         use = egg:swift#dlo
         max_get_time = 3600
@@ -865,13 +863,16 @@ class TestDloConfiguration(unittest.TestCase):
         [pipeline:main]
         pipeline = catch_errors dlo ye-olde-proxy-server
 
+        [filter:catch_errors]
+        use = egg:swift#catch_errors
+
         [filter:dlo]
         use = egg:swift#dlo
 
         [app:ye-olde-proxy-server]
         use = egg:swift#proxy
         rate_limit_after_segment = 13
-        max_get_time = 2900
+        set max_get_time = 2900
         """)
 
         conffile = tempfile.NamedTemporaryFile()
@@ -898,6 +899,9 @@ class TestDloConfiguration(unittest.TestCase):
         """)
 
         proxy_conf2 = dedent("""
+        [filter:catch_errors]
+        use = egg:swift#catch_errors
+
         [filter:dlo]
         use = egg:swift#dlo
 

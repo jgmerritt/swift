@@ -19,34 +19,37 @@ import time
 import traceback
 import math
 from swift import gettext_ as _
-from xml.etree.cElementTree import Element, SubElement, tostring
 
 from eventlet import Timeout
 
 import swift.common.db
 from swift.container.sync_store import ContainerSyncStore
-from swift.container.backend import ContainerBroker, DATADIR
+from swift.container.backend import ContainerBroker, DATADIR, \
+    RECORD_TYPE_SHARD, UNSHARDED, SHARDING, SHARDED, SHARD_UPDATE_STATES
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.container_sync_realms import ContainerSyncRealms
-from swift.common.request_helpers import get_param, get_listing_content_type, \
+from swift.common.request_helpers import get_param, \
     split_and_validate_path, is_sys_or_user_meta
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
-    override_bytes_from_content_type, get_log_line
-from swift.common.constraints import check_mount, valid_timestamp, check_utf8
+    override_bytes_from_content_type, get_log_line, \
+    config_fallocate_value, fs_has_free_space, list_from_csv, \
+    ShardRange
+from swift.common.constraints import valid_timestamp, check_utf8, check_drive
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
-from swift.common.http import HTTP_NOT_FOUND, is_success
+from swift.common.http import HTTP_NO_CONTENT, HTTP_NOT_FOUND, is_success
+from swift.common.middleware import listing_formats
 from swift.common.storage_policy import POLICIES
 from swift.common.base_storage_server import BaseStorageServer
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPConflict, \
     HTTPCreated, HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPMethodNotAllowed, Request, Response, \
-    HTTPInsufficientStorage, HTTPException
+    HTTPInsufficientStorage, HTTPException, HTTPMovedPermanently
 
 
 def gen_resp_headers(info, is_deleted=False):
@@ -72,6 +75,7 @@ def gen_resp_headers(info, is_deleted=False):
             'X-Timestamp': Timestamp(info.get('created_at', 0)).normal,
             'X-PUT-Timestamp': Timestamp(
                 info.get('put_timestamp', 0)).normal,
+            'X-Backend-Sharding-State': info.get('db_state', UNSHARDED),
         })
     return headers
 
@@ -111,11 +115,18 @@ class ContainerController(BaseStorageServer):
             conf.get('auto_create_account_prefix') or '.'
         if config_true_value(conf.get('allow_versions', 'f')):
             self.save_headers.append('x-versions-location')
+        if 'allow_versions' in conf:
+            self.logger.warning('Option allow_versions is deprecated. '
+                                'Configure the versioned_writes middleware in '
+                                'the proxy-server instead. This option will '
+                                'be ignored in a future release.')
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
         self.sync_store = ContainerSyncStore(self.root,
                                              self.logger,
                                              self.mount_check)
+        self.fallocate_reserve, self.fallocate_is_percent = \
+            config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
     def _get_container_broker(self, drive, part, account, container, **kwargs):
         """
@@ -140,7 +151,7 @@ class ContainerController(BaseStorageServer):
         Validate that the index supplied maps to a policy.
 
         :returns: policy index from request, or None if not present
-        :raises: HTTPBadRequest if the supplied index is bogus
+        :raises HTTPBadRequest: if the supplied index is bogus
         """
 
         policy_index = req.headers.get('X-Backend-Storage-Policy-Index', None)
@@ -256,6 +267,45 @@ class ContainerController(BaseStorageServer):
             self.logger.exception('Failed to update sync_store %s during %s' %
                                   (broker.db_file, method))
 
+    def _redirect_to_shard(self, req, broker, obj_name):
+        """
+        If the request indicates that it can accept a redirection, look for a
+        shard range that contains ``obj_name`` and if one exists return a
+        HTTPMovedPermanently response.
+
+        :param req: an instance of :class:`~swift.common.swob.Request`
+        :param broker: a container broker
+        :param obj_name: an object name
+        :return: an instance of :class:`swift.common.swob.HTTPMovedPermanently`
+            if a shard range exists for the given ``obj_name``, otherwise None.
+        """
+        if not config_true_value(
+                req.headers.get('x-backend-accept-redirect', False)):
+            return None
+
+        shard_ranges = broker.get_shard_ranges(
+            includes=obj_name, states=SHARD_UPDATE_STATES)
+        if not shard_ranges:
+            return None
+
+        # note: obj_name may be included in both a created sub-shard and its
+        # sharding parent. get_shard_ranges will return the created sub-shard
+        # in preference to the parent, which is the desired result.
+        containing_range = shard_ranges[0]
+        location = "/%s/%s" % (containing_range.name, obj_name)
+        headers = {'Location': location,
+                   'X-Backend-Redirect-Timestamp':
+                       containing_range.timestamp.internal}
+
+        # we do not want the host added to the location
+        req.environ['swift.leave_relative_location'] = True
+        return HTTPMovedPermanently(headers=headers, request=req)
+
+    def check_free_space(self, drive):
+        drive_root = os.path.join(self.root, drive)
+        return fs_has_free_space(
+            drive_root, self.fallocate_reserve, self.fallocate_is_percent)
+
     @public
     @timing_stats()
     def DELETE(self, req):
@@ -263,7 +313,9 @@ class ContainerController(BaseStorageServer):
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
         req_timestamp = valid_timestamp(req)
-        if self.mount_check and not check_mount(self.root, drive):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         # policy index is only relevant for delete_obj (and transitively for
         # auto create accounts)
@@ -278,6 +330,11 @@ class ContainerController(BaseStorageServer):
         if not os.path.exists(broker.db_file):
             return HTTPNotFound()
         if obj:     # delete object
+            # redirect if a shard range exists for the object name
+            redirect = self._redirect_to_shard(req, broker, obj)
+            if redirect:
+                return redirect
+
             broker.delete_object(obj, req.headers.get('x-timestamp'),
                                  obj_policy_index)
             return HTTPNoContent(request=req)
@@ -338,6 +395,40 @@ class ContainerController(BaseStorageServer):
             broker.update_status_changed_at(timestamp)
         return recreated
 
+    def _maybe_autocreate(self, broker, req_timestamp, account,
+                          policy_index):
+        created = False
+        if account.startswith(self.auto_create_account_prefix) and \
+                not os.path.exists(broker.db_file):
+            if policy_index is None:
+                raise HTTPBadRequest(
+                    'X-Backend-Storage-Policy-Index header is required')
+            try:
+                broker.initialize(req_timestamp.internal, policy_index)
+            except DatabaseAlreadyExists:
+                pass
+            else:
+                created = True
+        if not os.path.exists(broker.db_file):
+            raise HTTPNotFound()
+        return created
+
+    def _update_metadata(self, req, broker, req_timestamp, method):
+        metadata = {}
+        metadata.update(
+            (key, (value, req_timestamp.internal))
+            for key, value in req.headers.items()
+            if key.lower() in self.save_headers or
+            is_sys_or_user_meta('container', key))
+        if metadata:
+            if 'X-Container-Sync-To' in metadata:
+                if 'X-Container-Sync-To' not in broker.metadata or \
+                        metadata['X-Container-Sync-To'][0] != \
+                        broker.metadata['X-Container-Sync-To'][0]:
+                    broker.set_x_container_sync_points(-1, -1)
+            broker.update_metadata(metadata, validate_metadata=True)
+            self._update_sync_store(broker, method)
+
     @public
     @timing_stats()
     def PUT(self, req):
@@ -351,7 +442,11 @@ class ContainerController(BaseStorageServer):
                 self.realms_conf)
             if err:
                 return HTTPBadRequest(err)
-        if self.mount_check and not check_mount(self.root, drive):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         requested_policy_index = self.get_and_validate_policy_index(req)
         broker = self._get_container_broker(drive, part, account, container)
@@ -359,14 +454,13 @@ class ContainerController(BaseStorageServer):
             # obj put expects the policy_index header, default is for
             # legacy support during upgrade.
             obj_policy_index = requested_policy_index or 0
-            if account.startswith(self.auto_create_account_prefix) and \
-                    not os.path.exists(broker.db_file):
-                try:
-                    broker.initialize(req_timestamp.internal, obj_policy_index)
-                except DatabaseAlreadyExists:
-                    pass
-            if not os.path.exists(broker.db_file):
-                return HTTPNotFound()
+            self._maybe_autocreate(broker, req_timestamp, account,
+                                   obj_policy_index)
+            # redirect if a shard exists for this object name
+            response = self._redirect_to_shard(req, broker, obj)
+            if response:
+                return response
+
             broker.put_object(obj, req_timestamp.internal,
                               int(req.headers['x-size']),
                               req.headers['x-content-type'],
@@ -375,6 +469,22 @@ class ContainerController(BaseStorageServer):
                               req.headers.get('x-content-type-timestamp'),
                               req.headers.get('x-meta-timestamp'))
             return HTTPCreated(request=req)
+
+        record_type = req.headers.get('x-backend-record-type', '').lower()
+        if record_type == RECORD_TYPE_SHARD:
+            try:
+                # validate incoming data...
+                shard_ranges = [ShardRange.from_dict(sr)
+                                for sr in json.loads(req.body)]
+            except (ValueError, KeyError, TypeError) as err:
+                return HTTPBadRequest('Invalid body: %r' % err)
+            created = self._maybe_autocreate(broker, req_timestamp, account,
+                                             requested_policy_index)
+            self._update_metadata(req, broker, req_timestamp, 'PUT')
+            if shard_ranges:
+                # TODO: consider writing the shard ranges into the pending
+                # file, but if so ensure an all-or-none semantic for the write
+                broker.merge_shard_ranges(shard_ranges)
         else:   # put container
             if requested_policy_index is None:
                 # use the default index sent by the proxy if available
@@ -386,31 +496,18 @@ class ContainerController(BaseStorageServer):
                                              req_timestamp.internal,
                                              new_container_policy,
                                              requested_policy_index)
-            metadata = {}
-            metadata.update(
-                (key, (value, req_timestamp.internal))
-                for key, value in req.headers.items()
-                if key.lower() in self.save_headers or
-                is_sys_or_user_meta('container', key))
-            if 'X-Container-Sync-To' in metadata:
-                if 'X-Container-Sync-To' not in broker.metadata or \
-                        metadata['X-Container-Sync-To'][0] != \
-                        broker.metadata['X-Container-Sync-To'][0]:
-                    broker.set_x_container_sync_points(-1, -1)
-            broker.update_metadata(metadata, validate_metadata=True)
-            if metadata:
-                self._update_sync_store(broker, 'PUT')
+            self._update_metadata(req, broker, req_timestamp, 'PUT')
             resp = self.account_update(req, account, container, broker)
             if resp:
                 return resp
-            if created:
-                return HTTPCreated(request=req,
-                                   headers={'x-backend-storage-policy-index':
-                                            broker.storage_policy_index})
-            else:
-                return HTTPAccepted(request=req,
-                                    headers={'x-backend-storage-policy-index':
-                                             broker.storage_policy_index})
+        if created:
+            return HTTPCreated(request=req,
+                               headers={'x-backend-storage-policy-index':
+                                        broker.storage_policy_index})
+        else:
+            return HTTPAccepted(request=req,
+                                headers={'x-backend-storage-policy-index':
+                                         broker.storage_policy_index})
 
     @public
     @timing_stats(sample_rate=0.1)
@@ -418,8 +515,10 @@ class ContainerController(BaseStorageServer):
         """Handle HTTP HEAD request."""
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
-        out_content_type = get_listing_content_type(req)
-        if self.mount_check and not check_mount(self.root, drive):
+        out_content_type = listing_formats.get_listing_content_type(req)
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container,
                                             pending_timeout=0.1,
@@ -449,19 +548,88 @@ class ContainerController(BaseStorageServer):
         :params record: object entry record
         :returns: modified record
         """
-        (name, created, size, content_type, etag) = record[:5]
-        if content_type is None:
-            return {'subdir': name}
-        response = {'bytes': size, 'hash': etag, 'name': name,
-                    'content_type': content_type}
+        if isinstance(record, ShardRange):
+            created = record.timestamp
+            response = dict(record)
+        else:
+            (name, created, size, content_type, etag) = record[:5]
+            if content_type is None:
+                return {'subdir': name.decode('utf8')}
+            response = {
+                'bytes': size, 'hash': etag, 'name': name.decode('utf8'),
+                'content_type': content_type}
+            override_bytes_from_content_type(response, logger=self.logger)
         response['last_modified'] = Timestamp(created).isoformat
-        override_bytes_from_content_type(response, logger=self.logger)
         return response
 
     @public
     @timing_stats()
     def GET(self, req):
-        """Handle HTTP GET request."""
+        """
+        Handle HTTP GET request.
+
+        The body of the response to a successful GET request contains a listing
+        of either objects or shard ranges. The exact content of the listing is
+        determined by a combination of request headers and query string
+        parameters, as follows:
+
+        * The type of the listing is determined by the
+          ``X-Backend-Record-Type`` header. If this header has value ``shard``
+          then the response body will be a list of shard ranges; if this header
+          has value ``auto``, and the container state is ``sharding`` or
+          ``sharded``, then the listing will be a list of shard ranges;
+          otherwise the response body will be a list of objects.
+
+        * Both shard range and object listings may be constrained to a name
+          range by the ``marker`` and ``end_marker`` query string parameters.
+          Object listings will only contain objects whose names are greater
+          than any ``marker`` value and less than any ``end_marker`` value.
+          Shard range listings will only contain shard ranges whose namespace
+          is greater than or includes any ``marker`` value and is less than or
+          includes any ``end_marker`` value.
+
+        * Shard range listings may also be constrained by an ``includes`` query
+          string parameter. If this parameter is present the listing will only
+          contain shard ranges whose namespace includes the value of the
+          parameter; any ``marker`` or ``end_marker`` parameters are ignored
+
+        * The length of an object listing may be constrained by the ``limit``
+          parameter. Object listings may also be constrained by ``prefix``,
+          ``delimiter`` and ``path`` query string parameters.
+
+        * Shard range listings will include deleted shard ranges if and only if
+          the ``X-Backend-Include-Deleted`` header value is one of
+          :attr:`swift.common.utils.TRUE_VALUES`. Object listings never
+          include deleted objects.
+
+        * Shard range listings may be constrained to include only shard ranges
+          whose state is specified by a query string ``states`` parameter. If
+          present, the ``states`` parameter should be a comma separated list of
+          either the string or integer representation of
+          :data:`~swift.common.utils.ShardRange.STATES`.
+
+          Two alias values may be used in a ``states`` parameter value:
+          ``listing`` will cause the listing to include all shard ranges in a
+          state suitable for contributing to an object listing; ``updating``
+          will cause the listing to include all shard ranges in a state
+          suitable to accept an object update.
+
+          If either of these aliases is used then the shard range listing will
+          if necessary be extended with a synthesised 'filler' range in order
+          to satisfy the requested name range when insufficient actual shard
+          ranges are found. Any 'filler' shard range will cover the otherwise
+          uncovered tail of the requested name range and will point back to the
+          same container.
+
+        * Listings are not normally returned from a deleted container. However,
+          the ``X-Backend-Override-Deleted`` header may be used with a value in
+          :attr:`swift.common.utils.TRUE_VALUES` to force a shard range
+          listing to be returned from a deleted container whose DB file still
+          exists.
+
+        :param req: an instance of :class:`swift.common.swob.Request`
+        :returns: an instance of :class:`swift.common.swob.Response`
+        """
         drive, part, account, container, obj = split_and_validate_path(
             req, 4, 5, True)
         path = get_param(req, 'path')
@@ -482,19 +650,54 @@ class ContainerController(BaseStorageServer):
                     request=req,
                     body='Maximum limit is %d'
                     % constraints.CONTAINER_LISTING_LIMIT)
-        out_content_type = get_listing_content_type(req)
-        if self.mount_check and not check_mount(self.root, drive):
+        out_content_type = listing_formats.get_listing_content_type(req)
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container,
                                             pending_timeout=0.1,
                                             stale_reads_ok=True)
         info, is_deleted = broker.get_info_is_deleted()
-        resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
-        if is_deleted:
-            return HTTPNotFound(request=req, headers=resp_headers)
-        container_list = broker.list_objects_iter(
-            limit, marker, end_marker, prefix, delimiter, path,
-            storage_policy_index=info['storage_policy_index'], reverse=reverse)
+        record_type = req.headers.get('x-backend-record-type', '').lower()
+        if record_type == 'auto' and info.get('db_state') in (SHARDING,
+                                                              SHARDED):
+            record_type = 'shard'
+        if record_type == 'shard':
+            override_deleted = info and config_true_value(
+                req.headers.get('x-backend-override-deleted', False))
+            resp_headers = gen_resp_headers(
+                info, is_deleted=is_deleted and not override_deleted)
+            if is_deleted and not override_deleted:
+                return HTTPNotFound(request=req, headers=resp_headers)
+            resp_headers['X-Backend-Record-Type'] = 'shard'
+            includes = get_param(req, 'includes')
+            states = get_param(req, 'states')
+            fill_gaps = False
+            if states:
+                states = list_from_csv(states)
+                fill_gaps = any(('listing' in states, 'updating' in states))
+                try:
+                    states = broker.resolve_shard_range_states(states)
+                except ValueError:
+                    return HTTPBadRequest(request=req, body='Bad state')
+            include_deleted = config_true_value(
+                req.headers.get('x-backend-include-deleted', False))
+            container_list = broker.get_shard_ranges(
+                marker, end_marker, includes, reverse, states=states,
+                include_deleted=include_deleted, fill_gaps=fill_gaps)
+        else:
+            resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
+            if is_deleted:
+                return HTTPNotFound(request=req, headers=resp_headers)
+            resp_headers['X-Backend-Record-Type'] = 'object'
+            # Use the retired db while container is in process of sharding,
+            # otherwise use current db
+            src_broker = broker.get_brokers()[0]
+            container_list = src_broker.list_objects_iter(
+                limit, marker, end_marker, prefix, delimiter, path,
+                storage_policy_index=info['storage_policy_index'],
+                reverse=reverse)
         return self.create_listing(req, out_content_type, info, resp_headers,
                                    broker.metadata, container_list, container)
 
@@ -504,36 +707,20 @@ class ContainerController(BaseStorageServer):
             if value and (key.lower() in self.save_headers or
                           is_sys_or_user_meta('container', key)):
                 resp_headers[key] = value
-        ret = Response(request=req, headers=resp_headers,
-                       content_type=out_content_type, charset='utf-8')
-        if out_content_type == 'application/json':
-            ret.body = json.dumps([self.update_data_record(record)
-                                   for record in container_list])
-        elif out_content_type.endswith('/xml'):
-            doc = Element('container', name=container.decode('utf-8'))
-            for obj in container_list:
-                record = self.update_data_record(obj)
-                if 'subdir' in record:
-                    name = record['subdir'].decode('utf-8')
-                    sub = SubElement(doc, 'subdir', name=name)
-                    SubElement(sub, 'name').text = name
-                else:
-                    obj_element = SubElement(doc, 'object')
-                    for field in ["name", "hash", "bytes", "content_type",
-                                  "last_modified"]:
-                        SubElement(obj_element, field).text = str(
-                            record.pop(field)).decode('utf-8')
-                    for field in sorted(record):
-                        SubElement(obj_element, field).text = str(
-                            record[field]).decode('utf-8')
-            ret.body = tostring(doc, encoding='UTF-8').replace(
-                "<?xml version='1.0' encoding='UTF-8'?>",
-                '<?xml version="1.0" encoding="UTF-8"?>', 1)
+        listing = [self.update_data_record(record)
+                   for record in container_list]
+        if out_content_type.endswith('/xml'):
+            body = listing_formats.container_to_xml(listing, container)
+        elif out_content_type.endswith('/json'):
+            body = json.dumps(listing)
         else:
-            if not container_list:
-                return HTTPNoContent(request=req, headers=resp_headers)
-            ret.body = '\n'.join(rec[0] for rec in container_list) + '\n'
+            body = listing_formats.listing_to_text(listing)
+
+        ret = Response(request=req, headers=resp_headers, body=body,
+                       content_type=out_content_type, charset='utf-8')
         ret.last_modified = math.ceil(float(resp_headers['X-PUT-Timestamp']))
+        if not ret.body:
+            ret.status_int = HTTP_NO_CONTENT
         return ret
 
     @public
@@ -545,7 +732,11 @@ class ContainerController(BaseStorageServer):
         """
         post_args = split_and_validate_path(req, 3)
         drive, partition, hash = post_args
-        if self.mount_check and not check_mount(self.root, drive):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         try:
             args = json.load(req.environ['wsgi.input'])
@@ -567,26 +758,17 @@ class ContainerController(BaseStorageServer):
                 self.realms_conf)
             if err:
                 return HTTPBadRequest(err)
-        if self.mount_check and not check_mount(self.root, drive):
+        try:
+            check_drive(self.root, drive, self.mount_check)
+        except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_container_broker(drive, part, account, container)
         if broker.is_deleted():
             return HTTPNotFound(request=req)
         broker.update_put_timestamp(req_timestamp.internal)
-        metadata = {}
-        metadata.update(
-            (key, (value, req_timestamp.internal))
-            for key, value in req.headers.items()
-            if key.lower() in self.save_headers or
-            is_sys_or_user_meta('container', key))
-        if metadata:
-            if 'X-Container-Sync-To' in metadata:
-                if 'X-Container-Sync-To' not in broker.metadata or \
-                        metadata['X-Container-Sync-To'][0] != \
-                        broker.metadata['X-Container-Sync-To'][0]:
-                    broker.set_x_container_sync_points(-1, -1)
-            broker.update_metadata(metadata, validate_metadata=True)
-            self._update_sync_store(broker, 'POST')
+        self._update_metadata(req, broker, req_timestamp, 'POST')
         return HTTPNoContent(request=req)
 
     def __call__(self, env, start_response):

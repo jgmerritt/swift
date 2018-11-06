@@ -14,18 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import functools
 import hmac
 import hashlib
 import json
-import time
 from copy import deepcopy
 from six.moves import urllib
-from unittest2 import SkipTest
+from time import time, strftime, gmtime
 
 import test.functional as tf
+from swift.common.middleware import tempurl
 from test.functional import cluster_info
 from test.functional.tests import Utils, Base, Base2, BaseEnv
-from test.functional import requires_acls
+from test.functional import requires_acls, SkipTest
 from test.functional.swift_test_client import Account, Connection, \
     ResponseError
 
@@ -87,6 +89,7 @@ class TestTempurlEnv(TestTempurlBaseEnv):
 
 class TestTempurl(Base):
     env = TestTempurlEnv
+    digest_name = 'sha1'
 
     def setUp(self):
         super(TestTempurl, self).setUp()
@@ -98,30 +101,41 @@ class TestTempurl(Base):
                 "Expected tempurl_enabled to be True/False, got %r" %
                 (self.env.tempurl_enabled,))
 
-        expires = int(time.time()) + 86400
+        if self.digest_name not in cluster_info['tempurl'].get(
+                'allowed_digests', ['sha1']):
+            raise SkipTest("tempurl does not support %s signatures" %
+                           self.digest_name)
+
+        self.digest = getattr(hashlib, self.digest_name)
+        self.expires = int(time()) + 86400
+        self.expires_8601 = strftime(
+            tempurl.EXPIRES_ISO8601_FORMAT, gmtime(self.expires))
         self.obj_tempurl_parms = self.tempurl_parms(
-            'GET', expires, self.env.conn.make_path(self.env.obj.path),
+            'GET', self.expires, self.env.conn.make_path(self.env.obj.path),
             self.env.tempurl_key)
 
     def tempurl_parms(self, method, expires, path, key):
         sig = hmac.new(
             key,
             '%s\n%s\n%s' % (method, expires, urllib.parse.unquote(path)),
-            hashlib.sha1).hexdigest()
+            self.digest).hexdigest()
         return {'temp_url_sig': sig, 'temp_url_expires': str(expires)}
 
     def test_GET(self):
-        contents = self.env.obj.read(
-            parms=self.obj_tempurl_parms,
-            cfg={'no_auth_token': True})
-        self.assertEqual(contents, "obj contents")
+        for e in (str(self.expires), self.expires_8601):
+            self.obj_tempurl_parms['temp_url_expires'] = e
 
-        # GET tempurls also allow HEAD requests
-        self.assertTrue(self.env.obj.info(parms=self.obj_tempurl_parms,
-                                          cfg={'no_auth_token': True}))
+            contents = self.env.obj.read(
+                parms=self.obj_tempurl_parms,
+                cfg={'no_auth_token': True})
+            self.assertEqual(contents, "obj contents")
+
+            # GET tempurls also allow HEAD requests
+            self.assertTrue(self.env.obj.info(parms=self.obj_tempurl_parms,
+                                              cfg={'no_auth_token': True}))
 
     def test_GET_with_key_2(self):
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         parms = self.tempurl_parms(
             'GET', expires, self.env.conn.make_path(self.env.obj.path),
             self.env.tempurl_key2)
@@ -143,7 +157,7 @@ class TestTempurl(Base):
             hdrs={"X-Object-Manifest": "%s/get-dlo-inside-seg" %
                   (self.env.container.name,)})
 
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         parms = self.tempurl_parms(
             'GET', expires, self.env.conn.make_path(manifest.path),
             self.env.tempurl_key)
@@ -168,7 +182,7 @@ class TestTempurl(Base):
             hdrs={"X-Object-Manifest": "%s/get-dlo-outside-seg" %
                   (self.env.container.name,)})
 
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         parms = self.tempurl_parms(
             'GET', expires, self.env.conn.make_path(manifest.path),
             self.env.tempurl_key)
@@ -181,24 +195,29 @@ class TestTempurl(Base):
     def test_PUT(self):
         new_obj = self.env.container.file(Utils.create_name())
 
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
+        expires_8601 = strftime(
+            tempurl.EXPIRES_ISO8601_FORMAT, gmtime(expires))
+
         put_parms = self.tempurl_parms(
             'PUT', expires, self.env.conn.make_path(new_obj.path),
             self.env.tempurl_key)
+        for e in (str(expires), expires_8601):
+            put_parms['temp_url_expires'] = e
 
-        new_obj.write('new obj contents',
-                      parms=put_parms, cfg={'no_auth_token': True})
-        self.assertEqual(new_obj.read(), "new obj contents")
+            new_obj.write('new obj contents',
+                          parms=put_parms, cfg={'no_auth_token': True})
+            self.assertEqual(new_obj.read(), "new obj contents")
 
-        # PUT tempurls also allow HEAD requests
-        self.assertTrue(new_obj.info(parms=put_parms,
-                                     cfg={'no_auth_token': True}))
+            # PUT tempurls also allow HEAD requests
+            self.assertTrue(new_obj.info(parms=put_parms,
+                                         cfg={'no_auth_token': True}))
 
     def test_PUT_manifest_access(self):
         new_obj = self.env.container.file(Utils.create_name())
 
         # give out a signature which allows a PUT to new_obj
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         put_parms = self.tempurl_parms(
             'PUT', expires, self.env.conn.make_path(new_obj.path),
             self.env.tempurl_key)
@@ -230,7 +249,7 @@ class TestTempurl(Base):
 
         # try again using a tempurl POST to an already created object
         new_obj.write('', {}, parms=put_parms, cfg={'no_auth_token': True})
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         post_parms = self.tempurl_parms(
             'POST', expires, self.env.conn.make_path(new_obj.path),
             self.env.tempurl_key)
@@ -243,24 +262,25 @@ class TestTempurl(Base):
             self.fail('request did not error')
 
     def test_HEAD(self):
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         head_parms = self.tempurl_parms(
             'HEAD', expires, self.env.conn.make_path(self.env.obj.path),
             self.env.tempurl_key)
 
         self.assertTrue(self.env.obj.info(parms=head_parms,
                                           cfg={'no_auth_token': True}))
+
         # HEAD tempurls don't allow PUT or GET requests, despite the fact that
         # PUT and GET tempurls both allow HEAD requests
         self.assertRaises(ResponseError, self.env.other_obj.read,
                           cfg={'no_auth_token': True},
-                          parms=self.obj_tempurl_parms)
+                          parms=head_parms)
         self.assert_status([401])
 
         self.assertRaises(ResponseError, self.env.other_obj.write,
                           'new contents',
                           cfg={'no_auth_token': True},
-                          parms=self.obj_tempurl_parms)
+                          parms=head_parms)
         self.assert_status([401])
 
     def test_different_object(self):
@@ -310,22 +330,6 @@ class TestTempurl(Base):
 
 
 class TestTempURLPrefix(TestTempurl):
-    def setUp(self):
-        super(TestTempurl, self).setUp()
-        if self.env.tempurl_enabled is False:
-            raise SkipTest("TempURL not enabled")
-        elif self.env.tempurl_enabled is not True:
-            # just some sanity checking
-            raise Exception(
-                "Expected tempurl_enabled to be True/False, got %r" %
-                (self.env.tempurl_enabled,))
-
-        self.expires = int(time.time()) + 86400
-        self.obj_tempurl_parms = self.tempurl_parms(
-            'GET', self.expires,
-            self.env.conn.make_path(self.env.obj.path),
-            self.env.tempurl_key)
-
     def tempurl_parms(self, method, expires, path, key,
                       prefix=None):
         path_parts = urllib.parse.unquote(path).split('/')
@@ -337,7 +341,7 @@ class TestTempURLPrefix(TestTempurl):
             key,
             '%s\n%s\nprefix:%s' % (method, expires,
                                    '/'.join(path_parts[0:4]) + '/' + prefix),
-            hashlib.sha1).hexdigest()
+            self.digest).hexdigest()
         return {
             'temp_url_sig': sig, 'temp_url_expires': str(expires),
             'temp_url_prefix': prefix}
@@ -406,24 +410,31 @@ class TestContainerTempurlEnv(BaseEnv):
         cls.tempurl_key = Utils.create_name()
         cls.tempurl_key2 = Utils.create_name()
 
-        # creating another account and connection
-        # for ACL tests
-        config2 = deepcopy(tf.config)
-        config2['account'] = tf.config['account2']
-        config2['username'] = tf.config['username2']
-        config2['password'] = tf.config['password2']
-        cls.conn2 = Connection(config2)
-        cls.conn2.authenticate()
-        cls.account2 = Account(
-            cls.conn2, config2.get('account', config2['username']))
-        cls.account2 = cls.conn2.get_account()
+        if not tf.skip2:
+            # creating another account and connection
+            # for ACL tests
+            config2 = deepcopy(tf.config)
+            config2['account'] = tf.config['account2']
+            config2['username'] = tf.config['username2']
+            config2['password'] = tf.config['password2']
+            cls.conn2 = Connection(config2)
+            cls.conn2.authenticate()
+            cls.account2 = Account(
+                cls.conn2, config2.get('account', config2['username']))
+            cls.account2 = cls.conn2.get_account()
 
         cls.container = cls.account.container(Utils.create_name())
-        if not cls.container.create({
-                'x-container-meta-temp-url-key': cls.tempurl_key,
-                'x-container-meta-temp-url-key-2': cls.tempurl_key2,
-                'x-container-read': cls.account2.name}):
-            raise ResponseError(cls.conn.response)
+        if not tf.skip2:
+            if not cls.container.create({
+                    'x-container-meta-temp-url-key': cls.tempurl_key,
+                    'x-container-meta-temp-url-key-2': cls.tempurl_key2,
+                    'x-container-read': cls.account2.name}):
+                raise ResponseError(cls.conn.response)
+        else:
+            if not cls.container.create({
+                    'x-container-meta-temp-url-key': cls.tempurl_key,
+                    'x-container-meta-temp-url-key-2': cls.tempurl_key2}):
+                raise ResponseError(cls.conn.response)
 
         cls.obj = cls.container.file(Utils.create_name())
         cls.obj.write("obj contents")
@@ -433,6 +444,7 @@ class TestContainerTempurlEnv(BaseEnv):
 
 class TestContainerTempurl(Base):
     env = TestContainerTempurlEnv
+    digest_name = 'sha1'
 
     def setUp(self):
         super(TestContainerTempurl, self).setUp()
@@ -444,7 +456,13 @@ class TestContainerTempurl(Base):
                 "Expected tempurl_enabled to be True/False, got %r" %
                 (self.env.tempurl_enabled,))
 
-        expires = int(time.time()) + 86400
+        if self.digest_name not in cluster_info['tempurl'].get(
+                'allowed_digests', ['sha1']):
+            raise SkipTest("tempurl does not support %s signatures" %
+                           self.digest_name)
+
+        self.digest = getattr(hashlib, self.digest_name)
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'GET', expires, self.env.conn.make_path(self.env.obj.path),
             self.env.tempurl_key)
@@ -455,7 +473,7 @@ class TestContainerTempurl(Base):
         return hmac.new(
             key,
             '%s\n%s\n%s' % (method, expires, urllib.parse.unquote(path)),
-            hashlib.sha1).hexdigest()
+            self.digest).hexdigest()
 
     def test_GET(self):
         contents = self.env.obj.read(
@@ -468,7 +486,7 @@ class TestContainerTempurl(Base):
                                           cfg={'no_auth_token': True}))
 
     def test_GET_with_key_2(self):
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'GET', expires, self.env.conn.make_path(self.env.obj.path),
             self.env.tempurl_key2)
@@ -481,7 +499,7 @@ class TestContainerTempurl(Base):
     def test_PUT(self):
         new_obj = self.env.container.file(Utils.create_name())
 
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'PUT', expires, self.env.conn.make_path(new_obj.path),
             self.env.tempurl_key)
@@ -497,7 +515,7 @@ class TestContainerTempurl(Base):
                                      cfg={'no_auth_token': True}))
 
     def test_HEAD(self):
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'HEAD', expires, self.env.conn.make_path(self.env.obj.path),
             self.env.tempurl_key)
@@ -566,20 +584,16 @@ class TestContainerTempurl(Base):
 
     @requires_acls
     def test_tempurl_keys_visible_to_account_owner(self):
-        if not tf.cluster_info.get('tempauth'):
-            raise SkipTest('TEMP AUTH SPECIFIC TEST')
         metadata = self.env.container.info()
         self.assertEqual(metadata.get('tempurl_key'), self.env.tempurl_key)
         self.assertEqual(metadata.get('tempurl_key2'), self.env.tempurl_key2)
 
     @requires_acls
     def test_tempurl_keys_hidden_from_acl_readonly(self):
-        if not tf.cluster_info.get('tempauth'):
-            raise SkipTest('TEMP AUTH SPECIFIC TEST')
-        original_token = self.env.container.conn.storage_token
-        self.env.container.conn.storage_token = self.env.conn2.storage_token
-        metadata = self.env.container.info()
-        self.env.container.conn.storage_token = original_token
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
+        metadata = self.env.container.info(cfg={
+            'use_token': self.env.conn2.storage_token})
 
         self.assertNotIn(
             'tempurl_key', metadata,
@@ -604,7 +618,7 @@ class TestContainerTempurl(Base):
             hdrs={"X-Object-Manifest": "%s/get-dlo-inside-seg" %
                   (self.env.container.name,)})
 
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'GET', expires, self.env.conn.make_path(manifest.path),
             self.env.tempurl_key)
@@ -630,7 +644,7 @@ class TestContainerTempurl(Base):
             hdrs={"X-Object-Manifest": "%s/get-dlo-outside-seg" %
                   (container2.name,)})
 
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'GET', expires, self.env.conn.make_path(manifest.path),
             self.env.tempurl_key)
@@ -699,6 +713,7 @@ class TestSloTempurlEnv(TestTempurlBaseEnv):
 
 class TestSloTempurl(Base):
     env = TestSloTempurlEnv
+    digest_name = 'sha1'
 
     def setUp(self):
         super(TestSloTempurl, self).setUp()
@@ -710,14 +725,20 @@ class TestSloTempurl(Base):
                 "Expected enabled to be True/False, got %r" %
                 (self.env.enabled,))
 
+        if self.digest_name not in cluster_info['tempurl'].get(
+                'allowed_digests', ['sha1']):
+            raise SkipTest("tempurl does not support %s signatures" %
+                           self.digest_name)
+        self.digest = getattr(hashlib, self.digest_name)
+
     def tempurl_sig(self, method, expires, path, key):
         return hmac.new(
             key,
             '%s\n%s\n%s' % (method, expires, urllib.parse.unquote(path)),
-            hashlib.sha1).hexdigest()
+            self.digest).hexdigest()
 
     def test_GET(self):
-        expires = int(time.time()) + 86400
+        expires = int(time()) + 86400
         sig = self.tempurl_sig(
             'GET', expires, self.env.conn.make_path(self.env.manifest.path),
             self.env.tempurl_key)
@@ -735,3 +756,95 @@ class TestSloTempurl(Base):
 
 class TestSloTempurlUTF8(Base2, TestSloTempurl):
     pass
+
+
+def requires_digest(digest):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if digest not in cluster_info['tempurl'].get(
+                    'allowed_digests', ['sha1']):
+                raise SkipTest("tempurl does not support %s signatures" %
+                               digest)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+class TestTempurlAlgorithms(Base):
+    env = TestTempurlEnv
+
+    def get_sig(self, expires, digest, encoding):
+        path = self.env.conn.make_path(self.env.obj.path)
+
+        sig = hmac.new(
+            self.env.tempurl_key,
+            '%s\n%s\n%s' % ('GET', expires,
+                            urllib.parse.unquote(path)),
+            getattr(hashlib, digest))
+
+        if encoding == 'hex':
+            return sig.hexdigest()
+        elif encoding == 'base64':
+            return digest + ':' + base64.b64encode(sig.digest())
+        elif encoding == 'base64-no-padding':
+            return digest + ':' + base64.b64encode(sig.digest()).strip('=')
+        elif encoding == 'url-safe-base64':
+            return digest + ':' + base64.urlsafe_b64encode(sig.digest())
+        else:
+            raise ValueError('Unrecognized encoding: %r' % encoding)
+
+    def _do_test(self, digest, encoding, expect_failure=False):
+        expires = int(time()) + 86400
+        sig = self.get_sig(expires, digest, encoding)
+
+        if encoding == 'url-safe-base64':
+            # Make sure that we're actually testing url-safe-ness
+            while '-' not in sig and '_' not in sig:
+                expires += 1
+                sig = self.get_sig(expires, digest, encoding)
+
+        parms = {'temp_url_sig': sig, 'temp_url_expires': str(expires)}
+
+        if expect_failure:
+            with self.assertRaises(ResponseError):
+                self.env.obj.read(parms=parms, cfg={'no_auth_token': True})
+            self.assert_status([401])
+
+            # ditto for HEADs
+            with self.assertRaises(ResponseError):
+                self.env.obj.info(parms=parms, cfg={'no_auth_token': True})
+            self.assert_status([401])
+        else:
+            contents = self.env.obj.read(
+                parms=parms,
+                cfg={'no_auth_token': True})
+            self.assertEqual(contents, "obj contents")
+
+            # GET tempurls also allow HEAD requests
+            self.assertTrue(self.env.obj.info(
+                parms=parms, cfg={'no_auth_token': True}))
+
+    @requires_digest('sha1')
+    def test_sha1(self):
+        self._do_test('sha1', 'hex')
+        self._do_test('sha1', 'base64')
+        self._do_test('sha1', 'base64-no-padding')
+        self._do_test('sha1', 'url-safe-base64')
+
+    @requires_digest('sha256')
+    def test_sha256(self):
+        # apparently Cloud Files supports hex-encoded SHA-256
+        # let's not break that just for the sake of being different
+        self._do_test('sha256', 'hex')
+        self._do_test('sha256', 'base64')
+        self._do_test('sha256', 'base64-no-padding')
+        self._do_test('sha256', 'url-safe-base64')
+
+    @requires_digest('sha512')
+    def test_sha512(self):
+        # 128 chars seems awfully long for a signature -- let's require base64
+        self._do_test('sha512', 'hex', expect_failure=True)
+        self._do_test('sha512', 'base64')
+        self._do_test('sha512', 'base64-no-padding')
+        self._do_test('sha512', 'url-safe-base64')

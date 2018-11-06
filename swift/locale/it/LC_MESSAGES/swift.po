@@ -6,18 +6,18 @@
 # Andreas Jaeger <jaegerandi@gmail.com>, 2016. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: swift 2.9.1.dev6\n"
+"Project-Id-Version: swift VERSION\n"
 "Report-Msgid-Bugs-To: https://bugs.launchpad.net/openstack-i18n/\n"
-"POT-Creation-Date: 2016-07-19 04:02+0000\n"
+"POT-Creation-Date: 2018-08-09 00:12+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"PO-Revision-Date: 2016-04-07 03:43+0000\n"
-"Last-Translator: Remo Mattei <remo@rm.ht>\n"
+"PO-Revision-Date: 2016-04-12 06:42+0000\n"
+"Last-Translator: Copied by Zanata <copied-by-zanata@zanata.org>\n"
 "Language: it\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 "Generated-By: Babel 2.0\n"
-"X-Generator: Zanata 3.7.3\n"
+"X-Generator: Zanata 4.3.3\n"
 "Language-Team: Italian\n"
 
 msgid ""
@@ -43,22 +43,8 @@ msgstr ""
 "sincronizzati"
 
 #, python-format
-msgid "%(ip)s/%(device)s responded as unmounted"
-msgstr "%(ip)s/%(device)s ha risposto come smontato"
-
-#, python-format
 msgid "%(msg)s %(ip)s:%(port)s/%(device)s"
 msgstr "%(msg)s %(ip)s:%(port)s/%(device)s"
-
-#, python-format
-msgid ""
-"%(reconstructed)d/%(total)d (%(percentage).2f%%) partitions of %(device)d/"
-"%(dtotal)d (%(dpercentage).2f%%) devices reconstructed in %(time).2fs "
-"(%(rate).2f/sec, %(remaining)s remaining)"
-msgstr ""
-"%(reconstructed)d/%(total)d (%(percentage).2f%%) partizioni di %(device)d/"
-"%(dtotal)d (%(dpercentage).2f%%) dispositivi ricostruiti in %(time).2fs "
-"(%(rate).2f/sec, %(remaining)s rimanenti)"
 
 #, python-format
 msgid ""
@@ -306,10 +292,6 @@ msgstr ""
 "%(status)s %(reason)s"
 
 #, python-format
-msgid "ERROR Bad response %(status)s from %(host)s"
-msgstr "ERRORE Risposta errata %(status)s da %(host)s"
-
-#, python-format
 msgid "ERROR Client read timeout (%ss)"
 msgstr "ERRORE Timeout di lettura del client (%ss)"
 
@@ -456,9 +438,6 @@ msgstr "ERRORE relativo al server remoto %(ip)s:%(port)s/%(device)s"
 msgid "ERROR:  Failed to get paths to drive partitions: %s"
 msgstr "ERRORE:  Impossibile ottenere i percorsi per gestire le partizioni: %s"
 
-msgid "ERROR: An error occurred while retrieving segments"
-msgstr "ERRORE: Si è verificato un errore durante il richiamo dei segmenti"
-
 #, python-format
 msgid "ERROR: Unable to access %(path)s: %(error)s"
 msgstr "ERRORE: Impossibile accedere a %(path)s: %(error)s"
@@ -467,20 +446,8 @@ msgstr "ERRORE: Impossibile accedere a %(path)s: %(error)s"
 msgid "ERROR: Unable to run auditing: %s"
 msgstr "ERRORE: Impossibile eseguire la verifica: %s"
 
-#, python-format
-msgid "Error %(action)s to memcached: %(server)s"
-msgstr "Errore di %(action)s su memcached: %(server)s"
-
-#, python-format
-msgid "Error encoding to UTF-8: %s"
-msgstr "Errore durante la codifica in UTF-8: %s"
-
 msgid "Error hashing suffix"
 msgstr "Errore durante l'hash del suffisso"
-
-#, python-format
-msgid "Error limiting server %s"
-msgstr "Errore durante la limitazione del server %s"
 
 msgid "Error listing devices"
 msgstr "Errore durante l'elenco dei dispositivi"
@@ -532,14 +499,8 @@ msgstr "Errore: Argomento path della configurazione mancante"
 msgid "Error: unable to locate %s"
 msgstr "Errore: impossibile individuare %s"
 
-msgid "Exception dumping recon cache"
-msgstr "Eccezione durante il dump della cache di recon"
-
 msgid "Exception in top-level account reaper loop"
 msgstr "Eccezione nel loop reaper dell'account di livello superiore"
-
-msgid "Exception in top-level replication loop"
-msgstr "Eccezione nel loop di replica di livello superiore"
 
 msgid "Exception in top-levelreconstruction loop"
 msgstr "Eccezione nel loop di ricostruzione di livello superiore"
@@ -731,24 +692,8 @@ msgid "Object servers returned %s mismatched etags"
 msgstr "I server dell'oggetto hanno restituito %s etag senza corrispondenza"
 
 #, python-format
-msgid ""
-"Object update single threaded sweep completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"Pulizia a singolo thread aggiornamento oggetto completata: %(elapsed).02fs, "
-"%(success)s operazioni con esito positivo, %(fail)s errori"
-
-#, python-format
 msgid "Object update sweep completed: %.02fs"
 msgstr "Pulizia aggiornamento oggetto completata: %.02fs"
-
-#, python-format
-msgid ""
-"Object update sweep of %(device)s completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"Pulizia aggiornamento oggetto di %(device)s completata: %(elapsed).02fs, "
-"%(success)s operazioni con esito positivo, %(fail)s errori"
 
 msgid "Params, queries, and fragments not allowed in X-Container-Sync-To"
 msgstr "Parametri, query e frammenti non consentiti in X-Container-Sync-To"
@@ -876,10 +821,6 @@ msgstr ""
 "%(fail)s verifiche non superate"
 
 #, python-format
-msgid "Skipping %(device)s as it is not mounted"
-msgstr "%(device)s viene ignorato perché non è montato"
-
-#, python-format
 msgid "Skipping %s as it is not mounted"
 msgstr "%s viene ignorato perché non è montato"
 
@@ -913,10 +854,6 @@ msgid ""
 msgstr ""
 "Il numero totale di %(key)s per il contenitore (%(total)s) non corrisponde "
 "alla somma di %(key)s tra le politiche (%(sum)s)"
-
-#, python-format
-msgid "Timeout %(action)s to memcached: %(server)s"
-msgstr "Timeout di %(action)s su memcached: %(server)s"
 
 #, python-format
 msgid "Timeout Exception with %(ip)s:%(port)s/%(device)s"
@@ -971,10 +908,6 @@ msgstr "Impossibile leggere la configurazione da %s"
 #, python-format
 msgid "Unauth %(sync_from)r => %(sync_to)r"
 msgstr "%(sync_from)r => %(sync_to)r non autorizzato"
-
-#, python-format
-msgid "Unexpected response: %s"
-msgstr "Risposta imprevista: %s"
 
 msgid "Unhandled exception"
 msgstr "Eccezione non gestita"

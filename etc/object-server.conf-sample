@@ -1,6 +1,7 @@
 [DEFAULT]
 # bind_ip = 0.0.0.0
 bind_port = 6200
+# keep_idle = 600
 # bind_timeout = 30
 # backlog = 4096
 # user = swift
@@ -69,6 +70,12 @@ bind_port = 6200
 # network_chunk_size = 65536
 # disk_chunk_size = 65536
 #
+# Reclamation of tombstone files is performed primarily by the replicator and
+# the reconstructor but the object-server and object-auditor also reference
+# this value - it should be the same for all object services in the cluster,
+# and not greater than the container services reclaim_age
+# reclaim_age = 604800
+#
 # You can set scheduling priority of processes. Niceness values range from -20
 # (most favorable to the process) to 19 (least favorable to the process).
 # nice_priority =
@@ -114,10 +121,33 @@ use = egg:swift#object
 # Comma separated list of headers that can be set in metadata on an object.
 # This list is in addition to X-Object-Meta-* headers and cannot include
 # Content-Type, etag, Content-Length, or deleted
-# allowed_headers = Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object
+# allowed_headers = Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object, Cache-Control, Content-Language, Expires, X-Robots-Tag
 #
 # auto_create_account_prefix = .
 #
+
+# The number of threads in eventlet's thread pool. Most IO will occur
+# in the object server's main thread, but certain "heavy" IO
+# operations will occur in separate IO threads, managed by eventlet.
+#
+# The default value is auto, whose actual value is dependent on the
+# servers_per_port value:
+#
+#  - When servers_per_port is zero, the default value of
+#    eventlet_tpool_num_threads is empty, which uses eventlet's default
+#    (currently 20 threads).
+#
+#  - When servers_per_port is nonzero, the default value of
+#    eventlet_tpool_num_threads is 1.
+#
+# But you may override this value to any integer value.
+#
+# Note that this value is threads per object-server process, so to
+# compute the total number of IO threads on a node, you must multiply
+# this by the number of object-server processes on the node.
+#
+# eventlet_tpool_num_threads = auto
+
 # Configure parameter for creating specific server
 # To handle all verbs, including replication verbs, do not specify
 # "replication_server" (this is the default). To only handle replication,
@@ -132,11 +162,12 @@ use = egg:swift#object
 # object replicator when configured to use ssync.
 # replication_concurrency = 4
 #
-# Restricts incoming SSYNC requests to one per device,
-# replication_currency above allowing. This can help control I/O to each
-# device, but you may wish to set this to False to allow multiple SSYNC
-# requests (up to the above replication_concurrency setting) per device.
-# replication_one_per_device = True
+# Set to restrict the number of concurrent incoming SSYNC requests per
+# device; set to 0 for unlimited requests per device. This can help control
+# I/O to each device. This does not override replication_concurrency described
+# above, so you may need to adjust both parameters depending on your hardware
+# or network capacity.
+# replication_concurrency_per_device = 1
 #
 # Number of seconds to wait for an existing replication device lock before
 # giving up.
@@ -195,7 +226,16 @@ use = egg:swift#recon
 # run_pause is deprecated, use interval instead
 # run_pause = 30
 #
+# Number of concurrent replication jobs to run. This is per-process,
+# so replicator_workers=W and concurrency=C will result in W*C
+# replication jobs running at once.
 # concurrency = 1
+#
+# Number of worker processes to use. No matter how big this number is,
+# at most one worker per disk will be used. 0 means no forking; all work
+# is done in the main process.
+# replicator_workers = 0
+#
 # stats_interval = 300
 #
 # default is rsync, alternative is ssync
@@ -228,9 +268,6 @@ use = egg:swift#recon
 #
 # attempts to kill all workers if nothing replicates for lockup_timeout seconds
 # lockup_timeout = 1800
-#
-# The replicator also performs reclamation
-# reclaim_age = 604800
 #
 # ring_check_interval = 15
 # recon_cache_path = /var/cache/swift
@@ -288,15 +325,32 @@ use = egg:swift#recon
 # run_pause is deprecated, use interval instead
 # run_pause = 30
 #
+# Maximum number of worker processes to spawn.  Each worker will handle a
+# subset of devices.  Devices will be assigned evenly among the workers so that
+# workers cycle at similar intervals (which can lead to fewer workers than
+# requested).  You can not have more workers than devices.  If you have no
+# devices only a single worker is spawned.
+# reconstructor_workers = 0
+#
 # concurrency = 1
 # stats_interval = 300
 # node_timeout = 10
 # http_timeout = 60
 # lockup_timeout = 1800
-# reclaim_age = 604800
 # ring_check_interval = 15
 # recon_cache_path = /var/cache/swift
-# handoffs_first = False
+# The handoffs_only mode option is for special case emergency situations during
+# rebalance such as disk full in the cluster.  This option SHOULD NOT BE
+# CHANGED, except for extreme situations.  When handoffs_only mode is enabled
+# the reconstructor will *only* revert fragments from handoff nodes to primary
+# nodes and will not sync primary nodes with neighboring primary nodes.  This
+# will force the reconstructor to sync and delete handoffs' fragments more
+# quickly and minimize the time of the rebalance by limiting the number of
+# rebuilds.  The handoffs_only option is only for temporary use and should be
+# disabled as soon as the emergency situation has been resolved.  When
+# handoffs_only is not set, the deprecated handoffs_first option will be
+# honored as a synonym, but may be ignored in a future release.
+# handoffs_only = False
 #
 # You can set scheduling priority of processes. Niceness values range from -20
 # (most favorable to the process) to 19 (least favorable to the process).
@@ -318,10 +372,28 @@ use = egg:swift#recon
 # log_address = /dev/log
 #
 # interval = 300
-# concurrency = 1
 # node_timeout = <whatever's in the DEFAULT section or 10>
-# slowdown will sleep that amount between objects
+#
+# updater_workers controls how many processes the object updater will
+# spawn, while concurrency controls how many async_pending records
+# each updater process will operate on at any one time. With
+# concurrency=C and updater_workers=W, there will be up to W*C
+# async_pending records being processed at once.
+# concurrency = 8
+# updater_workers = 1
+#
+# Send at most this many object updates per second
+# objects_per_second = 50
+#
+# slowdown will sleep that amount between objects. Deprecated; use
+# objects_per_second instead.
 # slowdown = 0.01
+#
+# Log stats (at INFO level) every report_interval seconds. This
+# logging is per-process, so with concurrency > 1, the logs will
+# contain one stats log per worker process every report_interval
+# seconds.
+# report_interval = 300
 #
 # recon_cache_path = /var/cache/swift
 #

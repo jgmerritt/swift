@@ -31,11 +31,11 @@ from swift.common.header_key_dict import HeaderKeyDict
 
 from swift import gettext_ as _
 from swift.common.storage_policy import POLICIES
-from swift.common.constraints import FORMAT2CONTENT_TYPE
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success
-from swift.common.swob import HTTPBadRequest, HTTPNotAcceptable, \
-    HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator
+from swift.common.swob import HTTPBadRequest, \
+    HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator, \
+    HTTPPreconditionFailed, wsgi_to_bytes
 from swift.common.utils import split_path, validate_device_partition, \
     close_if_possible, maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
@@ -57,7 +57,7 @@ def get_param(req, name, default=None):
     :param default: result to return if the parameter is not found
     :returns: HTTP request parameter value
               (as UTF-8 encoded str, not unicode object)
-    :raises: HTTPBadRequest if param not valid UTF-8 byte sequence
+    :raises HTTPBadRequest: if param not valid UTF-8 byte sequence
     """
     value = req.params.get(name, default)
     if value and not isinstance(value, six.text_type):
@@ -68,28 +68,6 @@ def get_param(req, name, default=None):
                 request=req, content_type='text/plain',
                 body='"%s" parameter not valid UTF-8' % name)
     return value
-
-
-def get_listing_content_type(req):
-    """
-    Determine the content type to use for an account or container listing
-    response.
-
-    :param req: request object
-    :returns: content type as a string (e.g. text/plain, application/json)
-    :raises: HTTPNotAcceptable if the requested content type is not acceptable
-    :raises: HTTPBadRequest if the 'format' query param is provided and
-             not valid UTF-8
-    """
-    query_format = get_param(req, 'format')
-    if query_format:
-        req.accept = FORMAT2CONTENT_TYPE.get(
-            query_format.lower(), FORMAT2CONTENT_TYPE['plain'])
-    out_content_type = req.accept.best_match(
-        ['text/plain', 'application/json', 'application/xml', 'text/xml'])
-    if not out_content_type:
-        raise HTTPNotAcceptable(request=req)
-    return out_content_type
 
 
 def get_name_and_placement(request, minsegs=1, maxsegs=None,
@@ -103,7 +81,7 @@ def get_name_and_placement(request, minsegs=1, maxsegs=None,
 
     :returns: a list, result of :meth:`split_and_validate_path` with
               the BaseStoragePolicy instance appended on the end
-    :raises: HTTPServiceUnavailable if the path is invalid or no policy exists
+    :raises HTTPServiceUnavailable: if the path is invalid or no policy exists
              with the extracted policy_index.
     """
     policy_index = request.headers.get('X-Backend-Storage-Policy-Index')
@@ -126,7 +104,7 @@ def split_and_validate_path(request, minsegs=1, maxsegs=None,
 
     :returns: result of :meth:`~swift.common.utils.split_path` if
               everything's okay
-    :raises: HTTPBadRequest if something's not okay
+    :raises HTTPBadRequest: if something's not okay
     """
     try:
         segs = split_path(unquote(request.path),
@@ -200,6 +178,8 @@ def strip_user_meta_prefix(server_type, key):
     :param key: header key
     :returns: stripped header key
     """
+    if not is_user_meta(server_type, key):
+        raise ValueError('Key is not user meta')
     return key[len(get_user_meta_prefix(server_type)):]
 
 
@@ -212,6 +192,8 @@ def strip_sys_meta_prefix(server_type, key):
     :param key: header key
     :returns: stripped header key
     """
+    if not is_sys_meta(server_type, key):
+        raise ValueError('Key is not sysmeta')
     return key[len(get_sys_meta_prefix(server_type)):]
 
 
@@ -223,6 +205,8 @@ def strip_object_transient_sysmeta_prefix(key):
     :param key: header key
     :returns: stripped header key
     """
+    if not is_object_transient_sysmeta(key):
+        raise ValueError('Key is not object transient sysmeta')
     return key[len(OBJECT_TRANSIENT_SYSMETA_PREFIX):]
 
 
@@ -278,7 +262,7 @@ def remove_items(headers, condition):
     :returns: a dict, possibly empty, of headers that have been removed
     """
     removed = {}
-    keys = filter(condition, headers)
+    keys = [key for key in headers if condition(key)]
     removed.update((key, headers.pop(key)) for key in keys)
     return removed
 
@@ -296,6 +280,31 @@ def copy_header_subset(from_r, to_r, condition):
     for k, v in from_r.headers.items():
         if condition(k):
             to_r.headers[k] = v
+
+
+def check_path_header(req, name, length, error_msg):
+    """
+    Validate that the value of path-like header is
+    well formatted. We assume the caller ensures that
+    specific header is present in req.headers.
+
+    :param req: HTTP request object
+    :param name: header name
+    :param length: length of path segment check
+    :param error_msg: error message for client
+    :returns: A tuple with path parts according to length
+    :raise: HTTPPreconditionFailed if header value
+            is not well formatted.
+    """
+    hdr = unquote(req.headers.get(name))
+    if not hdr.startswith('/'):
+        hdr = '/' + hdr
+    try:
+        return split_path(hdr, length, length, True)
+    except ValueError:
+        raise HTTPPreconditionFailed(
+            request=req,
+            body=error_msg)
 
 
 class SegmentedIterable(object):
@@ -344,21 +353,28 @@ class SegmentedIterable(object):
         self.current_resp = None
 
     def _coalesce_requests(self):
-        start_time = time.time()
-        pending_req = None
-        pending_etag = None
-        pending_size = None
+        pending_req = pending_etag = pending_size = None
         try:
-            for seg_path, seg_etag, seg_size, first_byte, last_byte \
-                    in self.listing_iter:
+            for seg_dict in self.listing_iter:
+                if 'raw_data' in seg_dict:
+                    if pending_req:
+                        yield pending_req, pending_etag, pending_size
+
+                    to_yield = seg_dict['raw_data'][
+                        seg_dict['first_byte']:seg_dict['last_byte'] + 1]
+                    yield to_yield, None, len(seg_dict['raw_data'])
+                    pending_req = pending_etag = pending_size = None
+                    continue
+
+                seg_path, seg_etag, seg_size, first_byte, last_byte = (
+                    seg_dict['path'], seg_dict.get('hash'),
+                    seg_dict.get('bytes'),
+                    seg_dict['first_byte'], seg_dict['last_byte'])
+                if seg_size is not None:
+                    seg_size = int(seg_size)
                 first_byte = first_byte or 0
                 go_to_end = last_byte is None or (
                     seg_size is not None and last_byte == seg_size - 1)
-                if time.time() - start_time > self.max_get_time:
-                    raise SegmentError(
-                        'ERROR: While processing manifest %s, '
-                        'max LO GET time of %ds exceeded' %
-                        (self.name, self.max_get_time))
                 # The "multipart-manifest=get" query param ensures that the
                 # segment is a plain old object, not some flavor of large
                 # object; therefore, its etag is its MD5sum and hence we can
@@ -411,101 +427,123 @@ class SegmentedIterable(object):
 
         except ListingIterError:
             e_type, e_value, e_traceback = sys.exc_info()
-            if time.time() - start_time > self.max_get_time:
-                raise SegmentError(
-                    'ERROR: While processing manifest %s, '
-                    'max LO GET time of %ds exceeded' %
-                    (self.name, self.max_get_time))
             if pending_req:
                 yield pending_req, pending_etag, pending_size
             six.reraise(e_type, e_value, e_traceback)
 
-        if time.time() - start_time > self.max_get_time:
-            raise SegmentError(
-                'ERROR: While processing manifest %s, '
-                'max LO GET time of %ds exceeded' %
-                (self.name, self.max_get_time))
         if pending_req:
             yield pending_req, pending_etag, pending_size
 
-    def _internal_iter(self):
+    def _requests_to_bytes_iter(self):
+        # Take the requests out of self._coalesce_requests, actually make
+        # the requests, and generate the bytes from the responses.
+        #
+        # Yields 2-tuples (segment-name, byte-chunk). The segment name is
+        # used for logging.
+        for data_or_req, seg_etag, seg_size in self._coalesce_requests():
+            if isinstance(data_or_req, bytes):  # ugly, awful overloading
+                yield ('data segment', data_or_req)
+                continue
+            seg_req = data_or_req
+            seg_resp = seg_req.get_response(self.app)
+            if not is_success(seg_resp.status_int):
+                close_if_possible(seg_resp.app_iter)
+                raise SegmentError(
+                    'While processing manifest %s, '
+                    'got %d while retrieving %s' %
+                    (self.name, seg_resp.status_int, seg_req.path))
+
+            elif ((seg_etag and (seg_resp.etag != seg_etag)) or
+                    (seg_size and (seg_resp.content_length != seg_size) and
+                     not seg_req.range)):
+                # The content-length check is for security reasons. Seems
+                # possible that an attacker could upload a >1mb object and
+                # then replace it with a much smaller object with same
+                # etag. Then create a big nested SLO that calls that
+                # object many times which would hammer our obj servers. If
+                # this is a range request, don't check content-length
+                # because it won't match.
+                close_if_possible(seg_resp.app_iter)
+                raise SegmentError(
+                    'Object segment no longer valid: '
+                    '%(path)s etag: %(r_etag)s != %(s_etag)s or '
+                    '%(r_size)s != %(s_size)s.' %
+                    {'path': seg_req.path, 'r_etag': seg_resp.etag,
+                     'r_size': seg_resp.content_length,
+                     's_etag': seg_etag,
+                     's_size': seg_size})
+            else:
+                self.current_resp = seg_resp
+
+            seg_hash = None
+            if seg_resp.etag and not seg_req.headers.get('Range'):
+                # Only calculate the MD5 if it we can use it to validate
+                seg_hash = hashlib.md5()
+
+            document_iters = maybe_multipart_byteranges_to_document_iters(
+                seg_resp.app_iter,
+                seg_resp.headers['Content-Type'])
+
+            for chunk in itertools.chain.from_iterable(document_iters):
+                if seg_hash:
+                    seg_hash.update(chunk)
+                yield (seg_req.path, chunk)
+            close_if_possible(seg_resp.app_iter)
+
+            if seg_hash and seg_hash.hexdigest() != seg_resp.etag:
+                raise SegmentError(
+                    "Bad MD5 checksum in %(name)s for %(seg)s: headers had"
+                    " %(etag)s, but object MD5 was actually %(actual)s" %
+                    {'seg': seg_req.path, 'etag': seg_resp.etag,
+                     'name': self.name, 'actual': seg_hash.hexdigest()})
+
+    def _byte_counting_iter(self):
+        # Checks that we give the client the right number of bytes. Raises
+        # SegmentError if the number of bytes is wrong.
         bytes_left = self.response_body_length
 
-        try:
-            for seg_req, seg_etag, seg_size in self._coalesce_requests():
-                seg_resp = seg_req.get_response(self.app)
-                if not is_success(seg_resp.status_int):
-                    close_if_possible(seg_resp.app_iter)
-                    raise SegmentError(
-                        'ERROR: While processing manifest %s, '
-                        'got %d while retrieving %s' %
-                        (self.name, seg_resp.status_int, seg_req.path))
-
-                elif ((seg_etag and (seg_resp.etag != seg_etag)) or
-                        (seg_size and (seg_resp.content_length != seg_size) and
-                         not seg_req.range)):
-                    # The content-length check is for security reasons. Seems
-                    # possible that an attacker could upload a >1mb object and
-                    # then replace it with a much smaller object with same
-                    # etag. Then create a big nested SLO that calls that
-                    # object many times which would hammer our obj servers. If
-                    # this is a range request, don't check content-length
-                    # because it won't match.
-                    close_if_possible(seg_resp.app_iter)
-                    raise SegmentError(
-                        'Object segment no longer valid: '
-                        '%(path)s etag: %(r_etag)s != %(s_etag)s or '
-                        '%(r_size)s != %(s_size)s.' %
-                        {'path': seg_req.path, 'r_etag': seg_resp.etag,
-                         'r_size': seg_resp.content_length,
-                         's_etag': seg_etag,
-                         's_size': seg_size})
-                else:
-                    self.current_resp = seg_resp
-
-                seg_hash = None
-                if seg_resp.etag and not seg_req.headers.get('Range'):
-                    # Only calculate the MD5 if it we can use it to validate
-                    seg_hash = hashlib.md5()
-
-                document_iters = maybe_multipart_byteranges_to_document_iters(
-                    seg_resp.app_iter,
-                    seg_resp.headers['Content-Type'])
-
-                for chunk in itertools.chain.from_iterable(document_iters):
-                    if seg_hash:
-                        seg_hash.update(chunk)
-
-                    if bytes_left is None:
-                        yield chunk
-                    elif bytes_left >= len(chunk):
-                        yield chunk
-                        bytes_left -= len(chunk)
-                    else:
-                        yield chunk[:bytes_left]
-                        bytes_left -= len(chunk)
-                        close_if_possible(seg_resp.app_iter)
-                        raise SegmentError(
-                            'Too many bytes for %(name)s; truncating in '
-                            '%(seg)s with %(left)d bytes left' %
-                            {'name': self.name, 'seg': seg_req.path,
-                             'left': bytes_left})
-                close_if_possible(seg_resp.app_iter)
-
-                if seg_hash and seg_hash.hexdigest() != seg_resp.etag:
-                    raise SegmentError(
-                        "Bad MD5 checksum in %(name)s for %(seg)s: headers had"
-                        " %(etag)s, but object MD5 was actually %(actual)s" %
-                        {'seg': seg_req.path, 'etag': seg_resp.etag,
-                         'name': self.name, 'actual': seg_hash.hexdigest()})
-
-            if bytes_left:
+        for seg_name, chunk in self._requests_to_bytes_iter():
+            if bytes_left is None:
+                yield chunk
+            elif bytes_left >= len(chunk):
+                yield chunk
+                bytes_left -= len(chunk)
+            else:
+                yield chunk[:bytes_left]
+                bytes_left -= len(chunk)
                 raise SegmentError(
-                    'Not enough bytes for %s; closing connection' % self.name)
-        except (ListingIterError, SegmentError):
-            self.logger.exception(_('ERROR: An error occurred '
-                                    'while retrieving segments'))
-            raise
+                    'Too many bytes for %(name)s; truncating in '
+                    '%(seg)s with %(left)d bytes left' %
+                    {'name': self.name, 'seg': seg_name,
+                     'left': -bytes_left})
+
+        if bytes_left:
+            raise SegmentError('Expected another %d bytes for %s; '
+                               'closing connection' % (bytes_left, self.name))
+
+    def _time_limited_iter(self):
+        # Makes sure a GET response doesn't take more than self.max_get_time
+        # seconds to process. Raises an exception if things take too long.
+        start_time = time.time()
+        for chunk in self._byte_counting_iter():
+            now = time.time()
+            yield chunk
+            if now - start_time > self.max_get_time:
+                raise SegmentError(
+                    'While processing manifest %s, '
+                    'max LO GET time of %ds exceeded' %
+                    (self.name, self.max_get_time))
+
+    def _internal_iter(self):
+        # Top level of our iterator stack: pass bytes through; catch and
+        # handle exceptions.
+        try:
+            for chunk in self._time_limited_iter():
+                yield chunk
+        except (ListingIterError, SegmentError) as err:
+            self.logger.error(err)
+            if not self.validated_first_segment:
+                raise
         finally:
             if self.current_resp:
                 close_if_possible(self.current_resp.app_iter)
@@ -550,12 +588,13 @@ class SegmentedIterable(object):
         """
         if self.validated_first_segment:
             return
-        self.validated_first_segment = True
 
         try:
             self.peeked_chunk = next(self.app_iter)
         except StopIteration:
             pass
+        finally:
+            self.validated_first_segment = True
 
     def __iter__(self):
         if self.peeked_chunk is not None:
@@ -612,7 +651,7 @@ def http_response_to_document_iters(response, read_chunk_size=4096):
         # extracted from the Content-Type header.
         params = dict(params_list)
         return multipart_byteranges_to_document_iters(
-            response, params['boundary'], read_chunk_size)
+            response, wsgi_to_bytes(params['boundary']), read_chunk_size)
 
 
 def update_etag_is_at_header(req, name):
@@ -661,7 +700,7 @@ def resolve_etag_is_at_header(req, metadata):
     middleware's alternate etag sysmeta (X-Object-Sysmeta-Crypto-Etag) but will
     then find the EC alternate etag (if EC policy). But if the object *is*
     encrypted then X-Object-Sysmeta-Crypto-Etag is found and used, which is
-    correct because it should be preferred over X-Object-Sysmeta-Crypto-Etag.
+    correct because it should be preferred over X-Object-Sysmeta-Ec-Etag.
 
     :param req: a swob Request
     :param metadata: a dict containing object metadata

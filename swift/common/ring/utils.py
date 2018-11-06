@@ -17,6 +17,7 @@ import optparse
 import re
 import socket
 
+from swift.common import exceptions
 from swift.common.utils import expand_ipv6, is_valid_ip, is_valid_ipv4, \
     is_valid_ipv6
 
@@ -426,7 +427,7 @@ def parse_add_value(add_value):
 
     :returns: dictionary with keys 'region', 'zone', 'ip', 'port', 'device',
         'replication_ip', 'replication_port', 'meta'
-    :raises: ValueError if add_value is malformed
+    :raises ValueError: if add_value is malformed
     """
     region = None
     rest = add_value
@@ -606,8 +607,9 @@ def build_dev_from_opts(opts):
             'replication_port': replication_port, 'weight': opts.weight}
 
 
-def dispersion_report(builder, search_filter=None, verbose=False):
-    if not builder._dispersion_graph:
+def dispersion_report(builder, search_filter=None,
+                      verbose=False, recalculate=False):
+    if recalculate or not builder._dispersion_graph:
         builder._build_dispersion_graph()
     max_allowed_replicas = builder._build_max_replicas_by_tier()
     worst_tier = None
@@ -618,8 +620,11 @@ def dispersion_report(builder, search_filter=None, verbose=False):
         if search_filter and not re.match(search_filter, tier_name):
             continue
         max_replicas = int(max_allowed_replicas[tier])
-        at_risk_parts = sum(replica_counts[max_replicas + 1:])
-        placed_parts = sum(replica_counts[1:])
+        at_risk_parts = sum(replica_counts[i] * (i - max_replicas)
+                            for i in range(max_replicas + 1,
+                                           len(replica_counts)))
+        placed_parts = sum(replica_counts[i] * i for i in range(
+            1, len(replica_counts)))
         tier_dispersion = 100.0 * at_risk_parts / placed_parts
         if tier_dispersion > max_dispersion:
             max_dispersion = tier_dispersion
@@ -642,6 +647,34 @@ def dispersion_report(builder, search_filter=None, verbose=False):
     }
 
 
+def validate_replicas_by_tier(replicas, replicas_by_tier):
+    """
+    Validate the sum of the replicas at each tier.
+    The sum of the replicas at each tier should be less than or very close to
+    the upper limit indicated by replicas
+
+    :param replicas: float,the upper limit of replicas
+    :param replicas_by_tier: defaultdict,the replicas by tier
+    """
+    tiers = ['cluster', 'regions', 'zones', 'servers', 'devices']
+    for i, tier_name in enumerate(tiers):
+        replicas_at_tier = sum(replicas_by_tier[t] for t in
+                               replicas_by_tier if len(t) == i)
+        if abs(replicas - replicas_at_tier) > 1e-10:
+            raise exceptions.RingValidationError(
+                '%s != %s at tier %s' % (
+                    replicas_at_tier, replicas, tier_name))
+
+
+def format_device(region=None, zone=None, ip=None, device=None, **kwargs):
+    """
+    Convert device dict or tier attributes to a representative string.
+
+    :returns: a string, the normalized format of a device tier
+    """
+    return "r%sz%s-%s/%s" % (region, zone, ip, device)
+
+
 def get_tier_name(tier, builder):
     if len(tier) == 1:
         return "r%s" % (tier[0], )
@@ -651,8 +684,8 @@ def get_tier_name(tier, builder):
         return "r%sz%s-%s" % (tier[0], tier[1], tier[2])
     if len(tier) == 4:
         device = builder.devs[tier[3]] or {}
-        return "r%sz%s-%s/%s" % (tier[0], tier[1], tier[2],
-                                 device.get('device', 'IDd%s' % tier[3]))
+        return format_device(tier[0], tier[1], tier[2], device.get(
+            'device', 'IDd%s' % tier[3]))
 
 
 def validate_device_name(device_name):
@@ -660,3 +693,7 @@ def validate_device_name(device_name):
         device_name.startswith(' ') or
         device_name.endswith(' ') or
         len(device_name) == 0)
+
+
+def pretty_dev(device):
+    return format_device(**device)

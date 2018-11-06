@@ -23,15 +23,17 @@ from swift import gettext_ as _
 from random import random, shuffle
 from tempfile import mkstemp
 
-from eventlet import spawn, patcher, Timeout
+from eventlet import spawn, Timeout
 
 import swift.common.db
+from swift.common.constraints import check_drive
 from swift.container.backend import ContainerBroker, DATADIR
 from swift.common.bufferedhttp import http_connect
-from swift.common.exceptions import ConnectionTimeout
+from swift.common.exceptions import ConnectionTimeout, LockTimeout
 from swift.common.ring import Ring
-from swift.common.utils import get_logger, config_true_value, ismount, \
-    dump_recon_cache, majority_size, Timestamp
+from swift.common.utils import get_logger, config_true_value, \
+    dump_recon_cache, majority_size, Timestamp, ratelimit_sleep, \
+    eventlet_monkey_patch
 from swift.common.daemon import Daemon
 from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR
 
@@ -39,16 +41,28 @@ from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR
 class ContainerUpdater(Daemon):
     """Update container information in account listings."""
 
-    def __init__(self, conf):
+    def __init__(self, conf, logger=None):
         self.conf = conf
-        self.logger = get_logger(conf, log_route='container-updater')
+        self.logger = logger or get_logger(conf, log_route='container-updater')
         self.devices = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.interval = int(conf.get('interval', 300))
         self.account_ring = None
         self.concurrency = int(conf.get('concurrency', 4))
-        self.slowdown = float(conf.get('slowdown', 0.01))
+        if 'slowdown' in conf:
+            self.logger.warning(
+                'The slowdown option is deprecated in favor of '
+                'containers_per_second. This option may be ignored in a '
+                'future release.')
+            containers_per_second = 1 / (
+                float(conf.get('slowdown', '0.01')) + 0.01)
+        else:
+            containers_per_second = 50
+        self.containers_running_time = 0
+        self.max_containers_per_second = \
+            float(conf.get('containers_per_second',
+                           containers_per_second))
         self.node_timeout = float(conf.get('node_timeout', 3))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.no_changes = 0
@@ -87,9 +101,10 @@ class ContainerUpdater(Daemon):
         """
         paths = []
         for device in self._listdir(self.devices):
-            dev_path = os.path.join(self.devices, device)
-            if self.mount_check and not ismount(dev_path):
-                self.logger.warning(_('%s is not mounted'), device)
+            try:
+                dev_path = check_drive(self.devices, device, self.mount_check)
+            except ValueError as err:
+                self.logger.warning("%s", err)
                 continue
             con_path = os.path.join(dev_path, DATADIR)
             if not os.path.exists(con_path):
@@ -143,8 +158,7 @@ class ContainerUpdater(Daemon):
                     pid2filename[pid] = tmpfilename
                 else:
                     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                    patcher.monkey_patch(all=False, socket=True, select=True,
-                                         thread=True)
+                    eventlet_monkey_patch()
                     self.no_changes = 0
                     self.successes = 0
                     self.failures = 0
@@ -178,7 +192,7 @@ class ContainerUpdater(Daemon):
         """
         Run the updater once.
         """
-        patcher.monkey_patch(all=False, socket=True, select=True, thread=True)
+        eventlet_monkey_patch()
         self.logger.info(_('Begin container update single threaded sweep'))
         begin = time.time()
         self.no_changes = 0
@@ -205,8 +219,16 @@ class ContainerUpdater(Daemon):
         for root, dirs, files in os.walk(path):
             for file in files:
                 if file.endswith('.db'):
-                    self.process_container(os.path.join(root, file))
-                    time.sleep(self.slowdown)
+                    dbfile = os.path.join(root, file)
+                    try:
+                        self.process_container(dbfile)
+                    except (Exception, Timeout) as e:
+                        self.logger.exception(
+                            "Error processing container %s: %s", dbfile, e)
+
+                    self.containers_running_time = ratelimit_sleep(
+                        self.containers_running_time,
+                        self.max_containers_per_second)
 
     def process_container(self, dbfile):
         """
@@ -216,13 +238,26 @@ class ContainerUpdater(Daemon):
         """
         start_time = time.time()
         broker = ContainerBroker(dbfile, logger=self.logger)
-        info = broker.get_info()
+        try:
+            info = broker.get_info()
+        except LockTimeout as e:
+            self.logger.info(
+                "Failed to get container info (Lock timeout: %s); skipping.",
+                str(e))
+            return
         # Don't send updates if the container was auto-created since it
         # definitely doesn't have up to date statistics.
         if Timestamp(info['put_timestamp']) <= 0:
             return
         if self.account_suppressions.get(info['account'], 0) > time.time():
             return
+
+        if not broker.is_root_container():
+            # Don't double-up account stats.
+            # The sharder should get these stats to the root container,
+            # and the root's updater will get them to the right account.
+            info['object_count'] = info['bytes_used'] = 0
+
         if info['put_timestamp'] > info['reported_put_timestamp'] or \
                 info['delete_timestamp'] > info['reported_delete_timestamp'] \
                 or info['object_count'] != info['reported_object_count'] or \

@@ -33,27 +33,28 @@ from swift.obj import server
 from swift.obj import ssync_receiver, ssync_sender
 from swift.obj.reconstructor import ObjectReconstructor
 
-from test import unit
-from test.unit import debug_logger, patch_policies, make_timestamp_iter
+from test import listen_zero, unit
+from test.unit import (debug_logger, patch_policies, make_timestamp_iter,
+                       mock_check_drive, skip_if_no_xattrs)
+from test.unit.obj.common import write_diskfile
 
 
 @unit.patch_policies()
 class TestReceiver(unittest.TestCase):
 
     def setUp(self):
+        skip_if_no_xattrs()
         utils.HASH_PATH_SUFFIX = 'endcap'
         utils.HASH_PATH_PREFIX = 'startcap'
         # Not sure why the test.unit stuff isn't taking effect here; so I'm
         # reinforcing it.
-        diskfile.getxattr = unit._getxattr
-        diskfile.setxattr = unit._setxattr
         self.testdir = os.path.join(
             tempfile.mkdtemp(), 'tmp_test_ssync_receiver')
         utils.mkdirs(os.path.join(self.testdir, 'sda1', 'tmp'))
         self.conf = {
             'devices': self.testdir,
             'mount_check': 'false',
-            'replication_one_per_device': 'false',
+            'replication_concurrency_per_device': '0',
             'log_requests': 'false'}
         utils.mkdirs(os.path.join(self.testdir, 'device', 'partition'))
         self.controller = server.ObjectController(self.conf)
@@ -165,7 +166,7 @@ class TestReceiver(unittest.TestCase):
             [':MISSING_CHECK: START', ':MISSING_CHECK: END',
              ':UPDATES: START', ':UPDATES: END'])
         self.assertEqual(rcvr.policy, POLICIES[1])
-        self.assertEqual(rcvr.frag_index, None)
+        self.assertIsNone(rcvr.frag_index)
 
     def test_Receiver_with_bad_storage_policy_index_header(self):
         valid_indices = sorted([int(policy) for policy in POLICIES])
@@ -207,7 +208,7 @@ class TestReceiver(unittest.TestCase):
              ':UPDATES: START', ':UPDATES: END'])
         self.assertEqual(rcvr.policy, POLICIES[1])
         self.assertEqual(rcvr.frag_index, 7)
-        self.assertEqual(rcvr.node_index, None)
+        self.assertIsNone(rcvr.node_index)
 
     @unit.patch_policies()
     def test_Receiver_with_only_node_index_header(self):
@@ -369,8 +370,7 @@ class TestReceiver(unittest.TestCase):
                 mock.patch.object(
                     self.controller._diskfile_router[POLICIES.legacy],
                     'mount_check', False), \
-                mock.patch('swift.obj.diskfile.check_mount',
-                           return_value=False) as mocked_check_mount:
+                mock_check_drive(isdir=True) as mocks:
             req = swob.Request.blank(
                 '/device/partition', environ={'REQUEST_METHOD': 'SSYNC'})
             resp = req.get_response(self.controller)
@@ -378,14 +378,13 @@ class TestReceiver(unittest.TestCase):
                 self.body_lines(resp.body),
                 [':ERROR: 0 "Looking for :MISSING_CHECK: START got \'\'"'])
             self.assertEqual(resp.status_int, 200)
-            self.assertFalse(mocked_check_mount.called)
+            self.assertEqual([], mocks['ismount'].call_args_list)
 
         with mock.patch.object(self.controller, 'replication_semaphore'), \
                 mock.patch.object(
                     self.controller._diskfile_router[POLICIES.legacy],
                     'mount_check', True), \
-                mock.patch('swift.obj.diskfile.check_mount',
-                           return_value=False) as mocked_check_mount:
+                mock_check_drive(ismount=False) as mocks:
             req = swob.Request.blank(
                 '/device/partition', environ={'REQUEST_METHOD': 'SSYNC'})
             resp = req.get_response(self.controller)
@@ -395,12 +394,12 @@ class TestReceiver(unittest.TestCase):
                  "was not enough space to save the resource. Drive: "
                  "device</p></html>"])
             self.assertEqual(resp.status_int, 507)
-            mocked_check_mount.assert_called_once_with(
+            self.assertEqual([mock.call(os.path.join(
                 self.controller._diskfile_router[POLICIES.legacy].devices,
-                'device')
+                'device'))], mocks['ismount'].call_args_list)
 
-            mocked_check_mount.reset_mock()
-            mocked_check_mount.return_value = True
+            mocks['ismount'].reset_mock()
+            mocks['ismount'].return_value = True
             req = swob.Request.blank(
                 '/device/partition', environ={'REQUEST_METHOD': 'SSYNC'})
             resp = req.get_response(self.controller)
@@ -408,9 +407,9 @@ class TestReceiver(unittest.TestCase):
                 self.body_lines(resp.body),
                 [':ERROR: 0 "Looking for :MISSING_CHECK: START got \'\'"'])
             self.assertEqual(resp.status_int, 200)
-            mocked_check_mount.assert_called_once_with(
+            self.assertEqual([mock.call(os.path.join(
                 self.controller._diskfile_router[POLICIES.legacy].devices,
-                'device')
+                'device'))], mocks['ismount'].call_args_list)
 
     def test_SSYNC_Exception(self):
 
@@ -659,6 +658,36 @@ class TestReceiver(unittest.TestCase):
             self.body_lines(resp.body),
             [':MISSING_CHECK: START',
              self.hash2 + ' dm',
+             ':MISSING_CHECK: END',
+             ':UPDATES: START', ':UPDATES: END'])
+        self.assertEqual(resp.status_int, 200)
+        self.assertFalse(self.controller.logger.error.called)
+        self.assertFalse(self.controller.logger.exception.called)
+
+    def test_MISSING_CHECK_missing_meta_expired_data(self):
+        # verify that even when rx disk file has expired x-delete-at, it will
+        # still be opened and checked for missing meta
+        self.controller.logger = mock.MagicMock()
+        ts1 = next(make_timestamp_iter())
+        df = self.controller.get_diskfile(
+            'sda1', '1', self.account1, self.container1, self.object1,
+            POLICIES[0])
+        write_diskfile(df, ts1, extra_metadata={'X-Delete-At': 0})
+
+        # make a request - expect newer metadata to be wanted
+        req = swob.Request.blank(
+            '/sda1/1',
+            environ={'REQUEST_METHOD': 'SSYNC',
+                     'HTTP_X_BACKEND_STORAGE_POLICY_INDEX': '0'},
+            body=':MISSING_CHECK: START\r\n' +
+                 self.hash1 + ' ' + ts1.internal + ' m:30d40\r\n'
+                 ':MISSING_CHECK: END\r\n'
+                 ':UPDATES: START\r\n:UPDATES: END\r\n')
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            self.body_lines(resp.body),
+            [':MISSING_CHECK: START',
+             'c2519f265f9633e74f9b2fe3b9bec27d m',
              ':MISSING_CHECK: END',
              ':UPDATES: START', ':UPDATES: END'])
         self.assertEqual(resp.status_int, 200)
@@ -1486,7 +1515,7 @@ class TestReceiver(unittest.TestCase):
             self.assertFalse(self.controller.logger.error.called)
             req = _POST_request[0]
             self.assertEqual(req.path, '/device/partition/a/c/o')
-            self.assertEqual(req.content_length, None)
+            self.assertIsNone(req.content_length)
             self.assertEqual(req.headers, {
                 'X-Timestamp': '1364456113.12344',
                 'X-Object-Meta-Test1': 'one',
@@ -1672,7 +1701,7 @@ class TestReceiver(unittest.TestCase):
         self.controller.logger.exception.assert_called_once_with(
             'None/device/partition EXCEPTION in ssync.Receiver')
         self.assertEqual(len(_BONK_request), 1)  # sanity
-        self.assertEqual(_BONK_request[0], None)
+        self.assertIsNone(_BONK_request[0])
 
     def test_UPDATES_multiple(self):
         _requests = []
@@ -1834,7 +1863,7 @@ class TestReceiver(unittest.TestCase):
             req = _requests.pop(0)
             self.assertEqual(req.method, 'POST')
             self.assertEqual(req.path, '/device/partition/a/c/o7')
-            self.assertEqual(req.content_length, None)
+            self.assertIsNone(req.content_length)
             self.assertEqual(req.headers, {
                 'X-Timestamp': '1364456113.00008',
                 'X-Object-Meta-Test-User': 'user_meta',
@@ -1933,7 +1962,7 @@ class TestSsyncRxServer(unittest.TestCase):
     # server socket.
 
     def setUp(self):
-        self.rx_ip = '127.0.0.1'
+        skip_if_no_xattrs()
         # dirs
         self.tmpdir = tempfile.mkdtemp()
         self.tempdir = os.path.join(self.tmpdir, 'tmp_test_obj_server')
@@ -1948,7 +1977,8 @@ class TestSsyncRxServer(unittest.TestCase):
         }
         self.rx_logger = debug_logger('test-object-server')
         rx_server = server.ObjectController(self.conf, logger=self.rx_logger)
-        self.sock = eventlet.listen((self.rx_ip, 0))
+        self.rx_ip = '127.0.0.1'
+        self.sock = listen_zero()
         self.rx_server = eventlet.spawn(
             eventlet.wsgi.server, self.sock, rx_server, utils.NullLogger())
         self.rx_port = self.sock.getsockname()[1]

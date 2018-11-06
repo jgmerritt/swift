@@ -16,6 +16,7 @@
 """ Database code for Swift """
 
 from contextlib import contextmanager, closing
+import base64
 import hashlib
 import json
 import logging
@@ -56,12 +57,31 @@ def utf8encode(*args):
             for s in args]
 
 
-def utf8encodekeys(metadata):
-    uni_keys = [k for k in metadata if isinstance(k, six.text_type)]
-    for k in uni_keys:
-        sv = metadata[k]
-        del metadata[k]
-        metadata[k.encode('utf-8')] = sv
+def native_str_keys(metadata):
+    if six.PY2:
+        uni_keys = [k for k in metadata if isinstance(k, six.text_type)]
+        for k in uni_keys:
+            sv = metadata[k]
+            del metadata[k]
+            metadata[k.encode('utf-8')] = sv
+    else:
+        bin_keys = [k for k in metadata if isinstance(k, six.binary_type)]
+        for k in bin_keys:
+            sv = metadata[k]
+            del metadata[k]
+            metadata[k.decode('utf-8')] = sv
+
+
+ZERO_LIKE_VALUES = {None, '', 0, '0'}
+
+
+def zero_like(count):
+    """
+    We've cargo culted our consumers to be tolerant of various expressions of
+    zero in our databases for backwards compatibility with less disciplined
+    producers.
+    """
+    return count in ZERO_LIKE_VALUES
 
 
 def _db_timeout(timeout, db_file, call):
@@ -201,11 +221,27 @@ class DatabaseBroker(object):
 
     def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
                  account=None, container=None, pending_timeout=None,
-                 stale_reads_ok=False):
-        """Encapsulates working with a database."""
+                 stale_reads_ok=False, skip_commits=False):
+        """Encapsulates working with a database.
+
+        :param db_file: path to a database file.
+        :param timeout: timeout used for database operations.
+        :param logger: a logger instance.
+        :param account: name of account.
+        :param container: name of container.
+        :param pending_timeout: timeout used when attempting to take a lock to
+            write to pending file.
+        :param stale_reads_ok: if True then no error is raised if pending
+            commits cannot be committed before the database is read, otherwise
+            an error is raised.
+        :param skip_commits: if True then this broker instance will never
+            commit records from the pending file to the database;
+            :meth:`~swift.common.db.DatabaseBroker.put_record` should not
+            called on brokers with skip_commits True.
+        """
         self.conn = None
-        self.db_file = db_file
-        self.pending_file = self.db_file + '.pending'
+        self._db_file = db_file
+        self.pending_file = self._db_file + '.pending'
         self.pending_timeout = pending_timeout or 10
         self.stale_reads_ok = stale_reads_ok
         self.db_dir = os.path.dirname(db_file)
@@ -214,6 +250,7 @@ class DatabaseBroker(object):
         self.account = account
         self.container = container
         self._db_version = -1
+        self.skip_commits = skip_commits
 
     def __str__(self):
         """
@@ -233,9 +270,9 @@ class DatabaseBroker(object):
         :param put_timestamp: internalized timestamp of initial PUT request
         :param storage_policy_index: only required for containers
         """
-        if self.db_file == ':memory:':
+        if self._db_file == ':memory:':
             tmp_db_file = None
-            conn = get_db_connection(self.db_file, self.timeout)
+            conn = get_db_connection(self._db_file, self.timeout)
         else:
             mkdirs(self.db_dir)
             fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
@@ -322,27 +359,22 @@ class DatabaseBroker(object):
             self._delete_db(conn, timestamp)
             conn.commit()
 
-    def possibly_quarantine(self, exc_type, exc_value, exc_traceback):
+    @property
+    def db_file(self):
+        return self._db_file
+
+    def get_device_path(self):
+        suffix_path = os.path.dirname(self.db_dir)
+        partition_path = os.path.dirname(suffix_path)
+        dbs_path = os.path.dirname(partition_path)
+        return os.path.dirname(dbs_path)
+
+    def quarantine(self, reason):
         """
-        Checks the exception info to see if it indicates a quarantine situation
-        (malformed or corrupted database). If not, the original exception will
-        be reraised. If so, the database will be quarantined and a new
+        The database will be quarantined and a
         sqlite3.DatabaseError will be raised indicating the action taken.
         """
-        if 'database disk image is malformed' in str(exc_value):
-            exc_hint = 'malformed'
-        elif 'malformed database schema' in str(exc_value):
-            exc_hint = 'malformed'
-        elif 'file is encrypted or is not a database' in str(exc_value):
-            exc_hint = 'corrupted'
-        elif 'disk I/O error' in str(exc_value):
-            exc_hint = 'disk error while accessing'
-        else:
-            six.reraise(exc_type, exc_value, exc_traceback)
-        prefix_path = os.path.dirname(self.db_dir)
-        partition_path = os.path.dirname(prefix_path)
-        dbs_path = os.path.dirname(partition_path)
-        device_path = os.path.dirname(dbs_path)
+        device_path = self.get_device_path()
         quar_path = os.path.join(device_path, 'quarantined',
                                  self.db_type + 's',
                                  os.path.basename(self.db_dir))
@@ -354,11 +386,55 @@ class DatabaseBroker(object):
             quar_path = "%s-%s" % (quar_path, uuid4().hex)
             renamer(self.db_dir, quar_path, fsync=False)
         detail = _('Quarantined %(db_dir)s to %(quar_path)s due to '
-                   '%(exc_hint)s database') % {'db_dir': self.db_dir,
-                                               'quar_path': quar_path,
-                                               'exc_hint': exc_hint}
+                   '%(reason)s') % {'db_dir': self.db_dir,
+                                    'quar_path': quar_path,
+                                    'reason': reason}
         self.logger.error(detail)
         raise sqlite3.DatabaseError(detail)
+
+    def possibly_quarantine(self, exc_type, exc_value, exc_traceback):
+        """
+        Checks the exception info to see if it indicates a quarantine situation
+        (malformed or corrupted database). If not, the original exception will
+        be reraised. If so, the database will be quarantined and a new
+        sqlite3.DatabaseError will be raised indicating the action taken.
+        """
+        if 'database disk image is malformed' in str(exc_value):
+            exc_hint = 'malformed database'
+        elif 'malformed database schema' in str(exc_value):
+            exc_hint = 'malformed database'
+        elif ' is not a database' in str(exc_value):
+            # older versions said 'file is not a database'
+            # now 'file is encrypted or is not a database'
+            exc_hint = 'corrupted database'
+        elif 'disk I/O error' in str(exc_value):
+            exc_hint = 'disk error while accessing database'
+        else:
+            six.reraise(exc_type, exc_value, exc_traceback)
+
+        self.quarantine(exc_hint)
+
+    @contextmanager
+    def updated_timeout(self, new_timeout):
+        """Use with "with" statement; updates ``timeout`` within the block."""
+        old_timeout = self.timeout
+        try:
+            self.timeout = new_timeout
+            if self.conn:
+                self.conn.timeout = new_timeout
+            yield old_timeout
+        finally:
+            self.timeout = old_timeout
+            if self.conn:
+                self.conn.timeout = old_timeout
+
+    @contextmanager
+    def maybe_get(self, conn):
+        if conn:
+            yield conn
+        else:
+            with self.get() as conn:
+                yield conn
 
     @contextmanager
     def get(self):
@@ -460,6 +536,23 @@ class DatabaseBroker(object):
         with self.get() as conn:
             return self._is_deleted(conn)
 
+    def empty(self):
+        """
+        Check if the broker abstraction contains any undeleted records.
+        """
+        raise NotImplementedError()
+
+    def is_reclaimable(self, now, reclaim_age):
+        """
+        Check if the broker abstraction is empty, and has been marked deleted
+        for at least a reclaim age.
+        """
+        info = self.get_replication_info()
+        return (zero_like(info['count']) and
+                (Timestamp(now - reclaim_age) >
+                 Timestamp(info['delete_timestamp']) >
+                 Timestamp(info['put_timestamp'])))
+
     def merge_timestamps(self, created_at, put_timestamp, delete_timestamp):
         """
         Used in replication to handle updating timestamps.
@@ -476,7 +569,7 @@ class DatabaseBroker(object):
                                    delete_timestamp=MAX(?, delete_timestamp)
             ''' % self.db_type, (created_at, put_timestamp, delete_timestamp))
             if old_status != self._is_deleted(conn):
-                timestamp = Timestamp(time.time())
+                timestamp = Timestamp.now()
                 self._update_status_changed_at(conn, timestamp.internal)
 
             conn.commit()
@@ -531,13 +624,15 @@ class DatabaseBroker(object):
                 result.append({'remote_id': row[0], 'sync_point': row[1]})
             return result
 
-    def get_max_row(self):
+    def get_max_row(self, table=None):
+        if not table:
+            table = self.db_contains_type
         query = '''
             SELECT SQLITE_SEQUENCE.seq
             FROM SQLITE_SEQUENCE
             WHERE SQLITE_SEQUENCE.name == '%s'
             LIMIT 1
-        ''' % (self.db_contains_type)
+        ''' % (table, )
         with self.get() as conn:
             row = conn.execute(query).fetchone()
         return row[0] if row else -1
@@ -565,11 +660,26 @@ class DatabaseBroker(object):
             return curs.fetchone()
 
     def put_record(self, record):
-        if self.db_file == ':memory:':
+        """
+        Put a record into the DB. If the DB has an associated pending file with
+        space then the record is appended to that file and a commit to the DB
+        is deferred. If the DB is in-memory or its pending file is full then
+        the record will be committed immediately.
+
+        :param record: a record to be added to the DB.
+        :raises DatabaseConnectionError: if the DB file does not exist or if
+            ``skip_commits`` is True.
+        :raises LockTimeout: if a timeout occurs while waiting to take a lock
+            to write to the pending file.
+        """
+        if self._db_file == ':memory:':
             self.merge_items([record])
             return
         if not os.path.exists(self.db_file):
             raise DatabaseConnectionError(self.db_file, "DB doesn't exist")
+        if self.skip_commits:
+            raise DatabaseConnectionError(self.db_file,
+                                          'commits not accepted')
         with lock_parent_directory(self.pending_file, self.pending_timeout):
             pending_size = 0
             try:
@@ -583,11 +693,15 @@ class DatabaseBroker(object):
                 with open(self.pending_file, 'a+b') as fp:
                     # Colons aren't used in base64 encoding; so they are our
                     # delimiter
-                    fp.write(':')
-                    fp.write(pickle.dumps(
+                    fp.write(b':')
+                    fp.write(base64.b64encode(pickle.dumps(
                         self.make_tuple_for_pickle(record),
-                        protocol=PICKLE_PROTOCOL).encode('base64'))
+                        protocol=PICKLE_PROTOCOL)))
                     fp.flush()
+
+    def _skip_commit_puts(self):
+        return (self._db_file == ':memory:' or self.skip_commits or not
+                os.path.exists(self.pending_file))
 
     def _commit_puts(self, item_list=None):
         """
@@ -597,7 +711,13 @@ class DatabaseBroker(object):
 
         :param item_list: A list of items to commit in addition to .pending
         """
-        if self.db_file == ':memory:' or not os.path.exists(self.pending_file):
+        if self._skip_commit_puts():
+            if item_list:
+                # this broker instance should not be used to commit records,
+                # but if it is then raise an error rather than quietly
+                # discarding the records in item_list.
+                raise DatabaseConnectionError(self.db_file,
+                                              'commits not accepted')
             return
         if item_list is None:
             item_list = []
@@ -607,10 +727,11 @@ class DatabaseBroker(object):
                 self.merge_items(item_list)
             return
         with open(self.pending_file, 'r+b') as fp:
-            for entry in fp.read().split(':'):
+            for entry in fp.read().split(b':'):
                 if entry:
                     try:
-                        self._commit_puts_load(item_list, entry)
+                        data = pickle.loads(base64.b64decode(entry))
+                        self._commit_puts_load(item_list, data)
                     except Exception:
                         self.logger.exception(
                             _('Invalid pending entry %(file)s: %(entry)s'),
@@ -628,7 +749,7 @@ class DatabaseBroker(object):
         Catch failures of _commit_puts() if broker is intended for
         reading of stats, and thus does not care for pending updates.
         """
-        if self.db_file == ':memory:' or not os.path.exists(self.pending_file):
+        if self._skip_commit_puts():
             return
         try:
             with lock_parent_directory(self.pending_file,
@@ -640,9 +761,15 @@ class DatabaseBroker(object):
 
     def _commit_puts_load(self, item_list, entry):
         """
-        Unmarshall the :param:entry and append it to :param:item_list.
+        Unmarshall the :param:entry tuple and append it to :param:item_list.
         This is implemented by a particular broker to be compatible
         with its :func:`merge_items`.
+        """
+        raise NotImplementedError
+
+    def merge_items(self, item_list, source=None):
+        """
+        Save :param:item_list to the database.
         """
         raise NotImplementedError
 
@@ -684,7 +811,7 @@ class DatabaseBroker(object):
         within 512k of a boundary, it allocates to the next boundary.
         Boundaries are 2m, 5m, 10m, 25m, 50m, then every 50m after.
         """
-        if not DB_PREALLOCATION or self.db_file == ':memory:':
+        if not DB_PREALLOCATION or self._db_file == ':memory:':
             return
         MB = (1024 * 1024)
 
@@ -709,8 +836,12 @@ class DatabaseBroker(object):
     def get_raw_metadata(self):
         with self.get() as conn:
             try:
-                metadata = conn.execute('SELECT metadata FROM %s_stat' %
-                                        self.db_type).fetchone()[0]
+                row = conn.execute('SELECT metadata FROM %s_stat' %
+                                   self.db_type).fetchone()
+                if not row:
+                    self.quarantine("missing row in %s_stat table" %
+                                    self.db_type)
+                metadata = row[0]
             except sqlite3.OperationalError as err:
                 if 'no such column: metadata' not in str(err):
                     raise
@@ -727,7 +858,7 @@ class DatabaseBroker(object):
         metadata = self.get_raw_metadata()
         if metadata:
             metadata = json.loads(metadata)
-            utf8encodekeys(metadata)
+            native_str_keys(metadata)
         else:
             metadata = {}
         return metadata
@@ -738,25 +869,30 @@ class DatabaseBroker(object):
         Validates that metadata falls within acceptable limits.
 
         :param metadata: to be validated
-        :raises: HTTPBadRequest if MAX_META_COUNT or MAX_META_OVERALL_SIZE
+        :raises HTTPBadRequest: if MAX_META_COUNT or MAX_META_OVERALL_SIZE
                  is exceeded, or if metadata contains non-UTF-8 data
         """
         meta_count = 0
         meta_size = 0
         for key, (value, timestamp) in metadata.items():
+            if key and not isinstance(key, six.text_type):
+                if not check_utf8(key):
+                    raise HTTPBadRequest('Metadata must be valid UTF-8')
+                # Promote to a natural string for the checks below
+                if six.PY3:
+                    key = key.decode('utf8')
+            if value and not isinstance(value, six.text_type):
+                if not check_utf8(value):
+                    raise HTTPBadRequest('Metadata must be valid UTF-8')
             key = key.lower()
-            if value != '' and (key.startswith('x-account-meta') or
-                                key.startswith('x-container-meta')):
+            if value and key.startswith(('x-account-meta-',
+                                         'x-container-meta-')):
                 prefix = 'x-account-meta-'
                 if key.startswith('x-container-meta-'):
                     prefix = 'x-container-meta-'
                 key = key[len(prefix):]
                 meta_count = meta_count + 1
                 meta_size = meta_size + len(key) + len(value)
-            bad_key = key and not check_utf8(key)
-            bad_value = value and not check_utf8(value)
-            if bad_key or bad_value:
-                raise HTTPBadRequest('Metadata must be valid UTF-8')
         if meta_count > MAX_META_COUNT:
             raise HTTPBadRequest('Too many metadata items; max %d'
                                  % MAX_META_COUNT)
@@ -782,10 +918,14 @@ class DatabaseBroker(object):
                 return
         with self.get() as conn:
             try:
-                md = conn.execute('SELECT metadata FROM %s_stat' %
-                                  self.db_type).fetchone()[0]
+                row = conn.execute('SELECT metadata FROM %s_stat' %
+                                   self.db_type).fetchone()
+                if not row:
+                    self.quarantine("missing row in %s_stat table" %
+                                    self.db_type)
+                md = row[0]
                 md = json.loads(md) if md else {}
-                utf8encodekeys(md)
+                native_str_keys(md)
             except sqlite3.OperationalError as err:
                 if 'no such column: metadata' not in str(err):
                     raise
@@ -805,40 +945,46 @@ class DatabaseBroker(object):
 
     def reclaim(self, age_timestamp, sync_timestamp):
         """
-        Delete rows from the db_contains_type table that are marked deleted
-        and whose created_at timestamp is < age_timestamp.  Also deletes rows
-        from incoming_sync and outgoing_sync where the updated_at timestamp is
-        < sync_timestamp.
+        Delete reclaimable rows and metadata from the db.
 
-        In addition, this calls the DatabaseBroker's :func:`_reclaim` method.
+        By default this method will delete rows from the db_contains_type table
+        that are marked deleted and whose created_at timestamp is <
+        age_timestamp, and deletes rows from incoming_sync and outgoing_sync
+        where the updated_at timestamp is < sync_timestamp. In addition, this
+        calls the :meth:`_reclaim_metadata` method.
+
+        Subclasses may reclaim other items by overriding :meth:`_reclaim`.
 
         :param age_timestamp: max created_at timestamp of object rows to delete
         :param sync_timestamp: max update_at timestamp of sync rows to delete
         """
-        if self.db_file != ':memory:' and os.path.exists(self.pending_file):
+        if not self._skip_commit_puts():
             with lock_parent_directory(self.pending_file,
                                        self.pending_timeout):
                 self._commit_puts()
         with self.get() as conn:
-            conn.execute('''
-                DELETE FROM %s WHERE deleted = 1 AND %s < ?
-            ''' % (self.db_contains_type, self.db_reclaim_timestamp),
-                (age_timestamp,))
-            try:
-                conn.execute('''
-                    DELETE FROM outgoing_sync WHERE updated_at < ?
-                ''', (sync_timestamp,))
-                conn.execute('''
-                    DELETE FROM incoming_sync WHERE updated_at < ?
-                ''', (sync_timestamp,))
-            except sqlite3.OperationalError as err:
-                # Old dbs didn't have updated_at in the _sync tables.
-                if 'no such column: updated_at' not in str(err):
-                    raise
-            DatabaseBroker._reclaim(self, conn, age_timestamp)
+            self._reclaim(conn, age_timestamp, sync_timestamp)
+            self._reclaim_metadata(conn, age_timestamp)
             conn.commit()
 
-    def _reclaim(self, conn, timestamp):
+    def _reclaim(self, conn, age_timestamp, sync_timestamp):
+        conn.execute('''
+            DELETE FROM %s WHERE deleted = 1 AND %s < ?
+        ''' % (self.db_contains_type, self.db_reclaim_timestamp),
+            (age_timestamp,))
+        try:
+            conn.execute('''
+                DELETE FROM outgoing_sync WHERE updated_at < ?
+            ''', (sync_timestamp,))
+            conn.execute('''
+                DELETE FROM incoming_sync WHERE updated_at < ?
+            ''', (sync_timestamp,))
+        except sqlite3.OperationalError as err:
+            # Old dbs didn't have updated_at in the _sync tables.
+            if 'no such column: updated_at' not in str(err):
+                raise
+
+    def _reclaim_metadata(self, conn, timestamp):
         """
         Removes any empty metadata values older than the timestamp using the
         given database connection. This function will not call commit on the
@@ -852,8 +998,12 @@ class DatabaseBroker(object):
         :returns: True if conn.commit() should be called
         """
         try:
-            md = conn.execute('SELECT metadata FROM %s_stat' %
-                              self.db_type).fetchone()[0]
+            row = conn.execute('SELECT metadata FROM %s_stat' %
+                               self.db_type).fetchone()
+            if not row:
+                self.quarantine("missing row in %s_stat table" %
+                                self.db_type)
+            md = row[0]
             if md:
                 md = json.loads(md)
                 keys_to_delete = []

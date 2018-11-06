@@ -7,9 +7,9 @@
 # Pablo Caruana <pcaruana@redhat.com>, 2016. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: swift 2.9.1.dev6\n"
+"Project-Id-Version: swift VERSION\n"
 "Report-Msgid-Bugs-To: https://bugs.launchpad.net/openstack-i18n/\n"
-"POT-Creation-Date: 2016-07-19 04:02+0000\n"
+"POT-Creation-Date: 2018-08-25 00:41+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
@@ -18,7 +18,7 @@ msgstr ""
 "Language: es\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 "Generated-By: Babel 2.0\n"
-"X-Generator: Zanata 3.7.3\n"
+"X-Generator: Zanata 4.3.3\n"
 "Language-Team: Spanish\n"
 
 msgid ""
@@ -44,30 +44,8 @@ msgstr ""
 "sincronizados"
 
 #, python-format
-msgid "%(ip)s/%(device)s responded as unmounted"
-msgstr "%(ip)s/%(device)s han respondido como desmontados"
-
-#, python-format
-msgid "%(msg)s %(hdr)s: %(e)s"
-msgstr "%(msg)s %(hdr)s: %(e)s"
-
-#, python-format
 msgid "%(msg)s %(ip)s:%(port)s/%(device)s"
 msgstr "%(msg)s %(ip)s:%(port)s/%(device)s"
-
-#, python-format
-msgid "%(msg)s: %(err)s"
-msgstr "%(msg)s: %(err)s"
-
-#, python-format
-msgid ""
-"%(reconstructed)d/%(total)d (%(percentage).2f%%) partitions of %(device)d/"
-"%(dtotal)d (%(dpercentage).2f%%) devices reconstructed in %(time).2fs "
-"(%(rate).2f/sec, %(remaining)s remaining)"
-msgstr ""
-"%(reconstructed)d/%(total)d (%(percentage).2f%%) particiones de %(device)d/"
-"%(dtotal)d (%(dpercentage).2f%%) dispositivos reconstruidas en %(time).2fs "
-"(%(rate).2f/sec, %(remaining)s remaining)"
 
 #, python-format
 msgid ""
@@ -401,10 +379,6 @@ msgstr ""
 "hosts y dispositivos en la solicitud: %(hosts)s\" frente a %(devices)s\""
 
 #, python-format
-msgid "ERROR Bad response %(status)s from %(host)s"
-msgstr "ERROR Respuesta errónea %(status)s desde %(host)s"
-
-#, python-format
 msgid "ERROR Client read timeout (%ss)"
 msgstr "ERROR Tiempo de espera de lectura de cliente agotado (%ss)"
 
@@ -524,10 +498,6 @@ msgid "ERROR get_keys() missing callback"
 msgstr "ERROR get_keys() No se proporciona devolución de llamada "
 
 #, python-format
-msgid "ERROR get_keys(): from callback: %s"
-msgstr "ERROR get_keys() No se proporciona devolución de llamada: %s"
-
-#, python-format
 msgid "ERROR reading HTTP response from %s"
 msgstr "ERROR al leer la respuesta HTTP desde %s"
 
@@ -568,9 +538,6 @@ msgstr ""
 "ERROR: No se han podido obtener las vías de acceso a las particiones de "
 "unidad: %s"
 
-msgid "ERROR: An error occurred while retrieving segments"
-msgstr "ERROR: se ha producido un error al recuperar los segmentos"
-
 #, python-format
 msgid "ERROR: Unable to access %(path)s: %(error)s"
 msgstr "ERROR: no se ha podido acceder a %(path)s: %(error)s"
@@ -579,24 +546,12 @@ msgstr "ERROR: no se ha podido acceder a %(path)s: %(error)s"
 msgid "ERROR: Unable to run auditing: %s"
 msgstr "ERROR: no se ha podido ejecutar la auditoría: %s"
 
-#, python-format
-msgid "Error %(action)s to memcached: %(server)s"
-msgstr "%(action)s de error para memcached: %(server)s"
-
-#, python-format
-msgid "Error encoding to UTF-8: %s"
-msgstr "Error en la codificación a UTF-8: %s"
-
 msgid "Error hashing suffix"
 msgstr "Error en el hash del sufijo"
 
 #, python-format
 msgid "Error in %(conf)r with mtime_check_interval: %(error)s"
 msgstr "Error en %(conf)r  con mtime_check_interval: %(error)s"
-
-#, python-format
-msgid "Error limiting server %s"
-msgstr "Error al limitar el servidor %s"
 
 msgid "Error listing devices"
 msgstr "Error al mostrar los dispositivos"
@@ -645,25 +600,11 @@ msgstr "Error: falta el argumento de vía de acceso de configuración"
 msgid "Error: unable to locate %s"
 msgstr "Error: no se ha podido localizar %s"
 
-msgid "Exception dumping recon cache"
-msgstr "Excepción al volcar la memoria caché de recon"
-
 msgid "Exception in top-level account reaper loop"
 msgstr "Excepción en el bucle cosechador de cuenta de nivel superior"
 
-msgid "Exception in top-level replication loop"
-msgstr "Excepción en el bucle de réplica de nivel superior"
-
 msgid "Exception in top-levelreconstruction loop"
 msgstr "Excepción en el bucle de reconstrucción de nivel superior"
-
-#, python-format
-msgid "Exception while deleting container %(container)s %(err)s"
-msgstr "Excepción al suprimir el contenedor %(container)s %(err)s"
-
-#, python-format
-msgid "Exception while deleting object %(container)s %(obj)s %(err)s"
-msgstr "Excepción al suprimir el objeto %(container)s %(obj)s %(err)s"
 
 #, python-format
 msgid "Exception with %(ip)s:%(port)s/%(device)s"
@@ -889,24 +830,8 @@ msgstr ""
 "Los servidores de objeto han devuelvo %s etiquetas (etags) no coincidentes"
 
 #, python-format
-msgid ""
-"Object update single threaded sweep completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"Barrido de hebra única de actualización del objeto finalizado: "
-"%(elapsed).02fs, %(success)s éxitos, %(fail)s fallos"
-
-#, python-format
 msgid "Object update sweep completed: %.02fs"
 msgstr "Barrido de actualización del objeto finalizado: %.02fs"
-
-#, python-format
-msgid ""
-"Object update sweep of %(device)s completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"Barrido de actualización del objeto de %(device)s finalizado: "
-"%(elapsed).02fs, %(success)s con éxito, %(fail)s fallos"
 
 msgid "Params, queries, and fragments not allowed in X-Container-Sync-To"
 msgstr ""
@@ -916,14 +841,6 @@ msgstr ""
 msgid "Partition times: max %(max).4fs, min %(min).4fs, med %(med).4fs"
 msgstr ""
 "Tiempos de partición: máximo %(max).4fs, mínimo %(min).4fs, medio %(med).4fs"
-
-#, python-format
-msgid ""
-"Pass beginning; %(containers)s possible containers; %(objects)s possible "
-"objects"
-msgstr ""
-"Inicio del paso;  %(containers)s posibles contenedores; %(objects)s posibles "
-"objetos"
 
 #, python-format
 msgid "Pass completed in %(time)ds; %(objects)d objects expired"
@@ -945,18 +862,8 @@ msgid "Problem cleaning up %s"
 msgstr "Problema al limpiar %s"
 
 #, python-format
-msgid "Problem writing durable state file %(file)s (%(err)s)"
-msgstr ""
-"Problema al escribir en el archivo de estado durable %(file)s (%(err)s)"
-
-#, python-format
 msgid "Profiling Error: %s"
 msgstr "Error de perfil: %s"
-
-#, python-format
-msgid "Quarantined %(db_dir)s to %(quar_path)s due to %(exc_hint)s database"
-msgstr ""
-"En cuarentena%(db_dir)s hasta %(quar_path)s debido a %(exc_hint)s database"
 
 #, python-format
 msgid "Quarantined %(hsh_path)s to %(quar_path)s because it is not a directory"
@@ -1067,14 +974,6 @@ msgstr ""
 "%(fail)s han fallado la auditoría"
 
 #, python-format
-msgid "Skipping %(device)s as it is not mounted"
-msgstr "Omitiendo %(device)s, ya que no está montado"
-
-#, python-format
-msgid "Skipping %(dir)s: %(err)s"
-msgstr "Omitiendo %(dir)s: %(err)s"
-
-#, python-format
 msgid "Skipping %s as it is not mounted"
 msgstr "Omitiendo %s, ya que no está montado"
 
@@ -1109,10 +1008,6 @@ msgid ""
 msgstr ""
 "El total de %(key)s del contenedor (%(total)s) no coincide con la suma de "
 "%(key)s en las políticas (%(sum)s)"
-
-#, python-format
-msgid "Timeout %(action)s to memcached: %(server)s"
-msgstr "%(action)s de tiempo de espera para memcached: %(server)s"
 
 #, python-format
 msgid "Timeout Exception with %(ip)s:%(port)s/%(device)s"
@@ -1190,10 +1085,6 @@ msgstr "No se ha podido leer la configuración de %s"
 #, python-format
 msgid "Unauth %(sync_from)r => %(sync_to)r"
 msgstr "%(sync_from)r => %(sync_to)r sin autorización"
-
-#, python-format
-msgid "Unexpected response: %s"
-msgstr "Respuesta inesperada : %s "
 
 msgid "Unhandled exception"
 msgstr "Excepción no controlada"

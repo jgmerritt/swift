@@ -14,6 +14,7 @@
       License for the specific language governing permissions and limitations
       under the License.
 
+=================================
 Welcome to Swift's documentation!
 =================================
 
@@ -61,7 +62,9 @@ Overview and Concepts
     overview_erasure_code
     overview_encryption
     overview_backing_store
+    overview_container_sharding
     ring_background
+    ring_partpower
     associated_projects
 
 Developer Documentation
@@ -91,6 +94,8 @@ Administrator Documentation
     replication_network
     logs
     ops_runbook/index
+    admin/index
+    install/index
 
 Object Storage v1 REST API Documentation
 ========================================
@@ -112,6 +117,20 @@ The following provides supporting information for the REST API:
     api/form_post_middleware.rst
     api/use_content-encoding_metadata.rst
     api/use_the_content-disposition_metadata.rst
+    api/pseudo-hierarchical-folders-directories.rst
+    api/pagination.rst
+    api/serialized-response-formats.rst
+    api/static-website.rst
+    api/object-expiration.rst
+    api/bulk-delete.rst
+
+S3 Compatibility Info
+=====================
+
+.. toctree::
+    :maxdepth: 1
+
+    s3_compat
 
 OpenStack End User Guide
 ========================

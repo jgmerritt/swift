@@ -6,20 +6,20 @@
 # Andreas Jaeger <jaegerandi@gmail.com>, 2016. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: swift 2.9.1.dev6\n"
+"Project-Id-Version: swift VERSION\n"
 "Report-Msgid-Bugs-To: https://bugs.launchpad.net/openstack-i18n/\n"
-"POT-Creation-Date: 2016-07-19 04:02+0000\n"
+"POT-Creation-Date: 2018-08-09 00:12+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"PO-Revision-Date: 2016-03-27 11:17+0000\n"
-"Last-Translator: Ilya Alekseyev <ilyaalekseyev@acm.org>\n"
+"PO-Revision-Date: 2016-04-12 06:43+0000\n"
+"Last-Translator: Copied by Zanata <copied-by-zanata@zanata.org>\n"
 "Language: ru\n"
 "Plural-Forms: nplurals=4; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n"
 "%10<=4 && (n%100<12 || n%100>14) ? 1 : n%10==0 || (n%10>=5 && n%10<=9) || (n"
 "%100>=11 && n%100<=14)? 2 : 3);\n"
 "Generated-By: Babel 2.0\n"
-"X-Generator: Zanata 3.7.3\n"
+"X-Generator: Zanata 4.3.3\n"
 "Language-Team: Russian\n"
 
 msgid ""
@@ -45,22 +45,8 @@ msgstr ""
 "синхронизировано: %(synced).2f%%"
 
 #, python-format
-msgid "%(ip)s/%(device)s responded as unmounted"
-msgstr "Ответили как размонтированные: %(ip)s/%(device)s"
-
-#, python-format
 msgid "%(msg)s %(ip)s:%(port)s/%(device)s"
 msgstr "%(msg)s %(ip)s:%(port)s/%(device)s"
-
-#, python-format
-msgid ""
-"%(reconstructed)d/%(total)d (%(percentage).2f%%) partitions of %(device)d/"
-"%(dtotal)d (%(dpercentage).2f%%) devices reconstructed in %(time).2fs "
-"(%(rate).2f/sec, %(remaining)s remaining)"
-msgstr ""
-"Реконструированно разделов: %(reconstructed)d/%(total)d (%(percentage).2f%%) "
-"partitions of %(device)d/%(dtotal)d (%(dpercentage).2f%%) за время "
-"%(time).2fs (%(rate).2f/sec, осталось: %(remaining)s)"
 
 #, python-format
 msgid ""
@@ -298,10 +284,6 @@ msgstr ""
 "%(device)s (операция будет повторена позднее): Ответ: %(status)s %(reason)s"
 
 #, python-format
-msgid "ERROR Bad response %(status)s from %(host)s"
-msgstr "Ошибка: Неправильный запрос %(status)s из %(host)s"
-
-#, python-format
 msgid "ERROR Client read timeout (%ss)"
 msgstr "Ошибка: тайм-аут чтения клиента (%ss)"
 
@@ -450,9 +432,6 @@ msgstr "Ошибка с удаленным сервером %(ip)s:%(port)s/%(de
 msgid "ERROR:  Failed to get paths to drive partitions: %s"
 msgstr "Ошибка:  не удалось получить пути к разделам накопителей: %s"
 
-msgid "ERROR: An error occurred while retrieving segments"
-msgstr "Ошибка: ошибка при извлечении сегментов"
-
 #, python-format
 msgid "ERROR: Unable to access %(path)s: %(error)s"
 msgstr "Ошибка: не удалось получить доступ к %(path)s: %(error)s"
@@ -461,20 +440,8 @@ msgstr "Ошибка: не удалось получить доступ к %(pat
 msgid "ERROR: Unable to run auditing: %s"
 msgstr "Ошибка: не удалось запустить процесс контроля: %s"
 
-#, python-format
-msgid "Error %(action)s to memcached: %(server)s"
-msgstr "Ошибка действия %(action)s для сохранения в кэш памяти: %(server)s"
-
-#, python-format
-msgid "Error encoding to UTF-8: %s"
-msgstr "Ошибка кодирования в UTF-8: %s"
-
 msgid "Error hashing suffix"
 msgstr "Ошибка хэширования суффикса"
-
-#, python-format
-msgid "Error limiting server %s"
-msgstr "Ошибка ограничения сервера %s"
 
 msgid "Error listing devices"
 msgstr "Ошибка при выводе списка устройств"
@@ -524,15 +491,9 @@ msgstr "Ошибка: отсутствует аргумент пути конф�
 msgid "Error: unable to locate %s"
 msgstr "Ошибка: не удалось найти %s"
 
-msgid "Exception dumping recon cache"
-msgstr "Исключительная ситуация при создании кэша recon"
-
 msgid "Exception in top-level account reaper loop"
 msgstr ""
 "Исключительная ситуация в цикле чистильщика учетных записей верхнего уровня"
-
-msgid "Exception in top-level replication loop"
-msgstr "Исключительная ситуация в цикле репликации верхнего уровня"
 
 msgid "Exception in top-levelreconstruction loop"
 msgstr "Исключение в цикле реконструкции верхнего уровня"
@@ -725,24 +686,8 @@ msgid "Object servers returned %s mismatched etags"
 msgstr "Серверы объектов вернули несоответствующие etag: %s"
 
 #, python-format
-msgid ""
-"Object update single threaded sweep completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"Сплошная однонитевая проверка обновлений объекта завершена: %(elapsed).02fs, "
-"%(success)s успешно, %(fail)s с ошибками"
-
-#, python-format
 msgid "Object update sweep completed: %.02fs"
 msgstr "Сплошная проверка обновлений объекта завершена: %.02fs"
-
-#, python-format
-msgid ""
-"Object update sweep of %(device)s completed: %(elapsed).02fs, %(success)s "
-"successes, %(fail)s failures"
-msgstr ""
-"Сплошная проверка обновлений объекта на устройстве %(device)s завершена: "
-"%(elapsed).02fs, успешно: %(success)s, ошибка: %(fail)s"
 
 msgid "Params, queries, and fragments not allowed in X-Container-Sync-To"
 msgstr "В X-Container-Sync-To не разрешены параметры, запросы и фрагменты"
@@ -870,10 +815,6 @@ msgstr ""
 "ошибками: %(fail)s "
 
 #, python-format
-msgid "Skipping %(device)s as it is not mounted"
-msgstr "%(device)s будет пропущен, так как он не смонтирован"
-
-#, python-format
 msgid "Skipping %s as it is not mounted"
 msgstr "%s будет пропущен, так как он не смонтирован"
 
@@ -907,10 +848,6 @@ msgid ""
 msgstr ""
 "Общее число %(key)s для контейнера (%(total)s) не соответствует сумме "
 "%(key)s в стратегиях (%(sum)s)"
-
-#, python-format
-msgid "Timeout %(action)s to memcached: %(server)s"
-msgstr "Тайм-аут действия %(action)s для сохранения в кэш памяти: %(server)s"
 
 #, python-format
 msgid "Timeout Exception with %(ip)s:%(port)s/%(device)s"
@@ -964,10 +901,6 @@ msgstr "Не удалось прочитать конфигурацию из %s"
 #, python-format
 msgid "Unauth %(sync_from)r => %(sync_to)r"
 msgstr "Синхронизация %(sync_from)r => %(sync_to)r без прав доступа"
-
-#, python-format
-msgid "Unexpected response: %s"
-msgstr "Непредвиденный ответ: %s"
 
 msgid "Unhandled exception"
 msgstr "Необработанная исключительная ситуация"

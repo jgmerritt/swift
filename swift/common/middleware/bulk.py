@@ -205,6 +205,7 @@ from swift.common.utils import get_logger, register_swift_info, \
     StreamingPile
 from swift.common import constraints
 from swift.common.http import HTTP_UNAUTHORIZED, HTTP_NOT_FOUND, HTTP_CONFLICT
+from swift.common.wsgi import make_subrequest
 
 
 class CreateContainerError(Exception):
@@ -218,40 +219,48 @@ ACCEPTABLE_FORMATS = ['text/plain', 'application/json', 'application/xml',
                       'text/xml']
 
 
-def get_response_body(data_format, data_dict, error_list):
+def get_response_body(data_format, data_dict, error_list, root_tag):
     """
-    Returns a properly formatted response body according to format. Handles
-    json and xml, otherwise will return text/plain. Note: xml response does not
-    include xml declaration.
+    Returns a properly formatted response body according to format.
+
+    Handles json and xml, otherwise will return text/plain.
+    Note: xml response does not include xml declaration.
+
     :params data_format: resulting format
     :params data_dict: generated data about results.
     :params error_list: list of quoted filenames that failed
+    :params root_tag: the tag name to use for root elements when returning XML;
+                      e.g. 'extract' or 'delete'
     """
     if data_format == 'application/json':
         data_dict['Errors'] = error_list
         return json.dumps(data_dict)
     if data_format and data_format.endswith('/xml'):
-        output = '<delete>\n'
+        output = ['<', root_tag, '>\n']
         for key in sorted(data_dict):
             xml_key = key.replace(' ', '_').lower()
-            output += '<%s>%s</%s>\n' % (xml_key, data_dict[key], xml_key)
-        output += '<errors>\n'
-        output += '\n'.join(
-            ['<object>'
-             '<name>%s</name><status>%s</status>'
-             '</object>' % (saxutils.escape(name), status) for
-             name, status in error_list])
-        output += '</errors>\n</delete>\n'
-        return output
+            output.extend([
+                '<', xml_key, '>',
+                saxutils.escape(str(data_dict[key])),
+                '</', xml_key, '>\n',
+            ])
+        output.append('<errors>\n')
+        for name, status in error_list:
+            output.extend([
+                '<object><name>', saxutils.escape(name), '</name><status>',
+                saxutils.escape(status), '</status></object>\n',
+            ])
+        output.extend(['</errors>\n</', root_tag, '>\n'])
+        return ''.join(output)
 
-    output = ''
+    output = []
     for key in sorted(data_dict):
-        output += '%s: %s\n' % (key, data_dict[key])
-    output += 'Errors:\n'
-    output += '\n'.join(
-        ['%s, %s' % (name, status)
-         for name, status in error_list])
-    return output
+        output.append('%s: %s\n' % (key, data_dict[key]))
+    output.append('Errors:\n')
+    output.extend(
+        '%s, %s\n' % (name, status)
+        for name, status in error_list)
+    return ''.join(output)
 
 
 def pax_key_to_swift_header(pax_key):
@@ -296,22 +305,20 @@ class Bulk(object):
         Checks if the container exists and if not try to create it.
         :params container_path: an unquoted path to a container to be created
         :returns: True if created container, False if container exists
-        :raises: CreateContainerError when unable to create container
+        :raises CreateContainerError: when unable to create container
         """
-        new_env = req.environ.copy()
-        new_env['PATH_INFO'] = container_path
-        new_env['swift.source'] = 'EA'
-        new_env['REQUEST_METHOD'] = 'HEAD'
-        head_cont_req = Request.blank(container_path, environ=new_env)
+        head_cont_req = make_subrequest(
+            req.environ, method='HEAD', path=quote(container_path),
+            headers={'X-Auth-Token': req.headers.get('X-Auth-Token')},
+            swift_source='EA')
         resp = head_cont_req.get_response(self.app)
         if resp.is_success:
             return False
-        if resp.status_int == 404:
-            new_env = req.environ.copy()
-            new_env['PATH_INFO'] = container_path
-            new_env['swift.source'] = 'EA'
-            new_env['REQUEST_METHOD'] = 'PUT'
-            create_cont_req = Request.blank(container_path, environ=new_env)
+        if resp.status_int == HTTP_NOT_FOUND:
+            create_cont_req = make_subrequest(
+                req.environ, method='PUT', path=quote(container_path),
+                headers={'X-Auth-Token': req.headers.get('X-Auth-Token')},
+                swift_source='EA')
             resp = create_cont_req.get_response(self.app)
             if resp.is_success:
                 return True
@@ -324,7 +331,7 @@ class Bulk(object):
         Will populate objs_to_delete with data from request input.
         :params req: a Swob request
         :returns: a list of the contents of req.body when separated by newline.
-        :raises: HTTPException on failures
+        :raises HTTPException: on failures
         """
         line = ''
         data_remaining = True
@@ -379,6 +386,7 @@ class Bulk(object):
                      'Response Body': '',
                      'Number Deleted': 0,
                      'Number Not Found': 0}
+        req.environ['eventlet.minimum_write_chunk_size'] = 0
         try:
             if not out_content_type:
                 raise HTTPNotAcceptable(request=req)
@@ -399,7 +407,6 @@ class Bulk(object):
             if objs_to_delete is None:
                 objs_to_delete = self.get_objs_to_delete(req)
             failed_file_response = {'type': HTTPBadRequest}
-            req.environ['eventlet.minimum_write_chunk_size'] = 0
 
             def delete_filter(predicate, objs_to_delete):
                 for obj_to_delete in objs_to_delete:
@@ -433,15 +440,11 @@ class Bulk(object):
                                     objs_to_delete)
 
             def do_delete(obj_name, delete_path):
-                new_env = req.environ.copy()
-                new_env['PATH_INFO'] = delete_path
-                del(new_env['wsgi.input'])
-                new_env['CONTENT_LENGTH'] = 0
-                new_env['REQUEST_METHOD'] = 'DELETE'
-                new_env['HTTP_USER_AGENT'] = '%s %s' % (
-                    req.environ.get('HTTP_USER_AGENT'), user_agent)
-                new_env['swift.source'] = swift_source
-                delete_obj_req = Request.blank(delete_path, new_env)
+                delete_obj_req = make_subrequest(
+                    req.environ, method='DELETE', path=quote(delete_path),
+                    headers={'X-Auth-Token': req.headers.get('X-Auth-Token')},
+                    body='', agent='%(orig)s ' + user_agent,
+                    swift_source=swift_source)
                 return (delete_obj_req.get_response(self.app), obj_name, 0)
 
             with StreamingPile(self.delete_concurrency) as pile:
@@ -485,7 +488,7 @@ class Bulk(object):
             resp_dict['Response Status'] = HTTPServerError().status
 
         yield separator + get_response_body(out_content_type,
-                                            resp_dict, failed_files)
+                                            resp_dict, failed_files, 'delete')
 
     def handle_extract_iter(self, req, compress_type,
                             out_content_type='text/plain'):
@@ -507,6 +510,7 @@ class Bulk(object):
         last_yield = time()
         separator = ''
         containers_accessed = set()
+        req.environ['eventlet.minimum_write_chunk_size'] = 0
         try:
             if not out_content_type:
                 raise HTTPNotAcceptable(request=req)
@@ -526,7 +530,6 @@ class Bulk(object):
             tar = tarfile.open(mode='r|' + compress_type,
                                fileobj=req.body_file)
             failed_response_type = HTTPBadRequest
-            req.environ['eventlet.minimum_write_chunk_size'] = 0
             containers_created = 0
             while True:
                 if last_yield + self.yield_frequency < time():
@@ -585,15 +588,16 @@ class Bulk(object):
                             continue
 
                     tar_file = tar.extractfile(tar_info)
-                    new_env = req.environ.copy()
-                    new_env['REQUEST_METHOD'] = 'PUT'
-                    new_env['wsgi.input'] = tar_file
-                    new_env['PATH_INFO'] = destination
-                    new_env['CONTENT_LENGTH'] = tar_info.size
-                    new_env['swift.source'] = 'EA'
-                    new_env['HTTP_USER_AGENT'] = \
-                        '%s BulkExpand' % req.environ.get('HTTP_USER_AGENT')
-                    create_obj_req = Request.blank(destination, new_env)
+                    create_headers = {
+                        'Content-Length': tar_info.size,
+                        'X-Auth-Token': req.headers.get('X-Auth-Token'),
+                    }
+
+                    create_obj_req = make_subrequest(
+                        req.environ, method='PUT', path=quote(destination),
+                        headers=create_headers,
+                        agent='%(orig)s BulkExpand', swift_source='EA')
+                    create_obj_req.environ['wsgi.input'] = tar_file
 
                     for pax_key, pax_value in tar_info.pax_headers.items():
                         header_name = pax_key_to_swift_header(pax_key)
@@ -639,7 +643,7 @@ class Bulk(object):
             resp_dict['Response Status'] = HTTPServerError().status
 
         yield separator + get_response_body(
-            out_content_type, resp_dict, failed_files)
+            out_content_type, resp_dict, failed_files, 'extract')
 
     def _process_delete(self, resp, pile, obj_name, resp_dict,
                         failed_files, failed_file_response, retry=0):
@@ -675,7 +679,11 @@ class Bulk(object):
                 'tar.bz2': 'bz2'}.get(extract_type.lower().strip('.'))
             if archive_type is not None:
                 resp = HTTPOk(request=req)
-                out_content_type = req.accept.best_match(ACCEPTABLE_FORMATS)
+                try:
+                    out_content_type = req.accept.best_match(
+                        ACCEPTABLE_FORMATS)
+                except ValueError:
+                    out_content_type = None  # Ignore invalid header
                 if out_content_type:
                     resp.content_type = out_content_type
                 resp.app_iter = self.handle_extract_iter(
@@ -684,7 +692,10 @@ class Bulk(object):
                 resp = HTTPBadRequest("Unsupported archive format")
         if 'bulk-delete' in req.params and req.method in ['POST', 'DELETE']:
             resp = HTTPOk(request=req)
-            out_content_type = req.accept.best_match(ACCEPTABLE_FORMATS)
+            try:
+                out_content_type = req.accept.best_match(ACCEPTABLE_FORMATS)
+            except ValueError:
+                out_content_type = None  # Ignore invalid header
             if out_content_type:
                 resp.content_type = out_content_type
             resp.app_iter = self.handle_delete_iter(

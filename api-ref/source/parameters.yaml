@@ -152,18 +152,21 @@ ETag_obj_copied:
 ETag_obj_received:
   description: |
     The MD5 checksum of the uploaded object content.
-    The value is not quoted.
+    The value is not quoted. If it is an SLO, it would
+    be MD5 checksum of the segments' etags.
   in: header
   required: true
   type: string
 ETag_obj_req:
   description: |
     The MD5 checksum value of the request body. For
-    example, the MD5 checksum value of the object content. You are
-    strongly recommended to compute the MD5 checksum value of object
-    content and include it in the request. This enables the Object
-    Storage API to check the integrity of the upload. The value is not
-    quoted.
+    example, the MD5 checksum value of the object content. For
+    manifest objects, this value is the MD5 checksum of the
+    concatenated string of ETag values for each of the segments in
+    the manifest. You are strongly recommended to compute
+    the MD5 checksum value and include it in the request. This
+    enables the Object Storage API to check the integrity of the
+    upload. The value is not quoted.
   in: header
   required: false
   type: string
@@ -172,7 +175,7 @@ ETag_obj_resp:
     For objects smaller than 5 GB, this value is the
     MD5 checksum of the object content. The value is not quoted.  For
     manifest objects, this value is the MD5 checksum of the
-    concatenated string of MD5 checksums and ETags for each of the
+    concatenated string of ETag values for each of the
     segments in the manifest, and not the MD5 checksum of the content
     that was downloaded. Also the value is enclosed in double-quote
     characters.  You are strongly recommended to compute the MD5
@@ -277,7 +280,7 @@ X-Account-Access-Control_req:
     Sets an account access control list (ACL) that grants access to
     containers and objects in the account.
     See `Account ACLs
-    <http://docs.openstack.org/developer/swift/overview_acl.html#account-acls>`_
+    <https://docs.openstack.org/swift/latest/overview_acl.html#account-acls>`_
     for more information.
   in: header
   required: false
@@ -290,7 +293,7 @@ X-Account-Access-Control_resp:
     containers and objects in the account.
     If there is no ACL, this header is not returned by this operation.
     See `Account ACLs
-    <http://docs.openstack.org/developer/swift/overview_acl.html#account-acls>`_
+    <https://docs.openstack.org/swift/latest/overview_acl.html#account-acls>`_
     for more information.
   in: header
   required: false
@@ -431,7 +434,7 @@ X-Container-Meta-Access-Control-Expose-Headers:
     request response, separated by spaces.  By default the Object
     Storage service returns the following headers:
 
-    - All “simple response headers” as listed on
+    - All "simple response headers" as listed on
       `http://www.w3.org/TR/cors/#simple-response-header
       <http://www.w3.org/TR/cors/#simple-response-header>`_.
     - The headers ``etag``, ``x-timestamp``, ``x-trans-id``,
@@ -477,7 +480,7 @@ X-Container-Meta-Quota-Bytes:
     exceeds this quota value.
     This value does not take effect immediately. see
     `Container Quotas
-    <http://docs.openstack.org/developer/swift/api/container_quotas.html>`_
+    <https://docs.openstack.org/swift/latest/api/container_quotas.html>`_
     for more information.
   in: header
   required: false
@@ -497,7 +500,7 @@ X-Container-Meta-Quota-Count:
     exceeds this quota value.
     This value does not take effect immediately. see
     `Container Quotas
-    <http://docs.openstack.org/developer/swift/api/container_quotas.html>`_
+    <https://docs.openstack.org/swift/latest/api/container_quotas.html>`_
     for more information.
   in: header
   required: false
@@ -565,7 +568,7 @@ X-Container-Read:
 
     The format and scope of the ACL is dependent on the authorization system
     used by the Object Storage service. See `Container ACLs
-    <http://docs.openstack.org/developer/swift/overview_acl.html#container-acls>`_
+    <https://docs.openstack.org/swift/latest/overview_acl.html#container-acls>`_
     for more information.
   in: header
   required: false
@@ -575,7 +578,7 @@ X-Container-Read_resp:
     The ACL that grants read access. If there is no ACL, this
     header is not returned by this operation.
     See `Container ACLs
-    <http://docs.openstack.org/developer/swift/overview_acl.html#container-acls>`_
+    <https://docs.openstack.org/swift/latest/overview_acl.html#container-acls>`_
     for more information.
   in: header
   required: false
@@ -586,8 +589,7 @@ X-Container-Sync-Key:
     synchronization. If you remove the secret key, synchronization is
     halted.
     For more information, see `Container to Container Synchronization
-    <http://docs.openstack.org/developer/swift/overview_
-    container_sync.html>`_
+    <https://docs.openstack.org/swift/latest/overview_container_sync.html>`_
   in: header
   required: false
   type: string
@@ -625,7 +627,7 @@ X-Container-Write:
 
     The format of the ACL is dependent on the authorization system
     used by the Object Storage service.  See `Container ACLs
-    <http://docs.openstack.org/developer/swift/overview_acl.html#container-acls>`_
+    <https://docs.openstack.org/swift/latest/overview_acl.html#container-acls>`_
     for more information.
 
   in: header
@@ -636,7 +638,7 @@ X-Container-Write_resp:
     The ACL that grants write access. If there is no ACL,
     this header is not returned by this operation.
     See `Container ACLs
-    <http://docs.openstack.org/developer/swift/overview_acl.html#container-acls>`_
+    <https://docs.openstack.org/swift/latest/overview_acl.html#container-acls>`_
     for more information.
   in: header
   required: false
@@ -680,20 +682,41 @@ X-Copy-From:
   in: header
   required: false
   type: string
+X-Copy-From-Account:
+  description: |
+    Specifies the account name where the object is copied from. If not
+    specified, the object is copied from the account which owns the new
+    object (i.e., the account in the path).
+  in: header
+  required: false
+  type: string
 X-Delete-After:
   description: |
-    The number of seconds after which the system
-    removes the object. Internally, the Object Storage system stores
-    this value in the ``X-Delete-At`` metadata item.
+    The number of seconds after which the system removes the object. The value
+    should be a positive integer. Internally, the Object Storage system uses
+    this value to generate an ``X-Delete-At`` metadata item. If both
+    ``X-Delete-After`` and ``X-Delete-At`` are set then ``X-Delete-After``
+    takes precedence.
   in: header
   required: false
   type: integer
 X-Delete-At:
   description: |
-    The date and time in `UNIX Epoch time stamp
-    format <https://en.wikipedia.org/wiki/Unix_time>`_ when the system
-    removes the object.  For example, ``1440619048`` is equivalent to
-    ``Mon, Wed, 26 Aug 2015 19:57:28 GMT``.
+    The date and time in `UNIX Epoch time stamp format
+    <https://en.wikipedia.org/wiki/Unix_time>`_ when the system removes the
+    object.  For example, ``1440619048`` is equivalent to ``Mon, Wed, 26 Aug
+    2015 19:57:28 GMT``.  The value should be a positive integer corresponding
+    to a time in the future. If both ``X-Delete-After`` and ``X-Delete-At`` are
+    set then ``X-Delete-After`` takes precedence.
+  in: header
+  required: false
+  type: integer
+X-Delete-At_resp:
+  description: |
+    If present, specifies date and time in `UNIX Epoch time stamp format
+    <https://en.wikipedia.org/wiki/Unix_time>`_ when the system removes the
+    object.  For example, ``1440619048`` is equivalent to ``Mon, Wed, 26 Aug
+    2015 19:57:28 GMT``.
   in: header
   required: false
   type: integer
@@ -720,17 +743,16 @@ X-History-Location:
     is set, versioning is disabled for this container. ``X-History-Location``
     and ``X-Versions-Location`` cannot both be set at the same time. For more
     information about object versioning, see `Object versioning
-    <http://docs.openstack.org/ developer/swift/api/object_versioning.html>`_.
+    <https://docs.openstack.org/swift/latest/api/object_versioning.html>`_.
   in: header
   required: false
   type: string
 X-History-Location_resp:
   description: |
     If present, this container has versioning enabled and the value
-    is the UTF-8 encoded name of another container.
-    For more information about object versioning,
-    see `Object versioning <http://docs.openstack.org/developer/
-    swift/api/object_versioning.html>`_.
+    is the UTF-8 encoded name of another container. For more information
+    about object versioning, see `Object versioning
+    <https://docs.openstack.org/swift/latest/api/object_versioning.html>`_.
   in: header
   required: false
   type: string
@@ -821,7 +843,7 @@ X-Remove-Versions-Location:
 X-Service-Token:
   description: |
     A service token. See `OpenStack Service Using Composite Tokens
-    <http://docs.openstack.org/developer/swift/overview_auth.html#openstack-
+    <https://docs.openstack.org/swift/latest/overview_auth.html#openstack-
     service-using-composite-tokens>`_ for more information.
   in: header
   required: false
@@ -838,6 +860,44 @@ X-Storage-Policy:
     In requests, specifies the name of the storage policy to use for
     the container. In responses, is the storage policy name.
     The storage policy of the container cannot be changed.
+  in: header
+  required: false
+  type: string
+X-Symlink-Target:
+  description: |
+    Set to specify that this is a symlink object.
+    The value is the relative path of the target object in the
+    format <container>/<object>.  The target object does not need to
+    exist at the time of symlink creation.
+    You must UTF-8-encode and then URL-encode the names of the
+    container and object before you include them in this header.
+  in: header
+  required: false
+  type: string
+X-Symlink-Target-Account:
+  description: |
+    Set to specify that this is a cross-account symlink to
+    an object in the account specified in the value.
+    The ``X-Symlink-Target`` must also be set for this to
+    be effective.
+    You must UTF-8-encode and then URL-encode the account name
+    before you include it in this header.
+  in: header
+  required: false
+  type: string
+X-Symlink-Target-Account_resp:
+  description: |
+    If present, and ``X-Symlink-Target`` is present, then
+    this is a cross-account symlink to
+    an object in the account specified in the value.
+  in: header
+  required: false
+  type: string
+X-Symlink-Target_resp:
+  description: |
+    If present, this is a symlink object.
+    The value is the relative path of the target object in the
+    format <container>/<object>.
   in: header
   required: false
   type: string
@@ -870,7 +930,7 @@ X-Trans-Id-Extra:
     extra transaction information before you include it in the
     ``X-Trans-Id-Extra`` request header.  For example, you can include
     extra transaction information when you upload `large objects
-    <http://docs.openstack.org/developer/swift/api/large_objects.html>`_
+    <https://docs.openstack.org/swift/latest/api/large_objects.html>`_
     such as images. When
     you upload each segment and the manifest, include the same value
     in the ``X-Trans-Id-Extra`` request header. If an error occurs,
@@ -889,17 +949,16 @@ X-Versions-Location:
     is set, versioning is disabled for this container. ``X-Versions-Location``
     and ``X-History-Location`` cannot both be set at the same time. For more
     information about object versioning, see `Object versioning
-    <http://docs.openstack.org/ developer/swift/api/object_versioning.html>`_.
+    <https://docs.openstack.org/swift/latest/api/object_versioning.html>`_.
   in: header
   required: false
   type: string
 X-Versions-Location_resp:
   description: |
     If present, this container has versioning enabled and the value
-    is the UTF-8 encoded name of another container.
-    For more information about object versioning,
-    see `Object versioning <http://docs.openstack.org/developer/
-    swift/api/object_versioning.html>`_.
+    is the UTF-8 encoded name of another container. For more information
+    about object versioning, see `Object versioning
+    <https://docs.openstack.org/swift/latest/api/object_versioning.html>`_.
   in: header
   required: false
   type: string
@@ -937,25 +996,24 @@ bulk-delete:
     When the ``bulk-delete`` query parameter is present in the POST
     request, multiple objects or containers can be deleted
     with a single request. See `Bulk Delete
-    <http://docs.openstack.org/developer/swift/middleware.html?highlight=
-    bulk#bulk-delete>`_ for how this feature is used.
+    <https://docs.openstack.org/swift/latest/middleware.html#bulk-delete>`_
+    for how this feature is used.
   in: query
   required: false
   type: string
 delimiter:
   description: |
-    Delimiter value, which returns the object names
-    that are nested in the container. If you do not set a prefix and
-    set the delimiter to "/" you may get unexpected results where all
-    the objects are returned instead of only those with the delimiter
-    set.
+    The delimiter is a single character used to split object
+    names to present a pseudo-directory hierarchy of objects. When combined
+    with a ``prefix`` query, this enables API users to simulate and
+    traverse the objects in a container as if they were in a directory tree.
   in: query
   required: false
   type: string
 end_marker:
   description: |
-    For a string value, x , returns container names
-    that are less than the marker value.
+    For a string value, `x` , constrains the list to items whose names
+    are less than `x`.
   in: query
   required: false
   type: string
@@ -964,8 +1022,8 @@ extract-archive:
     When the ``extract-archive`` query parameter is present in the POST
     request, an archive (tar file) is uploaded and extracted to
     create multiple objects. See `Extract Archive
-    <http://docs.openstack.org/developer/swift/middleware.html?highlight=
-    bulk#extract-archive>`_ for how this feature is used.
+    <https://docs.openstack.org/swift/latest/middleware.html#extract-archive>`_
+    for how this feature is used.
   in: query
   required: false
   type: string
@@ -977,8 +1035,7 @@ filename:
     ``Content-Disposition`` response header. Browsers can interpret
     this file name value as a file attachment to save. For more
     information about temporary URLs, see `Temporary URL middleware
-    <http://docs.openstack.org/developer/
-    swift/api/temporary_url_middleware.html>`_.
+    <https://docs.openstack.org/swift/latest/api/temporary_url_middleware.html>`_.
   in: query
   required: false
   type: string
@@ -1003,8 +1060,8 @@ limit:
   type: integer
 marker:
   description: |
-    For a string value, x , returns container names
-    that are greater than the marker value.
+    For a string value, `x` , constrains the list to items whose names
+    are greater than `x`.
   in: query
   required: false
   type: string
@@ -1058,14 +1115,16 @@ multipart-manifest_put:
 path:
   description: |
     For a string value, returns the object names that
-    are nested in the pseudo path.
+    are nested in the pseudo path. Please use ``prefix``/``delimiter``
+    queries instead of using this ``path`` query.
   in: query
   required: false
   type: string
 prefix:
   description: |
-    Prefix value. Named items in the response begin
-    with this value.
+    Only objects with this prefix will be returned. When combined with a
+    ``delimiter`` query, this enables API users to simulate and
+    traverse the objects in a container as if they were in a directory tree.
   in: query
   required: false
   type: string
@@ -1085,15 +1144,33 @@ swiftinfo_sig:
   in: query
   required: false
   type: string
+symlink:
+  description: |
+    If you include the ``symlink=get`` query parameter
+    and the object is a symlink, then the response will include
+    data and metadata from the symlink itself rather than from the target.
+  in: query
+  required: false
+  type: string
+symlink_copy:
+  description: |
+    If you include the ``symlink=get`` query parameter
+    and the object is a symlink, the target object
+    contents are not copied. Instead, the symlink is copied to
+    create a new symlink to the same target.
+  in: query
+  required: false
+  type: string
 temp_url_expires:
   description: |
     The date and time in `UNIX Epoch time stamp
-    format <https://en.wikipedia.org/wiki/Unix_time>`_ when the
-    signature for temporary URLs expires.  For example, ``1440619048``
+    format <https://en.wikipedia.org/wiki/Unix_time>`_ or
+    `ISO 8601 UTC timestamp <https://en.wikipedia.org/wiki/ISO_8601>`_
+    when the signature for temporary URLs expires.
+    For example, ``1440619048`` or ``2015-08-26T19:57:28Z``
     is equivalent to ``Mon, Wed, 26 Aug 2015 19:57:28 GMT``.  For more
     information about temporary URLs, see `Temporary URL middleware
-    <http://docs.openstack.org/developer/swift/api/temporary
-    _url_middleware.html>`_.
+    <https://docs.openstack.org/swift/latest/api/temporary_url_middleware.html>`_.
   in: query
   required: true
   type: integer
@@ -1104,17 +1181,23 @@ temp_url_sig:
     method, expiration date, full path to the object, and the secret
     key for the temporary URL. For more information about temporary
     URLs, see `Temporary URL middleware
-    <http://docs.openstack.org/developer/swif
-    t/api/temporary_url_middleware.html>`_.
+    <https://docs.openstack.org/swift/latest/api/temporary_url_middleware.html>`_.
   in: query
   required: true
   type: string
 
 # variables in body
-bytes:
+bytes_in_account_get:
   description: |
     The total number of bytes that are stored in
     Object Storage for the account.
+  in: body
+  required: true
+  type: integer
+bytes_in_container_get:
+  description: |
+    The total number of bytes that are stored in
+    Object Storage for the container.
   in: body
   required: true
   type: integer
@@ -1154,9 +1237,22 @@ last_modified:
   in: body
   required: true
   type: string
-name:
+name_in_account_get:
   description: |
     The name of the container.
+  in: body
+  required: true
+  type: string
+name_in_container_get:
+  description: |
+    The name of the object.
+  in: body
+  required: true
+  type: string
+symlink_path:
+  description: |
+    This field exists only when the object is symlink.
+    This is the target path of the symlink object.
   in: body
   required: true
   type: string

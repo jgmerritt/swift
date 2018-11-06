@@ -17,9 +17,14 @@
 
 from __future__ import print_function
 
+import base64
+import binascii
+import bisect
+import collections
 import errno
 import fcntl
 import grp
+import hashlib
 import hmac
 import json
 import math
@@ -27,6 +32,8 @@ import operator
 import os
 import pwd
 import re
+import string
+import struct
 import sys
 import time
 import uuid
@@ -41,42 +48,44 @@ import ctypes
 import ctypes.util
 from optparse import OptionParser
 
-from tempfile import mkstemp, NamedTemporaryFile
+from tempfile import gettempdir, mkstemp, NamedTemporaryFile
 import glob
 import itertools
 import stat
 import datetime
 
 import eventlet
+import eventlet.debug
+import eventlet.greenthread
+import eventlet.patcher
 import eventlet.semaphore
-from eventlet import GreenPool, sleep, Timeout, tpool
+import pkg_resources
+from eventlet import GreenPool, sleep, Timeout
 from eventlet.green import socket, threading
+from eventlet.hubs import trampoline
 import eventlet.queue
 import netifaces
 import codecs
 utf8_decoder = codecs.getdecoder('utf-8')
 utf8_encoder = codecs.getencoder('utf-8')
 import six
+if not six.PY2:
+    utf16_decoder = codecs.getdecoder('utf-16')
+    utf16_encoder = codecs.getencoder('utf-16')
 from six.moves import cPickle as pickle
 from six.moves.configparser import (ConfigParser, NoSectionError,
                                     NoOptionError, RawConfigParser)
-from six.moves import range
+from six.moves import range, http_client
 from six.moves.urllib.parse import ParseResult
 from six.moves.urllib.parse import quote as _quote
 from six.moves.urllib.parse import urlparse as stdlib_urlparse
+from six import string_types
 
 from swift import gettext_ as _
 import swift.common.exceptions
-from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND, \
-    HTTP_PRECONDITION_FAILED, HTTP_REQUESTED_RANGE_NOT_SATISFIABLE
+from swift.common.http import is_server_error
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.linkat import linkat
-
-if six.PY3:
-    stdlib_queue = eventlet.patcher.original('queue')
-else:
-    stdlib_queue = eventlet.patcher.original('Queue')
-stdlib_threading = eventlet.patcher.original('threading')
 
 # logging doesn't import patched as cleanly as one would like
 from logging.handlers import SysLogHandler
@@ -107,6 +116,10 @@ FALLOCATE_RESERVE = 0
 # the number of bytes (False).
 FALLOCATE_IS_PERCENT = False
 
+# from /usr/include/linux/falloc.h
+FALLOC_FL_KEEP_SIZE = 1
+FALLOC_FL_PUNCH_HOLE = 2
+
 # from /usr/src/linux-headers-*/include/uapi/linux/resource.h
 PRIO_PROCESS = 0
 
@@ -117,9 +130,11 @@ def NR_ioprio_set():
     """Give __NR_ioprio_set value for your system."""
     architecture = os.uname()[4]
     arch_bits = platform.architecture()[0]
-    # check if supported system, now support only x86_64
+    # check if supported system, now support x86_64 and AArch64
     if architecture == 'x86_64' and arch_bits == '64bit':
         return 251
+    elif architecture == 'aarch64' and arch_bits == '64bit':
+        return 30
     raise OSError("Swift doesn't support ionice priority for %s %s" %
                   (architecture, arch_bits))
 
@@ -157,8 +172,8 @@ def IOPRIO_PRIO_VALUE(class_, data):
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
 # will end up with would also require knowing this suffix.
-HASH_PATH_SUFFIX = ''
-HASH_PATH_PREFIX = ''
+HASH_PATH_SUFFIX = b''
+HASH_PATH_PREFIX = b''
 
 SWIFT_CONF_FILE = '/etc/swift/swift.conf'
 
@@ -183,22 +198,57 @@ class InvalidHashPathConfigError(ValueError):
             "swift_hash_path_prefix are missing from %s" % SWIFT_CONF_FILE
 
 
+def set_swift_dir(swift_dir):
+    """
+    Sets the directory from which swift config files will be read. If the given
+    directory differs from that already set then the swift.conf file in the new
+    directory will be validated and storage policies will be reloaded from the
+    new swift.conf file.
+
+    :param swift_dir: non-default directory to read swift.conf from
+    """
+    global HASH_PATH_SUFFIX
+    global HASH_PATH_PREFIX
+    global SWIFT_CONF_FILE
+    if (swift_dir is not None and
+            swift_dir != os.path.dirname(SWIFT_CONF_FILE)):
+        SWIFT_CONF_FILE = os.path.join(
+            swift_dir, os.path.basename(SWIFT_CONF_FILE))
+        HASH_PATH_PREFIX = b''
+        HASH_PATH_SUFFIX = b''
+        validate_configuration()
+        return True
+    return False
+
+
 def validate_hash_conf():
     global HASH_PATH_SUFFIX
     global HASH_PATH_PREFIX
     if not HASH_PATH_SUFFIX and not HASH_PATH_PREFIX:
         hash_conf = ConfigParser()
-        if hash_conf.read(SWIFT_CONF_FILE):
+
+        if six.PY3:
+            # Use Latin1 to accept arbitrary bytes in the hash prefix/suffix
+            confs_read = hash_conf.read(SWIFT_CONF_FILE, encoding='latin1')
+        else:
+            confs_read = hash_conf.read(SWIFT_CONF_FILE)
+
+        if confs_read:
             try:
                 HASH_PATH_SUFFIX = hash_conf.get('swift-hash',
                                                  'swift_hash_path_suffix')
+                if six.PY3:
+                    HASH_PATH_SUFFIX = HASH_PATH_SUFFIX.encode('latin1')
             except (NoSectionError, NoOptionError):
                 pass
             try:
                 HASH_PATH_PREFIX = hash_conf.get('swift-hash',
                                                  'swift_hash_path_prefix')
+                if six.PY3:
+                    HASH_PATH_PREFIX = HASH_PATH_PREFIX.encode('latin1')
             except (NoSectionError, NoOptionError):
                 pass
+
         if not HASH_PATH_SUFFIX and not HASH_PATH_PREFIX:
             raise InvalidHashPathConfigError()
 
@@ -210,9 +260,10 @@ except InvalidHashPathConfigError:
     pass
 
 
-def get_hmac(request_method, path, expires, key):
+def get_hmac(request_method, path, expires, key, digest=sha1,
+             ip_range=None):
     """
-    Returns the hexdigest string of the HMAC-SHA1 (RFC 2104) for
+    Returns the hexdigest string of the HMAC (see RFC 2104) for
     the request.
 
     :param request_method: Request method to allow.
@@ -220,11 +271,33 @@ def get_hmac(request_method, path, expires, key):
     :param expires: Unix timestamp as an int for when the URL
                     expires.
     :param key: HMAC shared secret.
-
-    :returns: hexdigest str of the HMAC-SHA1 for the request.
+    :param digest: constructor for the digest to use in calculating the HMAC
+                   Defaults to SHA1
+    :param ip_range: The ip range from which the resource is allowed
+                     to be accessed. We need to put the ip_range as the
+                     first argument to hmac to avoid manipulation of the path
+                     due to newlines being valid in paths
+                     e.g. /v1/a/c/o\\n127.0.0.1
+    :returns: hexdigest str of the HMAC for the request using the specified
+              digest algorithm.
     """
-    return hmac.new(
-        key, '%s\n%s\n%s' % (request_method, expires, path), sha1).hexdigest()
+    # These are the three mandatory fields.
+    parts = [request_method, str(expires), path]
+    formats = [b"%s", b"%s", b"%s"]
+
+    if ip_range:
+        parts.insert(0, ip_range)
+        formats.insert(0, b"ip=%s")
+
+    if not isinstance(key, six.binary_type):
+        key = key.encode('utf8')
+
+    message = b'\n'.join(
+        fmt % (part if isinstance(part, six.binary_type)
+               else part.encode("utf-8"))
+        for fmt, part in zip(formats, parts))
+
+    return hmac.new(key, message, digest).hexdigest()
 
 
 # Used by get_swift_info and register_swift_info to store information about
@@ -343,6 +416,36 @@ def config_true_value(value):
         (isinstance(value, six.string_types) and value.lower() in TRUE_VALUES)
 
 
+def config_positive_int_value(value):
+    """
+    Returns positive int value if it can be cast by int() and it's an
+    integer > 0. (not including zero) Raises ValueError otherwise.
+    """
+    try:
+        result = int(value)
+        if result < 1:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError(
+            'Config option must be an positive int number, not "%s".' % value)
+    return result
+
+
+def config_float_value(value, minimum=None, maximum=None):
+    try:
+        val = float(value)
+        if minimum is not None and val < minimum:
+            raise ValueError()
+        if maximum is not None and val > maximum:
+            raise ValueError()
+        return val
+    except (TypeError, ValueError):
+        min_ = ', greater than %s' % minimum if minimum is not None else ''
+        max_ = ', less than %s' % maximum if maximum is not None else ''
+        raise ValueError('Config option must be a number%s%s, not "%s".' %
+                         (min_, max_, value))
+
+
 def config_auto_int_value(value, default):
     """
     Returns default if value is None or 'auto'.
@@ -425,6 +528,18 @@ def config_read_prefixed_options(conf, prefix_name, defaults):
     return params
 
 
+def eventlet_monkey_patch():
+    """
+    Install the appropriate Eventlet monkey patches.
+    """
+    # NOTE(sileht):
+    #     monkey-patching thread is required by python-keystoneclient;
+    #     monkey-patching select is required by oslo.messaging pika driver
+    #         if thread is monkey-patched.
+    eventlet.patcher.monkey_patch(all=False, socket=True, select=True,
+                                  thread=True)
+
+
 def noop_libc_function(*args):
     return 0
 
@@ -471,7 +586,7 @@ def load_libc_function(func_name, log_error=True,
 
 def generate_trans_id(trans_id_suffix):
     return 'tx%s-%010x%s' % (
-        uuid.uuid4().hex[:21], time.time(), quote(trans_id_suffix))
+        uuid.uuid4().hex[:21], int(time.time()), quote(trans_id_suffix))
 
 
 def get_policy_index(req_headers, res_headers):
@@ -479,13 +594,15 @@ def get_policy_index(req_headers, res_headers):
     Returns the appropriate index of the storage policy for the request from
     a proxy server
 
-    :param req: dict of the request headers.
-    :param res: dict of the response headers.
+    :param req_headers: dict of the request headers.
+    :param res_headers: dict of the response headers.
 
     :returns: string index of storage policy, or None
     """
     header = 'X-Backend-Storage-Policy-Index'
     policy_index = res_headers.get(header, req_headers.get(header))
+    if isinstance(policy_index, six.binary_type) and not six.PY2:
+        policy_index = policy_index.decode('ascii')
     return str(policy_index) if policy_index is not None else None
 
 
@@ -548,8 +665,10 @@ class FileLikeIter(object):
         """
         Wraps an iterable to behave as a file-like object.
 
-        The iterable must yield bytes strings.
+        The iterable must be a byte string or yield byte strings.
         """
+        if isinstance(iterable, bytes):
+            iterable = (iterable, )
         self.iterator = iter(iterable)
         self.buf = None
         self.closed = False
@@ -661,70 +780,192 @@ class FileLikeIter(object):
         self.closed = True
 
 
-class FallocateWrapper(object):
+def fs_has_free_space(fs_path, space_needed, is_percent):
+    """
+    Check to see whether or not a filesystem has the given amount of space
+    free. Unlike fallocate(), this does not reserve any space.
 
-    def __init__(self, noop=False):
-        self.noop = noop
-        if self.noop:
-            self.func_name = 'posix_fallocate'
-            self.fallocate = noop_libc_function
-            return
-        # fallocate is preferred because we need the on-disk size to match
-        # the allocated size. Older versions of sqlite require that the
-        # two sizes match. However, fallocate is Linux only.
-        for func in ('fallocate', 'posix_fallocate'):
-            self.func_name = func
-            self.fallocate = load_libc_function(func, log_error=False)
-            if self.fallocate is not noop_libc_function:
-                break
-        if self.fallocate is noop_libc_function:
-            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
-                            "libc.  Leaving as a no-op."))
+    :param fs_path: path to a file or directory on the filesystem; typically
+        the path to the filesystem's mount point
 
-    def __call__(self, fd, mode, offset, length):
-        """The length parameter must be a ctypes.c_uint64."""
-        if not self.noop:
-            if FALLOCATE_RESERVE > 0:
-                st = os.fstatvfs(fd)
-                free = st.f_frsize * st.f_bavail - length.value
-                if FALLOCATE_IS_PERCENT:
-                    free = \
-                        (float(free) / float(st.f_frsize * st.f_blocks)) * 100
-                if float(free) <= float(FALLOCATE_RESERVE):
-                    raise OSError(
-                        errno.ENOSPC,
-                        'FALLOCATE_RESERVE fail %s <= %s' %
-                        (free, FALLOCATE_RESERVE))
-        args = {
-            'fallocate': (fd, mode, offset, length),
-            'posix_fallocate': (fd, offset, length)
-        }
-        return self.fallocate(*args[self.func_name])
+    :param space_needed: minimum bytes or percentage of free space
+
+    :param is_percent: if True, then space_needed is treated as a percentage
+        of the filesystem's capacity; if False, space_needed is a number of
+        free bytes.
+
+    :returns: True if the filesystem has at least that much free space,
+        False otherwise
+
+    :raises OSError: if fs_path does not exist
+    """
+    st = os.statvfs(fs_path)
+    free_bytes = st.f_frsize * st.f_bavail
+    if is_percent:
+        size_bytes = st.f_frsize * st.f_blocks
+        free_percent = float(free_bytes) / float(size_bytes) * 100
+        return free_percent >= space_needed
+    else:
+        return free_bytes >= space_needed
+
+
+class _LibcWrapper(object):
+    """
+    A callable object that forwards its calls to a C function from libc.
+
+    These objects are lazy. libc will not be checked until someone tries to
+    either call the function or check its availability.
+
+    _LibcWrapper objects have an "available" property; if true, then libc
+    has the function of that name. If false, then calls will fail with a
+    NotImplementedError.
+    """
+    def __init__(self, func_name):
+        self._func_name = func_name
+        self._func_handle = None
+        self._loaded = False
+
+    def _ensure_loaded(self):
+        if not self._loaded:
+            func_name = self._func_name
+            try:
+                # Keep everything in this try-block in local variables so
+                # that a typo in self.some_attribute_name doesn't raise a
+                # spurious AttributeError.
+                func_handle = load_libc_function(
+                    func_name, fail_if_missing=True)
+            except AttributeError:
+                # We pass fail_if_missing=True to load_libc_function and
+                # then ignore the error. It's weird, but otherwise we have
+                # to check if self._func_handle is noop_libc_function, and
+                # that's even weirder.
+                pass
+            else:
+                self._func_handle = func_handle
+            self._loaded = True
+
+    @property
+    def available(self):
+        self._ensure_loaded()
+        return bool(self._func_handle)
+
+    def __call__(self, *args):
+        if self.available:
+            return self._func_handle(*args)
+        else:
+            raise NotImplementedError(
+                "No function %r found in libc" % self._func_name)
+
+
+_fallocate_enabled = True
+_fallocate_warned_about_missing = False
+_sys_fallocate = _LibcWrapper('fallocate')
+_sys_posix_fallocate = _LibcWrapper('posix_fallocate')
 
 
 def disable_fallocate():
-    global _sys_fallocate
-    _sys_fallocate = FallocateWrapper(noop=True)
+    global _fallocate_enabled
+    _fallocate_enabled = False
 
 
-def fallocate(fd, size):
+def fallocate(fd, size, offset=0):
     """
     Pre-allocate disk space for a file.
+
+    This function can be disabled by calling disable_fallocate(). If no
+    suitable C function is available in libc, this function is a no-op.
 
     :param fd: file descriptor
     :param size: size to allocate (in bytes)
     """
-    global _sys_fallocate
-    if _sys_fallocate is None:
-        _sys_fallocate = FallocateWrapper()
+    global _fallocate_enabled
+    if not _fallocate_enabled:
+        return
+
     if size < 0:
-        size = 0
-    # 1 means "FALLOC_FL_KEEP_SIZE", which means it pre-allocates invisibly
-    ret = _sys_fallocate(fd, 1, 0, ctypes.c_uint64(size))
-    err = ctypes.get_errno()
+        size = 0  # Done historically; not really sure why
+    if size >= (1 << 63):
+        raise ValueError('size must be less than 2 ** 63')
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+
+    # Make sure there's some (configurable) amount of free space in
+    # addition to the number of bytes we're allocating.
+    if FALLOCATE_RESERVE:
+        st = os.fstatvfs(fd)
+        free = st.f_frsize * st.f_bavail - size
+        if FALLOCATE_IS_PERCENT:
+            free = \
+                (float(free) / float(st.f_frsize * st.f_blocks)) * 100
+        if float(free) <= float(FALLOCATE_RESERVE):
+            raise OSError(
+                errno.ENOSPC,
+                'FALLOCATE_RESERVE fail %g <= %g' %
+                (free, FALLOCATE_RESERVE))
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        #
+        # mode=FALLOC_FL_KEEP_SIZE pre-allocates invisibly (without
+        # affecting the reported file size).
+        ret = _sys_fallocate(
+            fd, FALLOC_FL_KEEP_SIZE, ctypes.c_uint64(offset),
+            ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    elif _sys_posix_fallocate.available:
+        # Parameters are (fd, offset, length).
+        ret = _sys_posix_fallocate(fd, ctypes.c_uint64(offset),
+                                   ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    else:
+        # No suitable fallocate-like function is in our libc. Warn about it,
+        # but just once per process, and then do nothing.
+        global _fallocate_warned_about_missing
+        if not _fallocate_warned_about_missing:
+            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
+                              "libc.  Leaving as a no-op."))
+            _fallocate_warned_about_missing = True
+        return
+
     if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
                            errno.EINVAL):
         raise OSError(err, 'Unable to fallocate(%s)' % size)
+
+
+def punch_hole(fd, offset, length):
+    """
+    De-allocate disk space in the middle of a file.
+
+    :param fd: file descriptor
+    :param offset: index of first byte to de-allocate
+    :param length: number of bytes to de-allocate
+    """
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+    if length <= 0:
+        raise ValueError('length must be positive')
+    if length >= (1 << 63):
+        raise ValueError('length must be less than 2 ** 63')
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        ret = _sys_fallocate(
+            fd,
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+            ctypes.c_uint64(offset),
+            ctypes.c_uint64(length))
+        err = ctypes.get_errno()
+        if ret and err:
+            mode_str = "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+            raise OSError(err, "Unable to fallocate(%d, %s, %d, %d)" % (
+                fd, mode_str, offset, length))
+    else:
+        raise OSError(errno.ENOTSUP,
+                      'No suitable C function found for hole punching')
 
 
 def fsync(fd):
@@ -860,11 +1101,16 @@ class Timestamp(object):
         :param delta: deca-microsecond difference from the base timestamp
                       param, an int
         """
+        if isinstance(timestamp, bytes):
+            timestamp = timestamp.decode('ascii')
         if isinstance(timestamp, six.string_types):
-            parts = timestamp.split('_', 1)
-            self.timestamp = float(parts.pop(0))
-            if parts:
-                self.offset = int(parts[0], 16)
+            base, base_offset = timestamp.partition('_')[::2]
+            self.timestamp = float(base)
+            if '_' in base_offset:
+                raise ValueError('invalid literal for int() with base 16: '
+                                 '%r' % base_offset)
+            if base_offset:
+                self.offset = int(base_offset, 16)
             else:
                 self.offset = 0
         else:
@@ -889,6 +1135,10 @@ class Timestamp(object):
             raise ValueError('timestamp cannot be negative')
         if self.timestamp >= 10000000000:
             raise ValueError('timestamp too large')
+
+    @classmethod
+    def now(cls, offset=0, delta=0):
+        return cls(time.time(), offset=offset, delta=delta)
 
     def __repr__(self):
         return INTERNAL_FORMAT % (self.timestamp, self.offset)
@@ -1259,7 +1509,7 @@ def split_path(path, minsegs=1, maxsegs=None, rest_with_last=False):
                            trailing data, raises ValueError.
     :returns: list of segments with a length of maxsegs (non-existent
               segments will return as None)
-    :raises: ValueError if given an invalid path
+    :raises ValueError: if given an invalid path
     """
     if not maxsegs:
         maxsegs = minsegs
@@ -1294,7 +1544,7 @@ def validate_device_partition(device, partition):
 
     :param device: device to validate
     :param partition: partition to validate
-    :raises: ValueError if given an invalid device or partition
+    :raises ValueError: if given an invalid device or partition
     """
     if not device or '/' in device or device in ['.', '..']:
         raise ValueError('Invalid device: %s' % quote(device or ''))
@@ -1577,24 +1827,6 @@ class StatsdClient(object):
                                sample_rate)
 
 
-def server_handled_successfully(status_int):
-    """
-    True for successful responses *or* error codes that are not Swift's fault,
-    False otherwise. For example, 500 is definitely the server's fault, but
-    412 is an error code (4xx are all errors) that is due to a header the
-    client sent.
-
-    If one is tracking error rates to monitor server health, one would be
-    advised to use a function like this one, lest a client cause a flurry of
-    404s or 416s and make a spurious spike in your errors graph.
-    """
-    return (is_success(status_int) or
-            is_redirection(status_int) or
-            status_int == HTTP_NOT_FOUND or
-            status_int == HTTP_PRECONDITION_FAILED or
-            status_int == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
-
-
 def timing_stats(**dec_kwargs):
     """
     Returns a decorator that logs timing events or errors for public methods in
@@ -1607,7 +1839,15 @@ def timing_stats(**dec_kwargs):
         def _timing_stats(ctrl, *args, **kwargs):
             start_time = time.time()
             resp = func(ctrl, *args, **kwargs)
-            if server_handled_successfully(resp.status_int):
+            # .timing is for successful responses *or* error codes that are
+            # not Swift's fault. For example, 500 is definitely the server's
+            # fault, but 412 is an error code (4xx are all errors) that is
+            # due to a header the client sent.
+            #
+            # .errors.timing is for failures that *are* Swift's fault.
+            # Examples include 507 for an unmounted drive or 500 for an
+            # unhandled exception.
+            if not is_server_error(resp.status_int):
                 ctrl.logger.timing_since(method + '.timing',
                                          start_time, **dec_kwargs)
             else:
@@ -1617,6 +1857,51 @@ def timing_stats(**dec_kwargs):
 
         return _timing_stats
     return decorating_func
+
+
+class SwiftLoggerAdapter(logging.LoggerAdapter):
+    """
+    A logging.LoggerAdapter subclass that also passes through StatsD method
+    calls.
+
+    Like logging.LoggerAdapter, you have to subclass this and override the
+    process() method to accomplish anything useful.
+    """
+    def update_stats(self, *a, **kw):
+        return self.logger.update_stats(*a, **kw)
+
+    def increment(self, *a, **kw):
+        return self.logger.increment(*a, **kw)
+
+    def decrement(self, *a, **kw):
+        return self.logger.decrement(*a, **kw)
+
+    def timing(self, *a, **kw):
+        return self.logger.timing(*a, **kw)
+
+    def timing_since(self, *a, **kw):
+        return self.logger.timing_since(*a, **kw)
+
+    def transfer_rate(self, *a, **kw):
+        return self.logger.transfer_rate(*a, **kw)
+
+
+class PrefixLoggerAdapter(SwiftLoggerAdapter):
+    """
+    Adds an optional prefix to all its log messages. When the prefix has not
+    been set, messages are unchanged.
+    """
+    def set_prefix(self, prefix):
+        self.extra['prefix'] = prefix
+
+    def exception(self, *a, **kw):
+        self.logger.exception(*a, **kw)
+
+    def process(self, msg, kwargs):
+        msg, kwargs = super(PrefixLoggerAdapter, self).process(msg, kwargs)
+        if 'prefix' in self.extra:
+            msg = self.extra['prefix'] + msg
+        return (msg, kwargs)
 
 
 # double inheritance to support property with setter
@@ -1692,12 +1977,19 @@ class LogAdapter(logging.LoggerAdapter, object):
                 emsg = str(exc)
             elif exc.errno == errno.ECONNREFUSED:
                 emsg = _('Connection refused')
+            elif exc.errno == errno.ECONNRESET:
+                emsg = _('Connection reset')
             elif exc.errno == errno.EHOSTUNREACH:
                 emsg = _('Host unreachable')
+            elif exc.errno == errno.ENETUNREACH:
+                emsg = _('Network unreachable')
             elif exc.errno == errno.ETIMEDOUT:
                 emsg = _('Connection timeout')
             else:
                 call = self._exception
+        elif isinstance(exc, http_client.BadStatusLine):
+            # Use error(); not really exceptional
+            emsg = '%s: %s' % (exc.__class__.__name__, exc.line)
         elif isinstance(exc, eventlet.Timeout):
             emsg = exc.__class__.__name__
             if hasattr(exc, 'seconds'):
@@ -1796,6 +2088,25 @@ class SwiftLogFormatter(logging.Formatter):
         return msg
 
 
+class LogLevelFilter(object):
+    """
+    Drop messages for the logger based on level.
+
+    This is useful when dependencies log too much information.
+
+    :param level: All messages at or below this level are dropped
+                  (DEBUG < INFO < WARN < ERROR < CRITICAL|FATAL)
+                  Default: DEBUG
+    """
+    def __init__(self, level=logging.DEBUG):
+        self.level = level
+
+    def filter(self, record):
+        if record.levelno <= self.level:
+            return 0
+        return 1
+
+
 def get_logger(conf, name=None, log_to_console=False, log_route=None,
                fmt="%(server)s: %(message)s"):
     """
@@ -1848,17 +2159,18 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
     if udp_host:
         udp_port = int(conf.get('log_udp_port',
                                 logging.handlers.SYSLOG_UDP_PORT))
-        handler = SysLogHandler(address=(udp_host, udp_port),
-                                facility=facility)
+        handler = ThreadSafeSysLogHandler(address=(udp_host, udp_port),
+                                          facility=facility)
     else:
         log_address = conf.get('log_address', '/dev/log')
         try:
-            handler = SysLogHandler(address=log_address, facility=facility)
+            handler = ThreadSafeSysLogHandler(address=log_address,
+                                              facility=facility)
         except socket.error as e:
             # Either /dev/log isn't a UNIX socket or it does not exist at all
             if e.errno not in [errno.ENOTSOCK, errno.ENOENT]:
                 raise
-            handler = SysLogHandler(facility=facility)
+            handler = ThreadSafeSysLogHandler(facility=facility)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     get_logger.handler4logger[logger] = handler
@@ -1932,6 +2244,25 @@ def get_hub():
     getting swallowed somewhere. Then when that file descriptor
     was re-used, eventlet would freak right out because it still
     thought it was waiting for activity from it in some other coro.
+
+    Another note about epoll: it's hard to use when forking. epoll works
+    like so:
+
+       * create an epoll instance: efd = epoll_create(...)
+
+       * register file descriptors of interest with epoll_ctl(efd,
+             EPOLL_CTL_ADD, fd, ...)
+
+       * wait for events with epoll_wait(efd, ...)
+
+    If you fork, you and all your child processes end up using the same
+    epoll instance, and everyone becomes confused. It is possible to use
+    epoll and fork and still have a correct program as long as you do the
+    right things, but eventlet doesn't do those things. Really, it can't
+    even try to do those things since it doesn't get notified of forks.
+
+    In contrast, both poll() and select() specify the set of interesting
+    file descriptors with each call, so there's no problem with forking.
     """
     try:
         import select
@@ -2191,21 +2522,61 @@ def hash_path(account, container=None, object=None, raw_digest=False):
     """
     if object and not container:
         raise ValueError('container is required if object is provided')
-    paths = [account]
+    paths = [account if isinstance(account, six.binary_type)
+             else account.encode('utf8')]
     if container:
-        paths.append(container)
+        paths.append(container if isinstance(container, six.binary_type)
+                     else container.encode('utf8'))
     if object:
-        paths.append(object)
+        paths.append(object if isinstance(object, six.binary_type)
+                     else object.encode('utf8'))
     if raw_digest:
-        return md5(HASH_PATH_PREFIX + '/' + '/'.join(paths)
+        return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
                    + HASH_PATH_SUFFIX).digest()
     else:
-        return md5(HASH_PATH_PREFIX + '/' + '/'.join(paths)
+        return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
                    + HASH_PATH_SUFFIX).hexdigest()
 
 
+def get_zero_indexed_base_string(base, index):
+    """
+    This allows the caller to make a list of things with indexes, where the
+    first item (zero indexed) is just the bare base string, and subsequent
+    indexes are appended '-1', '-2', etc.
+
+    e.g.::
+
+      'lock', None => 'lock'
+      'lock', 0    => 'lock'
+      'lock', 1    => 'lock-1'
+      'object', 2  => 'object-2'
+
+    :param base: a string, the base string; when ``index`` is 0 (or None) this
+                 is the identity function.
+    :param index: a digit, typically an integer (or None); for values other
+                  than 0 or None this digit is appended to the base string
+                  separated by a hyphen.
+    """
+    if index == 0 or index is None:
+        return_string = base
+    else:
+        return_string = base + "-%d" % int(index)
+    return return_string
+
+
+def _get_any_lock(fds):
+    for fd in fds:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except IOError as err:
+            if err.errno != errno.EAGAIN:
+                raise
+    return False
+
+
 @contextmanager
-def lock_path(directory, timeout=10, timeout_class=None):
+def lock_path(directory, timeout=10, timeout_class=None, limit=1):
     """
     Context manager that acquires a lock on a directory.  This will block until
     the lock can be acquired, or the timeout time has expired (whichever occurs
@@ -2221,12 +2592,22 @@ def lock_path(directory, timeout=10, timeout_class=None):
         lock cannot be granted within the timeout. Will be
         constructed as timeout_class(timeout, lockpath). Default:
         LockTimeout
+    :param limit: The maximum number of locks that may be held concurrently on
+        the same directory at the time this method is called. Note that this
+        limit is only applied during the current call to this method and does
+        not prevent subsequent calls giving a larger limit. Defaults to 1.
+    :raises TypeError: if limit is not an int.
+    :raises ValueError: if limit is less than 1.
     """
+    if limit < 1:
+        raise ValueError('limit must be greater than or equal to 1')
     if timeout_class is None:
         timeout_class = swift.common.exceptions.LockTimeout
     mkdirs(directory)
     lockpath = '%s/.lock' % directory
-    fd = os.open(lockpath, os.O_WRONLY | os.O_CREAT)
+    fds = [os.open(get_zero_indexed_base_string(lockpath, i),
+                   os.O_WRONLY | os.O_CREAT)
+           for i in range(limit)]
     sleep_time = 0.01
     slower_sleep_time = max(timeout * 0.01, sleep_time)
     slowdown_at = timeout * 0.01
@@ -2234,19 +2615,16 @@ def lock_path(directory, timeout=10, timeout_class=None):
     try:
         with timeout_class(timeout, lockpath):
             while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if _get_any_lock(fds):
                     break
-                except IOError as err:
-                    if err.errno != errno.EAGAIN:
-                        raise
                 if time_slept > slowdown_at:
                     sleep_time = slower_sleep_time
                 sleep(sleep_time)
                 time_slept += sleep_time
         yield True
     finally:
-        os.close(fd)
+        for fd in fds:
+            os.close(fd)
 
 
 @contextmanager
@@ -2264,9 +2642,9 @@ def lock_file(filename, timeout=10, append=False, unlink=True):
     flags = os.O_CREAT | os.O_RDWR
     if append:
         flags |= os.O_APPEND
-        mode = 'a+'
+        mode = 'a+b'
     else:
-        mode = 'r+'
+        mode = 'r+b'
     while True:
         fd = os.open(filename, flags)
         file_obj = os.fdopen(fd, mode)
@@ -2343,7 +2721,7 @@ def compute_eta(start_time, current_value, final_value):
 
 def unlink_older_than(path, mtime):
     """
-    Remove any file in a given path that that was last modified before mtime.
+    Remove any file in a given path that was last modified before mtime.
 
     :param path: path to remove file from
     :param mtime: timestamp of oldest file to keep
@@ -2354,7 +2732,7 @@ def unlink_older_than(path, mtime):
 
 def unlink_paths_older_than(filepaths, mtime):
     """
-    Remove any files from the given list that that were
+    Remove any files from the given list that were
     last modified before mtime.
 
     :param filepaths: a list of strings, the full paths of files to check
@@ -2426,6 +2804,8 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
     else:
         c = ConfigParser(defaults)
     if hasattr(conf_path, 'readline'):
+        if hasattr(conf_path, 'seek'):
+            conf_path.seek(0)
         c.readfp(conf_path)
     else:
         if os.path.isdir(conf_path):
@@ -2555,9 +2935,21 @@ def remove_file(path):
         pass
 
 
+def remove_directory(path):
+    """Wrapper for os.rmdir, ENOENT and ENOTEMPTY are ignored
+
+    :param path: first and only argument passed to os.rmdir
+    """
+    try:
+        os.rmdir(path)
+    except OSError as e:
+        if e.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+            raise
+
+
 def audit_location_generator(devices, datadir, suffix='',
                              mount_check=True, logger=None):
-    '''
+    """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
 
@@ -2569,7 +2961,7 @@ def audit_location_generator(devices, datadir, suffix='',
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
-    '''
+    """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
     shuffle(device_dir)
@@ -2619,7 +3011,7 @@ def audit_location_generator(devices, datadir, suffix='',
 
 
 def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
-    '''
+    """
     Will eventlet.sleep() for the appropriate time so that the max_rate
     is never exceeded.  If max_rate is 0, will not ratelimit.  The
     maximum recommended rate should not exceed (1000 * incr_by) a second
@@ -2638,7 +3030,7 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
                         A larger number will result in larger spikes in rate
                         but better average accuracy. Must be > 0 to engage
                         rate-limiting behavior.
-    '''
+    """
     if max_rate <= 0 or incr_by <= 0:
         return running_time
 
@@ -2665,7 +3057,7 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
 
 
 class ContextPool(GreenPool):
-    "GreenPool subclassed to kill its coros when it gets gc'ed"
+    """GreenPool subclassed to kill its coros when it gets gc'ed"""
 
     def __enter__(self):
         return self
@@ -2811,7 +3203,7 @@ class StreamingPile(GreenAsyncPile):
 
 
 class ModifiedParseResult(ParseResult):
-    "Parse results class for urlparse."
+    """Parse results class for urlparse."""
 
     @property
     def hostname(self):
@@ -2850,7 +3242,7 @@ def validate_sync_to(value, allowed_sync_hosts, realms_conf):
     :param value: The X-Container-Sync-To header value to validate.
     :param allowed_sync_hosts: A list of allowed hosts in endpoints,
         if realms_conf does not apply.
-    :param realms_conf: A instance of
+    :param realms_conf: An instance of
         swift.common.container_sync_realms.ContainerSyncRealms to
         validate against.
     :returns: A tuple of (error_string, validated_endpoint, realm,
@@ -2924,7 +3316,7 @@ def affinity_key_function(affinity_str):
     :param affinity_str: affinity config value, e.g. "r1z2=3"
                          or "r1=1, r2z1=2, r2z2=2"
     :returns: single-argument function
-    :raises: ValueError if argument invalid
+    :raises ValueError: if argument invalid
     """
     affinity_str = affinity_str.strip()
 
@@ -2974,10 +3366,10 @@ def affinity_locality_predicate(write_affinity_str):
     If affinity_str is empty or all whitespace, then the resulting function
     will consider everything local
 
-    :param affinity_str: affinity config value, e.g. "r1z2"
+    :param write_affinity_str: affinity config value, e.g. "r1z2"
         or "r1, r2z1, r2z2"
     :returns: single-argument function, or None if affinity_str is empty
-    :raises: ValueError if argument invalid
+    :raises ValueError: if argument invalid
     """
     affinity_str = write_affinity_str.strip()
 
@@ -3039,18 +3431,27 @@ def human_readable(value):
 
 def put_recon_cache_entry(cache_entry, key, item):
     """
-    Function that will check if item is a dict, and if so put it under
-    cache_entry[key].  We use nested recon cache entries when the object
-    auditor runs in parallel or else in 'once' mode with a specified
-    subset of devices.
+    Update a recon cache entry item.
+
+    If ``item`` is an empty dict then any existing ``key`` in ``cache_entry``
+    will be deleted. Similarly if ``item`` is a dict and any of its values are
+    empty dicts then the corrsponsing key will be deleted from the nested dict
+    in ``cache_entry``.
+
+    We use nested recon cache entries when the object auditor
+    runs in parallel or else in 'once' mode with a specified subset of devices.
+
+    :param cache_entry: a dict of existing cache entries
+    :param key: key for item to update
+    :param item: value for item to update
     """
     if isinstance(item, dict):
+        if not item:
+            cache_entry.pop(key, None)
+            return
         if key not in cache_entry or key in cache_entry and not \
                 isinstance(cache_entry[key], dict):
             cache_entry[key] = {}
-        elif key in cache_entry and item == {}:
-            cache_entry.pop(key, None)
-            return
         for k, v in item.items():
             if v == {}:
                 cache_entry[key].pop(k, None)
@@ -3086,7 +3487,9 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
             try:
                 with NamedTemporaryFile(dir=os.path.dirname(cache_file),
                                         delete=False) as tf:
-                    tf.write(json.dumps(cache_entry) + '\n')
+                    cache_data = json.dumps(cache_entry, ensure_ascii=True,
+                                            sort_keys=True)
+                    tf.write(cache_data.encode('ascii') + b'\n')
                 if set_owner:
                     os.chown(tf.name, pwd.getpwnam(set_owner).pw_uid, -1)
                 renamer(tf.name, cache_file, fsync=False)
@@ -3097,8 +3500,24 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
                     except OSError as err:
                         if err.errno != errno.ENOENT:
                             raise
-    except (Exception, Timeout):
-        logger.exception(_('Exception dumping recon cache'))
+    except (Exception, Timeout) as err:
+        logger.exception('Exception dumping recon cache: %s' % err)
+
+
+def load_recon_cache(cache_file):
+    """
+    Load a recon cache file. Treats missing file as empty.
+    """
+    try:
+        with open(cache_file) as fh:
+            return json.load(fh)
+    except IOError as e:
+        if e.errno == errno.ENOENT:
+            return {}
+        else:
+            raise
+    except ValueError:  # invalid JSON
+        return {}
 
 
 def listdir(path):
@@ -3134,7 +3553,7 @@ def pairs(item_list):
     """
     Returns an iterator of all pairs of elements from item_list.
 
-    :param items: items (no duplicates allowed)
+    :param item_list: items (no duplicates allowed)
     """
     for i, item1 in enumerate(item_list):
         for item2 in item_list[(i + 1):]:
@@ -3234,10 +3653,31 @@ def get_valid_utf8_str(str_or_unicode):
 
     :param str_or_unicode: a string or an unicode which can be invalid utf-8
     """
-    if isinstance(str_or_unicode, six.text_type):
-        (str_or_unicode, _len) = utf8_encoder(str_or_unicode, 'replace')
-    (valid_utf8_str, _len) = utf8_decoder(str_or_unicode, 'replace')
-    return valid_utf8_str.encode('utf-8')
+    if six.PY2:
+        if isinstance(str_or_unicode, six.text_type):
+            (str_or_unicode, _len) = utf8_encoder(str_or_unicode, 'replace')
+        (valid_unicode_str, _len) = utf8_decoder(str_or_unicode, 'replace')
+    else:
+        # Apparently under py3 we need to go to utf-16 to collapse surrogates?
+        if isinstance(str_or_unicode, six.binary_type):
+            try:
+                (str_or_unicode, _len) = utf8_decoder(str_or_unicode,
+                                                      'surrogatepass')
+            except UnicodeDecodeError:
+                (str_or_unicode, _len) = utf8_decoder(str_or_unicode,
+                                                      'replace')
+        (str_or_unicode, _len) = utf16_encoder(str_or_unicode, 'surrogatepass')
+        (valid_unicode_str, _len) = utf16_decoder(str_or_unicode, 'replace')
+    return valid_unicode_str.encode('utf-8')
+
+
+class Everything(object):
+    """
+    A container that contains everything. If "e" is an instance of
+    Everything, then "x in e" is true for all x.
+    """
+    def __contains__(self, element):
+        return True
 
 
 def list_from_csv(comma_separated_str):
@@ -3505,21 +3945,6 @@ class Spliterator(object):
             self._iterator_in_progress = False
 
 
-def tpool_reraise(func, *args, **kwargs):
-    """
-    Hack to work around Eventlet's tpool not catching and reraising Timeouts.
-    """
-    def inner():
-        try:
-            return func(*args, **kwargs)
-        except BaseException as err:
-            return err
-    resp = tpool.execute(inner)
-    if isinstance(resp, BaseException):
-        raise resp
-    return resp
-
-
 def ismount(path):
     """
     Test whether a path is a mount point. This will catch any
@@ -3550,7 +3975,13 @@ def ismount_raw(path):
         raise
 
     if stat.S_ISLNK(s1.st_mode):
-        # A symlink can never be a mount point
+        # Some environments (like vagrant-swift-all-in-one) use a symlink at
+        # the device level but could still provide a stubfile in the target
+        # to indicate that it should be treated as a mount point for swift's
+        # purposes.
+        if os.path.isfile(os.path.join(path, ".ismount")):
+            return True
+        # Otherwise, a symlink can never be a mount point
         return False
 
     s2 = os.lstat(os.path.join(path, '..'))
@@ -3564,6 +3995,12 @@ def ismount_raw(path):
     ino2 = s2.st_ino
     if ino1 == ino2:
         # path/.. is the same i-node as path
+        return True
+
+    # Device and inode checks are not properly working inside containerized
+    # environments, therefore using a workaround to check if there is a
+    # stubfile placed by an operator
+    if os.path.isfile(os.path.join(path, ".ismount")):
         return True
 
     return False
@@ -3609,7 +4046,7 @@ def parse_content_range(content_range):
     :param content_range: Content-Range header value to parse,
         e.g. "bytes 100-1249/49004"
     :returns: 3-tuple (start, end, total)
-    :raises: ValueError if malformed
+    :raises ValueError: if malformed
     """
     found = re.search(_content_range_pattern, content_range)
     if not found:
@@ -3688,12 +4125,15 @@ def quote(value, safe='/'):
     """
     Patched version of urllib.quote that encodes utf-8 strings before quoting
     """
-    return _quote(get_valid_utf8_str(value), safe)
+    quoted = _quote(get_valid_utf8_str(value), safe)
+    if isinstance(value, six.binary_type):
+        quoted = quoted.encode('utf-8')
+    return quoted
 
 
 def get_expirer_container(x_delete_at, expirer_divisor, acc, cont, obj):
     """
-    Returns a expiring object container name for given X-Delete-At and
+    Returns an expiring object container name for given X-Delete-At and
     a/c/o.
     """
     shard_int = int(hash_path(acc, cont, obj), 16) % 100
@@ -3791,13 +4231,13 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
     :param boundary: The mime boundary to separate new file-like
                      objects on.
     :returns: A generator of file-like objects for each part.
-    :raises: MimeInvalid if the document is malformed
+    :raises MimeInvalid: if the document is malformed
     """
-    boundary = '--' + boundary
+    boundary = b'--' + boundary
     blen = len(boundary) + 2  # \r\n
     try:
         got = wsgi_input.readline(blen)
-        while got == '\r\n':
+        while got == b'\r\n':
             got = wsgi_input.readline(blen)
     except (IOError, ValueError) as e:
         raise swift.common.exceptions.ChunkReadError(str(e))
@@ -3805,8 +4245,8 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
     if got.strip() != boundary:
         raise swift.common.exceptions.MimeInvalid(
             'invalid starting boundary: wanted %r, got %r', (boundary, got))
-    boundary = '\r\n' + boundary
-    input_buffer = ''
+    boundary = b'\r\n' + boundary
+    input_buffer = b''
     done = False
     while not done:
         it = _MultipartMimeFileLikeObject(wsgi_input, boundary, input_buffer,
@@ -4113,6 +4553,553 @@ def get_md5_socket():
     return md5_sockfd
 
 
+class ShardRange(object):
+    """
+    A ShardRange encapsulates sharding state related to a container including
+    lower and upper bounds that define the object namespace for which the
+    container is responsible.
+
+    Shard ranges may be persisted in a container database. Timestamps
+    associated with subsets of the shard range attributes are used to resolve
+    conflicts when a shard range needs to be merged with an existing shard
+    range record and the most recent version of an attribute should be
+    persisted.
+
+    :param name: the name of the shard range; this should take the form of a
+        path to a container i.e. <account_name>/<container_name>.
+    :param timestamp: a timestamp that represents the time at which the
+        shard range's ``lower``, ``upper`` or ``deleted`` attributes were
+        last modified.
+    :param lower: the lower bound of object names contained in the shard range;
+        the lower bound *is not* included in the shard range namespace.
+    :param upper: the upper bound of object names contained in the shard range;
+        the upper bound *is* included in the shard range namespace.
+    :param object_count: the number of objects in the shard range; defaults to
+        zero.
+    :param bytes_used: the number of bytes in the shard range; defaults to
+        zero.
+    :param meta_timestamp: a timestamp that represents the time at which the
+        shard range's ``object_count`` and ``bytes_used`` were last updated;
+        defaults to the value of ``timestamp``.
+    :param deleted: a boolean; if True the shard range is considered to be
+        deleted.
+    :param state: the state; must be one of ShardRange.STATES; defaults to
+        CREATED.
+    :param state_timestamp: a timestamp that represents the time at which
+        ``state`` was forced to its current value; defaults to the value of
+        ``timestamp``. This timestamp is typically not updated with every
+        change of ``state`` because in general conflicts in ``state``
+        attributes are resolved by choosing the larger ``state`` value.
+        However, when this rule does not apply, for example when changing state
+        from ``SHARDED`` to ``ACTIVE``, the ``state_timestamp`` may be advanced
+        so that the new ``state`` value is preferred over any older ``state``
+        value.
+    :param epoch: optional epoch timestamp which represents the time at which
+        sharding was enabled for a container.
+    """
+    FOUND = 10
+    CREATED = 20
+    CLEAVED = 30
+    ACTIVE = 40
+    SHRINKING = 50
+    SHARDING = 60
+    SHARDED = 70
+    STATES = {FOUND: 'found',
+              CREATED: 'created',
+              CLEAVED: 'cleaved',
+              ACTIVE: 'active',
+              SHRINKING: 'shrinking',
+              SHARDING: 'sharding',
+              SHARDED: 'sharded'}
+    STATES_BY_NAME = dict((v, k) for k, v in STATES.items())
+
+    class OuterBound(object):
+        def __eq__(self, other):
+            return isinstance(other, type(self))
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+        def __str__(self):
+            return ''
+
+        def __repr__(self):
+            return type(self).__name__
+
+        def __bool__(self):
+            return False
+
+        __nonzero__ = __bool__
+
+    @functools.total_ordering
+    class MaxBound(OuterBound):
+        def __ge__(self, other):
+            return True
+
+    @functools.total_ordering
+    class MinBound(OuterBound):
+        def __le__(self, other):
+            return True
+
+    MIN = MinBound()
+    MAX = MaxBound()
+
+    def __init__(self, name, timestamp, lower=MIN, upper=MAX,
+                 object_count=0, bytes_used=0, meta_timestamp=None,
+                 deleted=False, state=None, state_timestamp=None, epoch=None):
+        self.account = self.container = self._timestamp = \
+            self._meta_timestamp = self._state_timestamp = self._epoch = None
+        self._lower = ShardRange.MIN
+        self._upper = ShardRange.MAX
+        self._deleted = False
+        self._state = None
+
+        self.name = name
+        self.timestamp = timestamp
+        self.lower = lower
+        self.upper = upper
+        self.deleted = deleted
+        self.object_count = object_count
+        self.bytes_used = bytes_used
+        self.meta_timestamp = meta_timestamp
+        self.state = self.FOUND if state is None else state
+        self.state_timestamp = state_timestamp
+        self.epoch = epoch
+
+    @classmethod
+    def _encode(cls, value):
+        if six.PY2 and isinstance(value, six.text_type):
+            return value.encode('utf-8')
+        return value
+
+    def _encode_bound(self, bound):
+        if isinstance(bound, ShardRange.OuterBound):
+            return bound
+        if not isinstance(bound, string_types):
+            raise TypeError('must be a string type')
+        return self._encode(bound)
+
+    @classmethod
+    def _make_container_name(cls, root_container, parent_container, timestamp,
+                             index):
+        if not isinstance(parent_container, bytes):
+            parent_container = parent_container.encode('utf-8')
+        return "%s-%s-%s-%s" % (root_container,
+                                hashlib.md5(parent_container).hexdigest(),
+                                cls._to_timestamp(timestamp).internal,
+                                index)
+
+    @classmethod
+    def make_path(cls, shards_account, root_container, parent_container,
+                  timestamp, index):
+        """
+        Returns a path for a shard container that is valid to use as a name
+        when constructing a :class:`~swift.common.utils.ShardRange`.
+
+        :param shards_account: the hidden internal account to which the shard
+            container belongs.
+        :param root_container: the name of the root container for the shard.
+        :param parent_container: the name of the parent container for the
+            shard; for initial first generation shards this should be the same
+            as ``root_container``; for shards of shards this should be the name
+            of the sharding shard container.
+        :param timestamp: an instance of :class:`~swift.common.utils.Timestamp`
+        :param index: a unique index that will distinguish the path from any
+            other path generated using the same combination of
+            ``shards_account``, ``root_container``, ``parent_container`` and
+            ``timestamp``.
+        :return: a string of the form <account_name>/<container_name>
+        """
+        shard_container = cls._make_container_name(
+            root_container, parent_container, timestamp, index)
+        return '%s/%s' % (shards_account, shard_container)
+
+    @classmethod
+    def _to_timestamp(cls, timestamp):
+        if timestamp is None or isinstance(timestamp, Timestamp):
+            return timestamp
+        return Timestamp(timestamp)
+
+    @property
+    def name(self):
+        return '%s/%s' % (self.account, self.container)
+
+    @name.setter
+    def name(self, path):
+        path = self._encode(path)
+        if not path or len(path.split('/')) != 2 or not all(path.split('/')):
+            raise ValueError(
+                "Name must be of the form '<account>/<container>', got %r" %
+                path)
+        self.account, self.container = path.split('/')
+
+    @property
+    def timestamp(self):
+        return self._timestamp
+
+    @timestamp.setter
+    def timestamp(self, ts):
+        if ts is None:
+            raise TypeError('timestamp cannot be None')
+        self._timestamp = self._to_timestamp(ts)
+
+    @property
+    def meta_timestamp(self):
+        if self._meta_timestamp is None:
+            return self.timestamp
+        return self._meta_timestamp
+
+    @meta_timestamp.setter
+    def meta_timestamp(self, ts):
+        self._meta_timestamp = self._to_timestamp(ts)
+
+    @property
+    def lower(self):
+        return self._lower
+
+    @property
+    def lower_str(self):
+        return str(self.lower)
+
+    @lower.setter
+    def lower(self, value):
+        if value in (None, ''):
+            value = ShardRange.MIN
+        try:
+            value = self._encode_bound(value)
+        except TypeError as err:
+            raise TypeError('lower %s' % err)
+        if value > self._upper:
+            raise ValueError(
+                'lower (%r) must be less than or equal to upper (%r)' %
+                (value, self.upper))
+        self._lower = value
+
+    @property
+    def end_marker(self):
+        return self.upper_str + '\x00' if self.upper else ''
+
+    @property
+    def upper(self):
+        return self._upper
+
+    @property
+    def upper_str(self):
+        return str(self.upper)
+
+    @upper.setter
+    def upper(self, value):
+        if value in (None, ''):
+            value = ShardRange.MAX
+        try:
+            value = self._encode_bound(value)
+        except TypeError as err:
+            raise TypeError('upper %s' % err)
+        if value < self._lower:
+            raise ValueError(
+                'upper (%r) must be greater than or equal to lower (%r)' %
+                (value, self.lower))
+        self._upper = value
+
+    @property
+    def object_count(self):
+        return self._count
+
+    @object_count.setter
+    def object_count(self, count):
+        count = int(count)
+        if count < 0:
+            raise ValueError('object_count cannot be < 0')
+        self._count = count
+
+    @property
+    def bytes_used(self):
+        return self._bytes
+
+    @bytes_used.setter
+    def bytes_used(self, bytes_used):
+        bytes_used = int(bytes_used)
+        if bytes_used < 0:
+            raise ValueError('bytes_used cannot be < 0')
+        self._bytes = bytes_used
+
+    def update_meta(self, object_count, bytes_used, meta_timestamp=None):
+        """
+        Set the object stats metadata to the given values and update the
+        meta_timestamp to the current time.
+
+        :param object_count: should be an integer
+        :param bytes_used: should be an integer
+        :param meta_timestamp: timestamp for metadata; if not given the
+            current time will be set.
+        :raises ValueError: if ``object_count`` or ``bytes_used`` cannot be
+            cast to an int, or if meta_timestamp is neither None nor can be
+            cast to a :class:`~swift.common.utils.Timestamp`.
+        """
+        self.object_count = int(object_count)
+        self.bytes_used = int(bytes_used)
+        if meta_timestamp is None:
+            self.meta_timestamp = Timestamp.now()
+        else:
+            self.meta_timestamp = meta_timestamp
+
+    def increment_meta(self, object_count, bytes_used):
+        """
+        Increment the object stats metadata by the given values and update the
+        meta_timestamp to the current time.
+
+        :param object_count: should be an integer
+        :param bytes_used: should be an integer
+        :raises ValueError: if ``object_count`` or ``bytes_used`` cannot be
+            cast to an int.
+        """
+        self.update_meta(self.object_count + int(object_count),
+                         self.bytes_used + int(bytes_used))
+
+    @classmethod
+    def resolve_state(cls, state):
+        """
+        Given a value that may be either the name or the number of a state
+        return a tuple of (state number, state name).
+
+        :param state: Either a string state name or an integer state number.
+        :return: A tuple (state number, state name)
+        :raises ValueError: if ``state`` is neither a valid state name nor a
+            valid state number.
+        """
+        try:
+            state = state.lower()
+            state_num = cls.STATES_BY_NAME[state]
+        except (KeyError, AttributeError):
+            try:
+                state_name = cls.STATES[state]
+            except KeyError:
+                raise ValueError('Invalid state %r' % state)
+            else:
+                state_num = state
+        else:
+            state_name = state
+        return state_num, state_name
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, state):
+        try:
+            float_state = float(state)
+            int_state = int(float_state)
+        except (ValueError, TypeError):
+            raise ValueError('Invalid state %r' % state)
+        if int_state != float_state or int_state not in self.STATES:
+            raise ValueError('Invalid state %r' % state)
+        self._state = int_state
+
+    @property
+    def state_text(self):
+        return self.STATES[self.state]
+
+    @property
+    def state_timestamp(self):
+        if self._state_timestamp is None:
+            return self.timestamp
+        return self._state_timestamp
+
+    @state_timestamp.setter
+    def state_timestamp(self, ts):
+        self._state_timestamp = self._to_timestamp(ts)
+
+    @property
+    def epoch(self):
+        return self._epoch
+
+    @epoch.setter
+    def epoch(self, epoch):
+        self._epoch = self._to_timestamp(epoch)
+
+    def update_state(self, state, state_timestamp=None):
+        """
+        Set state to the given value and optionally update the state_timestamp
+        to the given time.
+
+        :param state: new state, should be an integer
+        :param state_timestamp: timestamp for state; if not given the
+            state_timestamp will not be changed.
+        :return: True if the state or state_timestamp was changed, False
+            otherwise
+        """
+        if state_timestamp is None and self.state == state:
+            return False
+        self.state = state
+        if state_timestamp is not None:
+            self.state_timestamp = state_timestamp
+        return True
+
+    @property
+    def deleted(self):
+        return self._deleted
+
+    @deleted.setter
+    def deleted(self, value):
+        self._deleted = bool(value)
+
+    def set_deleted(self, timestamp=None):
+        """
+        Mark the shard range deleted and set timestamp to the current time.
+
+        :param timestamp: optional timestamp to set; if not given the
+            current time will be set.
+        :return: True if the deleted attribute or timestamp was changed, False
+            otherwise
+        """
+        if timestamp is None and self.deleted:
+            return False
+        self.deleted = True
+        self.timestamp = timestamp or Timestamp.now()
+        return True
+
+    def __contains__(self, item):
+        # test if the given item is within the namespace
+        if item == '':
+            return False
+        item = self._encode_bound(item)
+        return self.lower < item <= self.upper
+
+    def __lt__(self, other):
+        # a ShardRange is less than other if its entire namespace is less than
+        # other; if other is another ShardRange that implies that this
+        # ShardRange's upper must be less than or equal to the other
+        # ShardRange's lower
+        if self.upper == ShardRange.MAX:
+            return False
+        if isinstance(other, ShardRange):
+            return self.upper <= other.lower
+        elif other is None:
+            return True
+        else:
+            return self.upper < other
+
+    def __gt__(self, other):
+        # a ShardRange is greater than other if its entire namespace is greater
+        # than other; if other is another ShardRange that implies that this
+        # ShardRange's lower must be less greater than or equal to the other
+        # ShardRange's upper
+        if self.lower == ShardRange.MIN:
+            return False
+        if isinstance(other, ShardRange):
+            return self.lower >= other.upper
+        elif other is None:
+            return False
+        else:
+            return self.lower >= other
+
+    def __eq__(self, other):
+        # test for equality of range bounds only
+        if not isinstance(other, ShardRange):
+            return False
+        return self.lower == other.lower and self.upper == other.upper
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __repr__(self):
+        return '%s<%r to %r as of %s, (%d, %d) as of %s, %s as of %s>' % (
+            self.__class__.__name__, self.lower, self.upper,
+            self.timestamp.internal, self.object_count, self.bytes_used,
+            self.meta_timestamp.internal, self.state_text,
+            self.state_timestamp.internal)
+
+    def entire_namespace(self):
+        """
+        Returns True if the ShardRange includes the entire namespace, False
+        otherwise.
+        """
+        return (self.lower == ShardRange.MIN and
+                self.upper == ShardRange.MAX)
+
+    def overlaps(self, other):
+        """
+        Returns True if the ShardRange namespace overlaps with the other
+        ShardRange's namespace.
+
+        :param other: an instance of :class:`~swift.common.utils.ShardRange`
+        """
+        if not isinstance(other, ShardRange):
+            return False
+        return max(self.lower, other.lower) < min(self.upper, other.upper)
+
+    def includes(self, other):
+        """
+        Returns True if this namespace includes the whole of the other
+        namespace, False otherwise.
+
+        :param other: an instance of :class:`~swift.common.utils.ShardRange`
+        """
+        return (self.lower <= other.lower) and (other.upper <= self.upper)
+
+    def __iter__(self):
+        yield 'name', self.name
+        yield 'timestamp', self.timestamp.internal
+        yield 'lower', str(self.lower)
+        yield 'upper', str(self.upper)
+        yield 'object_count', self.object_count
+        yield 'bytes_used', self.bytes_used
+        yield 'meta_timestamp', self.meta_timestamp.internal
+        yield 'deleted', 1 if self.deleted else 0
+        yield 'state', self.state
+        yield 'state_timestamp', self.state_timestamp.internal
+        yield 'epoch', self.epoch.internal if self.epoch is not None else None
+
+    def copy(self, timestamp=None, **kwargs):
+        """
+        Creates a copy of the ShardRange.
+
+        :param timestamp: (optional) If given, the returned ShardRange will
+            have all of its timestamps set to this value. Otherwise the
+            returned ShardRange will have the original timestamps.
+        :return: an instance of :class:`~swift.common.utils.ShardRange`
+        """
+        new = ShardRange.from_dict(dict(self, **kwargs))
+        if timestamp:
+            new.timestamp = timestamp
+            new.meta_timestamp = new.state_timestamp = None
+        return new
+
+    @classmethod
+    def from_dict(cls, params):
+        """
+        Return an instance constructed using the given dict of params. This
+        method is deliberately less flexible than the class `__init__()` method
+        and requires all of the `__init__()` args to be given in the dict of
+        params.
+
+        :param params: a dict of parameters
+        :return: an instance of this class
+        """
+        return cls(
+            params['name'], params['timestamp'], params['lower'],
+            params['upper'], params['object_count'], params['bytes_used'],
+            params['meta_timestamp'], params['deleted'], params['state'],
+            params['state_timestamp'], params['epoch'])
+
+
+def find_shard_range(item, ranges):
+    """
+    Find a ShardRange in given list of ``shard_ranges`` whose namespace
+    contains ``item``.
+
+    :param item: The item for a which a ShardRange is to be found.
+    :param ranges: a sorted list of ShardRanges.
+    :return: the ShardRange whose namespace contains ``item``, or None if
+        no suitable range is found.
+    """
+    index = bisect.bisect_left(ranges, item)
+    if index != len(ranges) and item in ranges[index]:
+        return ranges[index]
+    return None
+
+
 def modify_priority(conf, logger):
     """
     Modify priority by nice and ionice.
@@ -4179,6 +5166,27 @@ def modify_priority(conf, logger):
     _ioprio_set(io_class, io_priority)
 
 
+def o_tmpfile_in_path_supported(dirpath):
+    fd = None
+    try:
+        fd = os.open(dirpath, os.O_WRONLY | O_TMPFILE)
+        return True
+    except OSError as e:
+        if e.errno in (errno.EINVAL, errno.EISDIR, errno.EOPNOTSUPP):
+            return False
+        else:
+            raise Exception("Error on '%(path)s' while checking "
+                            "O_TMPFILE: '%(ex)s'",
+                            {'path': dirpath, 'ex': e})
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def o_tmpfile_in_tmpdir_supported():
+    return o_tmpfile_in_path_supported(gettempdir())
+
+
 def o_tmpfile_supported():
     """
     Returns True if O_TMPFILE flag is supported.
@@ -4202,3 +5210,401 @@ def safe_json_loads(value):
         except (TypeError, ValueError):
             pass
     return None
+
+
+def strict_b64decode(value, allow_line_breaks=False):
+    '''
+    Validate and decode Base64-encoded data.
+
+    The stdlib base64 module silently discards bad characters, but we often
+    want to treat them as an error.
+
+    :param value: some base64-encoded data
+    :param allow_line_breaks: if True, ignore carriage returns and newlines
+    :returns: the decoded data
+    :raises ValueError: if ``value`` is not a string, contains invalid
+                        characters, or has insufficient padding
+    '''
+    if isinstance(value, bytes):
+        try:
+            value = value.decode('ascii')
+        except UnicodeDecodeError:
+            raise ValueError
+    if not isinstance(value, six.text_type):
+        raise ValueError
+    # b64decode will silently discard bad characters, but we want to
+    # treat them as an error
+    valid_chars = string.digits + string.ascii_letters + '/+'
+    strip_chars = '='
+    if allow_line_breaks:
+        valid_chars += '\r\n'
+        strip_chars += '\r\n'
+    if any(c not in valid_chars for c in value.strip(strip_chars)):
+        raise ValueError
+    try:
+        return base64.b64decode(value)
+    except (TypeError, binascii.Error):  # (py2 error, py3 error)
+        raise ValueError
+
+
+MD5_BLOCK_READ_BYTES = 4096
+
+
+def md5_hash_for_file(fname):
+    """
+    Get the MD5 checksum of a file.
+
+    :param fname: path to file
+    :returns: MD5 checksum, hex encoded
+    """
+    with open(fname, 'rb') as f:
+        md5sum = md5()
+        for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), b''):
+            md5sum.update(block)
+    return md5sum.hexdigest()
+
+
+def replace_partition_in_path(path, part_power):
+    """
+    Takes a full path to a file and a partition power and returns
+    the same path, but with the correct partition number. Most useful when
+    increasing the partition power.
+
+    :param path: full path to a file, for example object .data file
+    :param part_power: partition power to compute correct partition number
+    :returns: Path with re-computed partition power
+    """
+
+    path_components = path.split(os.sep)
+    digest = binascii.unhexlify(path_components[-2])
+
+    part_shift = 32 - int(part_power)
+    part = struct.unpack_from('>I', digest)[0] >> part_shift
+
+    path_components[-4] = "%d" % part
+
+    return os.sep.join(path_components)
+
+
+def load_pkg_resource(group, uri):
+    if '#' in uri:
+        uri, name = uri.split('#', 1)
+    else:
+        name = uri
+        uri = 'egg:swift'
+
+    if ':' in uri:
+        scheme, dist = uri.split(':', 1)
+        scheme = scheme.lower()
+    else:
+        scheme = 'egg'
+        dist = uri
+
+    if scheme != 'egg':
+        raise TypeError('Unhandled URI scheme: %r' % scheme)
+    return pkg_resources.load_entry_point(dist, group, name)
+
+
+class PipeMutex(object):
+    """
+    Mutex using a pipe. Works across both greenlets and real threads, even
+    at the same time.
+    """
+
+    def __init__(self):
+        self.rfd, self.wfd = os.pipe()
+
+        # You can't create a pipe in non-blocking mode; you must set it
+        # later.
+        rflags = fcntl.fcntl(self.rfd, fcntl.F_GETFL)
+        fcntl.fcntl(self.rfd, fcntl.F_SETFL, rflags | os.O_NONBLOCK)
+        os.write(self.wfd, b'-')  # start unlocked
+
+        self.owner = None
+        self.recursion_depth = 0
+
+        # Usually, it's an error to have multiple greenthreads all waiting
+        # to read the same file descriptor. It's often a sign of inadequate
+        # concurrency control; for example, if you have two greenthreads
+        # trying to use the same memcache connection, they'll end up writing
+        # interleaved garbage to the socket or stealing part of each others'
+        # responses.
+        #
+        # In this case, we have multiple greenthreads waiting on the same
+        # file descriptor by design. This lets greenthreads in real thread A
+        # wait with greenthreads in real thread B for the same mutex.
+        # Therefore, we must turn off eventlet's multiple-reader detection.
+        #
+        # It would be better to turn off multiple-reader detection for only
+        # our calls to trampoline(), but eventlet does not support that.
+        eventlet.debug.hub_prevent_multiple_readers(False)
+
+    def acquire(self, blocking=True):
+        """
+        Acquire the mutex.
+
+        If called with blocking=False, returns True if the mutex was
+        acquired and False if it wasn't. Otherwise, blocks until the mutex
+        is acquired and returns True.
+
+        This lock is recursive; the same greenthread may acquire it as many
+        times as it wants to, though it must then release it that many times
+        too.
+        """
+        current_greenthread_id = id(eventlet.greenthread.getcurrent())
+        if self.owner == current_greenthread_id:
+            self.recursion_depth += 1
+            return True
+
+        while True:
+            try:
+                # If there is a byte available, this will read it and remove
+                # it from the pipe. If not, this will raise OSError with
+                # errno=EAGAIN.
+                os.read(self.rfd, 1)
+                self.owner = current_greenthread_id
+                return True
+            except OSError as err:
+                if err.errno != errno.EAGAIN:
+                    raise
+
+                if not blocking:
+                    return False
+
+                # Tell eventlet to suspend the current greenthread until
+                # self.rfd becomes readable. This will happen when someone
+                # else writes to self.wfd.
+                trampoline(self.rfd, read=True)
+
+    def release(self):
+        """
+        Release the mutex.
+        """
+        current_greenthread_id = id(eventlet.greenthread.getcurrent())
+        if self.owner != current_greenthread_id:
+            raise RuntimeError("cannot release un-acquired lock")
+
+        if self.recursion_depth > 0:
+            self.recursion_depth -= 1
+            return
+
+        self.owner = None
+        os.write(self.wfd, b'X')
+
+    def close(self):
+        """
+        Close the mutex. This releases its file descriptors.
+
+        You can't use a mutex after it's been closed.
+        """
+        if self.wfd is not None:
+            os.close(self.rfd)
+            self.rfd = None
+            os.close(self.wfd)
+            self.wfd = None
+        self.owner = None
+        self.recursion_depth = 0
+
+    def __del__(self):
+        # We need this so we don't leak file descriptors. Otherwise, if you
+        # call get_logger() and don't explicitly dispose of it by calling
+        # logger.logger.handlers[0].lock.close() [1], the pipe file
+        # descriptors are leaked.
+        #
+        # This only really comes up in tests. Swift processes tend to call
+        # get_logger() once and then hang on to it until they exit, but the
+        # test suite calls get_logger() a lot.
+        #
+        # [1] and that's a completely ridiculous thing to expect callers to
+        # do, so nobody does it and that's okay.
+        self.close()
+
+
+class ThreadSafeSysLogHandler(SysLogHandler):
+    def createLock(self):
+        self.lock = PipeMutex()
+
+
+def round_robin_iter(its):
+    """
+    Takes a list of iterators, yield an element from each in a round-robin
+    fashion until all of them are exhausted.
+    :param its: list of iterators
+    """
+    while its:
+        for it in its:
+            try:
+                yield next(it)
+            except StopIteration:
+                its.remove(it)
+
+
+OverrideOptions = collections.namedtuple(
+    'OverrideOptions', ['devices', 'partitions', 'policies'])
+
+
+def parse_override_options(**kwargs):
+    """
+    Figure out which policies, devices, and partitions we should operate on,
+    based on kwargs.
+
+    If 'override_policies' is already present in kwargs, then return that
+    value. This happens when using multiple worker processes; the parent
+    process supplies override_policies=X to each child process.
+
+    Otherwise, in run-once mode, look at the 'policies' keyword argument.
+    This is the value of the "--policies" command-line option. In
+    run-forever mode or if no --policies option was provided, an empty list
+    will be returned.
+
+    The procedures for devices and partitions are similar.
+
+    :returns: a named tuple with fields "devices", "partitions", and
+      "policies".
+    """
+    run_once = kwargs.get('once', False)
+
+    if 'override_policies' in kwargs:
+        policies = kwargs['override_policies']
+    elif run_once:
+        policies = [
+            int(p) for p in list_from_csv(kwargs.get('policies'))]
+    else:
+        policies = []
+
+    if 'override_devices' in kwargs:
+        devices = kwargs['override_devices']
+    elif run_once:
+        devices = list_from_csv(kwargs.get('devices'))
+    else:
+        devices = []
+
+    if 'override_partitions' in kwargs:
+        partitions = kwargs['override_partitions']
+    elif run_once:
+        partitions = [
+            int(p) for p in list_from_csv(kwargs.get('partitions'))]
+    else:
+        partitions = []
+
+    return OverrideOptions(devices=devices, partitions=partitions,
+                           policies=policies)
+
+
+def distribute_evenly(items, num_buckets):
+    """
+    Distribute items as evenly as possible into N buckets.
+    """
+    out = [[] for _ in range(num_buckets)]
+    for index, item in enumerate(items):
+        out[index % num_buckets].append(item)
+    return out
+
+
+def get_redirect_data(response):
+    """
+    Extract a redirect location from a response's headers.
+
+    :param response: a response
+    :return: a tuple of (path, Timestamp) if a Location header is found,
+        otherwise None
+    :raises ValueError: if the Location header is found but a
+        X-Backend-Redirect-Timestamp is not found, or if there is a problem
+        with the format of etiher header
+    """
+    headers = HeaderKeyDict(response.getheaders())
+    if 'Location' not in headers:
+        return None
+    location = urlparse(headers['Location']).path
+    account, container, _junk = split_path(location, 2, 3, True)
+    timestamp_val = headers.get('X-Backend-Redirect-Timestamp')
+    try:
+        timestamp = Timestamp(timestamp_val)
+    except (TypeError, ValueError):
+        raise ValueError('Invalid timestamp value: %s' % timestamp_val)
+    return '%s/%s' % (account, container), timestamp
+
+
+def parse_db_filename(filename):
+    """
+    Splits a db filename into three parts: the hash, the epoch, and the
+    extension.
+
+    >>> parse_db_filename("ab2134.db")
+    ('ab2134', None, '.db')
+    >>> parse_db_filename("ab2134_1234567890.12345.db")
+    ('ab2134', '1234567890.12345', '.db')
+
+    :param filename: A db file basename or path to a db file.
+    :return: A tuple of (hash , epoch, extension). ``epoch`` may be None.
+    :raises ValueError: if ``filename`` is not a path to a file.
+    """
+    filename = os.path.basename(filename)
+    if not filename:
+        raise ValueError('Path to a file required.')
+    name, ext = os.path.splitext(filename)
+    parts = name.split('_')
+    hash_ = parts.pop(0)
+    epoch = parts[0] if parts else None
+    return hash_, epoch, ext
+
+
+def make_db_file_path(db_path, epoch):
+    """
+    Given a path to a db file, return a modified path whose filename part has
+    the given epoch.
+
+    A db filename takes the form ``<hash>[_<epoch>].db``; this method replaces
+    the ``<epoch>`` part of the given ``db_path`` with the given ``epoch``
+    value, or drops the epoch part if the given ``epoch`` is ``None``.
+
+    :param db_path: Path to a db file that does not necessarily exist.
+    :param epoch: A string (or ``None``) that will be used as the epoch
+        in the new path's filename; non-``None`` values will be
+        normalized to the normal string representation of a
+        :class:`~swift.common.utils.Timestamp`.
+    :return: A modified path to a db file.
+    :raises ValueError: if the ``epoch`` is not valid for constructing a
+        :class:`~swift.common.utils.Timestamp`.
+    """
+    hash_, _, ext = parse_db_filename(db_path)
+    db_dir = os.path.dirname(db_path)
+    if epoch is None:
+        return os.path.join(db_dir, hash_ + ext)
+    epoch = Timestamp(epoch).normal
+    return os.path.join(db_dir, '%s_%s%s' % (hash_, epoch, ext))
+
+
+def get_db_files(db_path):
+    """
+    Given the path to a db file, return a sorted list of all valid db files
+    that actually exist in that path's dir. A valid db filename has the form:
+
+        <hash>[_<epoch>].db
+
+    where <hash> matches the <hash> part of the given db_path as would be
+    parsed by :meth:`~swift.utils.common.parse_db_filename`.
+
+    :param db_path: Path to a db file that does not necessarily exist.
+    :return: List of valid db files that do exist in the dir of the
+        ``db_path``. This list may be empty.
+    """
+    db_dir, db_file = os.path.split(db_path)
+    try:
+        files = os.listdir(db_dir)
+    except OSError as err:
+        if err.errno == errno.ENOENT:
+            return []
+        raise
+    if not files:
+        return []
+    match_hash, epoch, ext = parse_db_filename(db_file)
+    results = []
+    for f in files:
+        hash_, epoch, ext = parse_db_filename(f)
+        if ext != '.db':
+            continue
+        if hash_ != match_hash:
+            continue
+        results.append(os.path.join(db_dir, f))
+    return sorted(results)

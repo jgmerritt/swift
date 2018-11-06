@@ -105,6 +105,10 @@ class DiskFileXattrNotSupported(DiskFileError):
     pass
 
 
+class DiskFileBadMetadataChecksum(DiskFileError):
+    pass
+
+
 class DeviceUnavailable(SwiftException):
     pass
 
@@ -195,6 +199,10 @@ class SegmentError(SwiftException):
     pass
 
 
+class LinkIterError(SwiftException):
+    pass
+
+
 class ReplicationException(Exception):
     pass
 
@@ -212,6 +220,10 @@ class APIVersionError(SwiftException):
 
 
 class EncryptionException(SwiftException):
+    pass
+
+
+class UnknownSecretIdError(EncryptionException):
     pass
 
 

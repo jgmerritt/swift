@@ -18,14 +18,13 @@ from six.moves.urllib.parse import unquote
 from swift import gettext_ as _
 
 from swift.account.utils import account_listing_response
-from swift.common.request_helpers import get_listing_content_type
 from swift.common.middleware.acl import parse_acl, format_acl
 from swift.common.utils import public
 from swift.common.constraints import check_metadata
-from swift.common import constraints
 from swift.common.http import HTTP_NOT_FOUND, HTTP_GONE
 from swift.proxy.controllers.base import Controller, clear_info_cache, \
     set_info_cache
+from swift.common.middleware import listing_formats
 from swift.common.swob import HTTPBadRequest, HTTPMethodNotAllowed
 from swift.common.request_helpers import get_sys_meta_prefix
 
@@ -35,7 +34,7 @@ class AccountController(Controller):
     server_type = 'Account'
 
     def __init__(self, app, account_name, **kwargs):
-        Controller.__init__(self, app)
+        super(AccountController, self).__init__(app)
         self.account_name = unquote(account_name)
         if not self.app.allow_account_management:
             self.allowed_methods.remove('PUT')
@@ -53,11 +52,11 @@ class AccountController(Controller):
 
     def GETorHEAD(self, req):
         """Handler for HTTP GET/HEAD requests."""
-        if len(self.account_name) > constraints.MAX_ACCOUNT_NAME_LENGTH:
+        length_limit = self.get_name_length_limit()
+        if len(self.account_name) > length_limit:
             resp = HTTPBadRequest(request=req)
             resp.body = 'Account name length of %d longer than %d' % \
-                        (len(self.account_name),
-                         constraints.MAX_ACCOUNT_NAME_LENGTH)
+                        (len(self.account_name), length_limit)
             # Don't cache this. We know the account doesn't exist because
             # the name is bad; we don't need to cache that because it's
             # really cheap to recompute.
@@ -67,6 +66,9 @@ class AccountController(Controller):
         concurrency = self.app.account_ring.replica_count \
             if self.app.concurrent_gets else 1
         node_iter = self.app.iter_nodes(self.app.account_ring, partition)
+        params = req.params
+        params['format'] = 'json'
+        req.params = params
         resp = self.GETorHEAD_base(
             req, _('Account'), node_iter, partition,
             req.swift_entity_path.rstrip('/'), concurrency)
@@ -86,8 +88,9 @@ class AccountController(Controller):
                 # creates the account if necessary. If we feed it a perfect
                 # lie, it'll just try to create the container without
                 # creating the account, and that'll fail.
-                resp = account_listing_response(self.account_name, req,
-                                                get_listing_content_type(req))
+                resp = account_listing_response(
+                    self.account_name, req,
+                    listing_formats.get_listing_content_type(req))
                 resp.headers['X-Backend-Fake-Account-Listing'] = 'yes'
 
         # Cache this. We just made a request to a storage node and got
@@ -113,11 +116,11 @@ class AccountController(Controller):
         error_response = check_metadata(req, 'account')
         if error_response:
             return error_response
-        if len(self.account_name) > constraints.MAX_ACCOUNT_NAME_LENGTH:
+        length_limit = self.get_name_length_limit()
+        if len(self.account_name) > length_limit:
             resp = HTTPBadRequest(request=req)
             resp.body = 'Account name length of %d longer than %d' % \
-                        (len(self.account_name),
-                         constraints.MAX_ACCOUNT_NAME_LENGTH)
+                        (len(self.account_name), length_limit)
             return resp
         account_partition, accounts = \
             self.app.account_ring.get_nodes(self.account_name)
@@ -132,11 +135,11 @@ class AccountController(Controller):
     @public
     def POST(self, req):
         """HTTP POST request handler."""
-        if len(self.account_name) > constraints.MAX_ACCOUNT_NAME_LENGTH:
+        length_limit = self.get_name_length_limit()
+        if len(self.account_name) > length_limit:
             resp = HTTPBadRequest(request=req)
             resp.body = 'Account name length of %d longer than %d' % \
-                        (len(self.account_name),
-                         constraints.MAX_ACCOUNT_NAME_LENGTH)
+                        (len(self.account_name), length_limit)
             return resp
         error_response = check_metadata(req, 'account')
         if error_response:

@@ -28,6 +28,11 @@ The supported headers are,
 |                                                | Space separated.             |
 +------------------------------------------------+------------------------------+
 
+In addition the the values set in container metadata, some cluster-wide values
+may also be configured using the ``strict_cors_mode``, ``cors_allow_origin``
+and ``cors_expose_headers`` in ``proxy-server.conf``. See
+``proxy-server.conf-sample`` for more information.
+
 Before a browser issues an actual request it may issue a `preflight request`_.
 The preflight request is an OPTIONS call to verify the Origin is allowed to
 make the request. The sequence of events are,
@@ -48,6 +53,14 @@ returns the following values for this header,
 * all metadata headers (``X-Container-Meta-*`` for containers and
   ``X-Object-Meta-*`` for objects)
 * headers listed in ``X-Container-Meta-Access-Control-Expose-Headers``
+* headers configured using the ``cors_expose_headers`` option in
+  ``proxy-server.conf``
+
+.. note::
+    An OPTIONS request to a symlink object will respond with the options for
+    the symlink only, the request will not be redirected to the target object.
+    Therefore, if the symlink's target object is in another container with
+    CORS settings, the response will not reflect the settings.
 
 
 -----------------

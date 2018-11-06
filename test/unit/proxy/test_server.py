@@ -42,32 +42,34 @@ from collections import defaultdict
 import uuid
 
 import mock
-from eventlet import sleep, spawn, wsgi, listen, Timeout, debug
+from eventlet import sleep, spawn, wsgi, Timeout, debug
 from eventlet.green import httplib
 from six import BytesIO
 from six import StringIO
 from six.moves import range
-from six.moves.urllib.parse import quote
+from six.moves.urllib.parse import quote, parse_qsl
 
-from swift.common.utils import hash_path, storage_directory, \
-    parse_content_type, parse_mime_headers, \
-    iter_multipart_mime_documents, public
-
+from test import listen_zero
 from test.unit import (
     connect_tcp, readuntil2crlfs, FakeLogger, fake_http_connect, FakeRing,
     FakeMemcache, debug_logger, patch_policies, write_fake_ring,
-    mocked_http_conn, DEFAULT_TEST_EC_TYPE, make_timestamp_iter)
+    mocked_http_conn, DEFAULT_TEST_EC_TYPE, make_timestamp_iter,
+    skip_if_no_xattrs)
+from test.unit.helpers import setup_servers, teardown_servers
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers.obj import ReplicatedObjectController
 from swift.obj import server as object_server
+from swift.common.bufferedhttp import BufferedHTTPResponse
 from swift.common.middleware import proxy_logging, versioned_writes, \
-    copy
+    copy, listing_formats
 from swift.common.middleware.acl import parse_acl, format_acl
 from swift.common.exceptions import ChunkReadTimeout, DiskFileNotExist, \
     APIVersionError, ChunkWriteTimeout
 from swift.common import utils, constraints
-from swift.common.utils import mkdirs, NullLogger
-from swift.common.wsgi import monkey_patch_mimetools, loadapp
+from swift.common.utils import hash_path, storage_directory, \
+    parse_content_type, parse_mime_headers, \
+    iter_multipart_mime_documents, public, mkdirs, NullLogger
+from swift.common.wsgi import monkey_patch_mimetools, loadapp, ConfigString
 from swift.proxy.controllers import base as proxy_base
 from swift.proxy.controllers.base import get_cache_key, cors_validation, \
     get_account_info, get_container_info
@@ -79,8 +81,6 @@ from swift.common.swob import Request, Response, HTTPUnauthorized, \
 from swift.common.storage_policy import StoragePolicy, POLICIES
 import swift.common.request_helpers
 from swift.common.request_helpers import get_sys_meta_prefix
-
-from test.unit.helpers import setup_servers, teardown_servers
 
 # mocks
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
@@ -118,11 +118,11 @@ def unpatch_policies(f):
     return wrapper
 
 
-def setup():
+def setUpModule():
     do_setup(object_server)
 
 
-def teardown():
+def tearDownModule():
     teardown_servers(_test_context)
 
 
@@ -239,6 +239,7 @@ def _limit_max_file_size(f):
 class TestController(unittest.TestCase):
 
     def setUp(self):
+        skip_if_no_xattrs()
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
         self.memcache = FakeMemcache()
@@ -333,6 +334,10 @@ class TestController(unittest.TestCase):
                               'container_count': '12345',
                               'total_object_count': None,
                               'bytes': None,
+                              'storage_policies': {p.idx: {
+                                  'container_count': 0,
+                                  'object_count': 0,
+                                  'bytes': 0} for p in POLICIES},
                               'meta': {},
                               'sysmeta': {}}
             self.assertEqual(container_info,
@@ -360,6 +365,10 @@ class TestController(unittest.TestCase):
                             'container_count': None,  # internally keep None
                             'total_object_count': None,
                             'bytes': None,
+                            'storage_policies': {p.idx: {
+                                'container_count': 0,
+                                'object_count': 0,
+                                'bytes': 0} for p in POLICIES},
                             'meta': {},
                             'sysmeta': {}}
             self.assertEqual(account_info,
@@ -553,17 +562,47 @@ class TestController(unittest.TestCase):
 
 
 @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
-class TestProxyServer(unittest.TestCase):
+class TestProxyServerConfiguration(unittest.TestCase):
+    def _make_app(self, conf):
+        # helper function to instantiate a proxy server instance
+        return proxy_server.Application(conf, FakeMemcache(),
+                                        container_ring=FakeRing(),
+                                        account_ring=FakeRing())
 
-    def test_creation(self):
+    def test_node_timeout(self):
         # later config should be extended to assert more config options
-        app = proxy_server.Application({'node_timeout': '3.5',
-                                        'recoverable_node_timeout': '1.5'},
-                                       FakeMemcache(),
-                                       container_ring=FakeRing(),
-                                       account_ring=FakeRing())
+        app = self._make_app({'node_timeout': '3.5',
+                              'recoverable_node_timeout': '1.5'})
         self.assertEqual(app.node_timeout, 3.5)
         self.assertEqual(app.recoverable_node_timeout, 1.5)
+
+    def test_cors_options(self):
+        # check defaults
+        app = self._make_app({})
+        self.assertFalse(app.cors_allow_origin)
+        self.assertFalse(app.cors_expose_headers)
+        self.assertTrue(app.strict_cors_mode)
+
+        # check custom configs
+        app = self._make_app({
+            'cors_allow_origin': '',
+            'cors_expose_headers': '',
+            'strict_cors_mode': 'True'})
+        self.assertTrue(app.strict_cors_mode)
+
+        app = self._make_app({
+            'cors_allow_origin': ' http://X.com,http://Y.com ,,  http://Z.com',
+            'cors_expose_headers': ' custom1,,,  custom2,custom3,,',
+            'strict_cors_mode': 'False'})
+        self.assertEqual({'http://X.com', 'http://Y.com', 'http://Z.com'},
+                         set(app.cors_allow_origin))
+        self.assertEqual({'custom1', 'custom2', 'custom3'},
+                         set(app.cors_expose_headers))
+        self.assertFalse(app.strict_cors_mode)
+
+
+@patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing())])
+class TestProxyServer(unittest.TestCase):
 
     def test_get_object_ring(self):
         baseapp = proxy_server.Application({},
@@ -750,20 +789,155 @@ class TestProxyServer(unittest.TestCase):
                        {'ip': '127.0.0.1'}]
         self.assertEqual(res, exp_sorting)
 
-    def test_node_affinity(self):
-        baseapp = proxy_server.Application({'sorting_method': 'affinity',
-                                            'read_affinity': 'r1=1'},
+    def _do_sort_nodes(self, conf, policy_conf, nodes, policy,
+                       node_timings=None):
+        # Note with shuffling mocked out, sort_nodes will by default return
+        # nodes in the order they are given
+        nodes = list(nodes)
+        conf = dict(conf, policy_config=policy_conf)
+        baseapp = proxy_server.Application(conf,
                                            FakeMemcache(),
+                                           logger=FakeLogger(),
                                            container_ring=FakeRing(),
                                            account_ring=FakeRing())
-
-        nodes = [{'region': 2, 'zone': 1, 'ip': '127.0.0.1'},
-                 {'region': 1, 'zone': 2, 'ip': '127.0.0.2'}]
+        if node_timings:
+            for i, n in enumerate(nodes):
+                baseapp.set_node_timing(n, node_timings[i])
         with mock.patch('swift.proxy.server.shuffle', lambda x: x):
-            app_sorted = baseapp.sort_nodes(nodes)
-            exp_sorted = [{'region': 1, 'zone': 2, 'ip': '127.0.0.2'},
-                          {'region': 2, 'zone': 1, 'ip': '127.0.0.1'}]
-            self.assertEqual(exp_sorted, app_sorted)
+            app_sorted = baseapp.sort_nodes(nodes, policy)
+        self.assertFalse(baseapp.logger.get_lines_for_level('warning'))
+        return baseapp, app_sorted
+
+    def test_sort_nodes_default(self):
+        nodes = [{'region': 0, 'zone': 1, 'ip': '127.0.0.3'},
+                 {'region': 1, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 2, 'zone': 2, 'ip': '127.0.0.2'}]
+
+        # sanity check - no affinity conf results in node order unchanged
+        app, actual = self._do_sort_nodes({}, {}, nodes, None)
+        self.assertEqual(nodes, actual)
+
+    def test_sort_nodes_by_affinity_proxy_server_config(self):
+        nodes = [{'region': 0, 'zone': 1, 'ip': '127.0.0.3'},
+                 {'region': 1, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 2, 'zone': 2, 'ip': '127.0.0.2'}]
+
+        # proxy-server affinity conf is to prefer r2
+        conf = {'sorting_method': 'affinity', 'read_affinity': 'r2=1'}
+        app, actual = self._do_sort_nodes(conf, {}, nodes, None)
+        self.assertEqual([nodes[2], nodes[0], nodes[1]], actual)
+        app, actual = self._do_sort_nodes(conf, {}, nodes, POLICIES[0])
+        self.assertEqual([nodes[2], nodes[0], nodes[1]], actual)
+        # check that node timings are not collected if sorting_method != timing
+        self.assertFalse(app.sorts_by_timing)  # sanity check
+        self.assertFalse(app.node_timings)  # sanity check
+
+        # proxy-server affinity conf is to prefer region 1
+        conf = {'sorting_method': 'affinity', 'read_affinity': 'r1=1'}
+        app, actual = self._do_sort_nodes(conf, {}, nodes, None)
+        self.assertEqual([nodes[1], nodes[0], nodes[2]], actual)
+        app, actual = self._do_sort_nodes(conf, {}, nodes, POLICIES[0])
+        self.assertEqual([nodes[1], nodes[0], nodes[2]], actual)
+
+    @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
+                     StoragePolicy(1, 'one', False, object_ring=FakeRing())])
+    def test_sort_nodes_by_affinity_per_policy(self):
+        nodes = [{'region': 0, 'zone': 1, 'ip': '127.0.0.4'},
+                 {'region': 1, 'zone': 0, 'ip': '127.0.0.3'},
+                 {'region': 2, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 3, 'zone': 0, 'ip': '127.0.0.2'}]
+        conf = {'sorting_method': 'affinity', 'read_affinity': 'r3=1'}
+        per_policy = {'0': {'sorting_method': 'affinity',
+                            'read_affinity': 'r1=1'},
+                      '1': {'sorting_method': 'affinity',
+                            'read_affinity': 'r2=1'}}
+        # policy 0 affinity prefers r1
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[0])
+        self.assertEqual([nodes[1], nodes[0], nodes[2], nodes[3]], actual)
+        # policy 1 affinity prefers r2
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[1])
+        self.assertEqual([nodes[2], nodes[0], nodes[1], nodes[3]], actual)
+        # default affinity prefers r3
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, None)
+        self.assertEqual([nodes[3], nodes[0], nodes[1], nodes[2]], actual)
+
+    def test_sort_nodes_by_affinity_per_policy_with_no_default(self):
+        # no proxy-server setting but policy 0 prefers r0
+        nodes = [{'region': 1, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 0, 'zone': 2, 'ip': '127.0.0.2'}]
+        conf = {}
+        per_policy = {'0': {'sorting_method': 'affinity',
+                            'read_affinity': 'r0=0'}}
+        # policy 0 uses affinity sorting
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[0])
+        self.assertEqual([nodes[1], nodes[0]], actual)
+        # any other policy will use default sorting
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, None)
+        self.assertEqual(nodes, actual)
+
+    def test_sort_nodes_by_affinity_per_policy_inherits(self):
+        # policy 0 has read_affinity but no sorting_method override,
+        nodes = [{'region': 1, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 0, 'zone': 2, 'ip': '127.0.0.2'}]
+        conf = {}
+        per_policy = {'0': {'read_affinity': 'r0=0'}}
+        # policy 0 uses the default sorting method instead of affinity sorting
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[0])
+        self.assertEqual(nodes, actual)
+        # but if proxy-server sorting_method is affinity then policy 0 inherits
+        conf = {'sorting_method': 'affinity'}
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[0])
+        self.assertEqual([nodes[1], nodes[0]], actual)
+
+    def test_sort_nodes_by_affinity_per_policy_overrides(self):
+        # default setting is to sort by timing but policy 0 uses read affinity
+        nodes = [{'region': 0, 'zone': 1, 'ip': '127.0.0.3'},
+                 {'region': 1, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 2, 'zone': 2, 'ip': '127.0.0.2'}]
+        node_timings = [10, 1, 100]
+        conf = {'sorting_method': 'timing'}
+        per_policy = {'0': {'sorting_method': 'affinity',
+                            'read_affinity': 'r1=1,r2=2'}}
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[0],
+                                          node_timings=node_timings)
+        self.assertEqual([nodes[1], nodes[2], nodes[0]], actual)
+        # check that timings are collected despite one policy using affinity
+        self.assertTrue(app.sorts_by_timing)
+        self.assertEqual(3, len(app.node_timings))
+        # check app defaults to sorting by timing when no policy specified
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, None,
+                                          node_timings=node_timings)
+        self.assertEqual([nodes[1], nodes[0], nodes[2]], actual)
+
+    @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
+                     StoragePolicy(1, 'one', False, object_ring=FakeRing())])
+    def test_sort_nodes_by_timing_per_policy(self):
+        # default setting is to sort by affinity but policy 0 uses timing
+        nodes = [{'region': 0, 'zone': 1, 'ip': '127.0.0.3'},
+                 {'region': 1, 'zone': 1, 'ip': '127.0.0.1'},
+                 {'region': 2, 'zone': 2, 'ip': '127.0.0.2'}]
+        node_timings = [10, 1, 100]
+
+        conf = {'sorting_method': 'affinity', 'read_affinity': 'r1=1,r2=2'}
+        per_policy = {'0': {'sorting_method': 'timing',
+                            'read_affinity': 'r1=1,r2=2'},  # should be ignored
+                      '1': {'read_affinity': 'r2=1'}}
+        # policy 0 uses timing
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[0],
+                                          node_timings=node_timings)
+        self.assertEqual([nodes[1], nodes[0], nodes[2]], actual)
+        self.assertTrue(app.sorts_by_timing)
+        self.assertEqual(3, len(app.node_timings))
+
+        # policy 1 uses policy specific read affinity
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, POLICIES[1],
+                                          node_timings=node_timings)
+        self.assertEqual([nodes[2], nodes[0], nodes[1]], actual)
+
+        # check that with no policy specified the default read affinity is used
+        app, actual = self._do_sort_nodes(conf, per_policy, nodes, None,
+                                          node_timings=node_timings)
+        self.assertEqual([nodes[1], nodes[2], nodes[0]], actual)
 
     def test_node_concurrency(self):
         nodes = [{'region': 1, 'zone': 1, 'ip': '127.0.0.1', 'port': 6010,
@@ -1143,41 +1317,586 @@ class TestProxyServerLoading(unittest.TestCase):
             self.assertTrue(policy.object_ring)
 
 
-@patch_policies([StoragePolicy(0, 'zero', True,
-                               object_ring=FakeRing(base_port=3000))])
-class TestObjectController(unittest.TestCase):
+@patch_policies()
+class TestProxyServerConfigLoading(unittest.TestCase):
 
     def setUp(self):
-        self.app = proxy_server.Application(
-            None, FakeMemcache(),
-            logger=debug_logger('proxy-ut'),
-            account_ring=FakeRing(),
-            container_ring=FakeRing())
-        # clear proxy logger result for each test
-        _test_servers[0].logger._clear()
+        skip_if_no_xattrs()
+        self.tempdir = mkdtemp()
+        account_ring_path = os.path.join(self.tempdir, 'account.ring.gz')
+        write_fake_ring(account_ring_path)
+        container_ring_path = os.path.join(self.tempdir, 'container.ring.gz')
+        write_fake_ring(container_ring_path)
 
     def tearDown(self):
-        self.app.account_ring.set_replicas(3)
-        self.app.container_ring.set_replicas(3)
-        for policy in POLICIES:
-            policy.object_ring = FakeRing(base_port=3000)
+        rmtree(self.tempdir)
 
-    def put_container(self, policy_name, container_name):
-        # Note: only works if called with unpatched policies
-        prolis = _test_sockets[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/%s HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: 0\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'X-Storage-Policy: %s\r\n'
-                 '\r\n' % (container_name, policy_name))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 2'
-        self.assertEqual(headers[:len(exp)], exp)
+    def _write_conf(self, conf_body):
+        # this is broken out to a method so that subclasses can override
+        conf_path = os.path.join(self.tempdir, 'proxy-server.conf')
+        with open(conf_path, 'w') as f:
+            f.write(dedent(conf_body))
+        return conf_path
+
+    def _write_conf_and_load_app(self, conf_sections, app_name='proxy-server'):
+        # write proxy-server.conf file, load app
+        conf_body = dedent("""
+        [DEFAULT]
+        swift_dir = %s
+
+        [pipeline:main]
+        pipeline = %s
+
+        %s
+        """) % (self.tempdir, app_name, dedent(conf_sections))
+
+        conf_path = self._write_conf(conf_body)
+        with mock.patch('swift.proxy.server.get_logger',
+                        return_value=FakeLogger()):
+            app = loadapp(conf_path, allow_modify_pipeline=False)
+        return app
+
+    def _check_policy_options(self, app, exp_options, exp_is_local):
+        # verify expected config
+        for policy, options in exp_options.items():
+            for k, v in options.items():
+                actual = getattr(app.get_policy_options(policy), k)
+                if k == "write_affinity_node_count_fn":
+                    if policy:  # this check only applies when using a policy
+                        actual = actual(policy.object_ring.replica_count)
+                        self.assertEqual(v, actual)
+                    continue
+                self.assertEqual(v, actual,
+                                 "Expected %s=%s but got %s=%s for policy %s" %
+                                 (k, v, k, actual, policy))
+
+        for policy, nodes in exp_is_local.items():
+            fn = app.get_policy_options(policy).write_affinity_is_local_fn
+            if nodes is None:
+                self.assertIsNone(fn)
+                continue
+            for node, expected_result in nodes:
+                actual = fn(node)
+                self.assertIs(expected_result, actual,
+                              "Expected %s but got %s for %s, policy %s" %
+                              (expected_result, actual, node, policy))
+
+    def test_per_policy_conf_none_configured(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        """
+        expected_default = {"read_affinity": "",
+                            "sorting_method": "shuffle",
+                            "write_affinity": "",
+                            "write_affinity_node_count_fn": 6}
+        exp_options = {None: expected_default,
+                       POLICIES[0]: expected_default,
+                       POLICIES[1]: expected_default}
+        exp_is_local = {POLICIES[0]: None,
+                        POLICIES[1]: None}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, exp_is_local)
+
+    def test_per_policy_conf_one_configured(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        read_affinity = r1=100
+        write_affinity = r1
+        write_affinity_node_count = 1 * replicas
+        write_affinity_handoff_delete_count = 4
+        """
+        expected_default = {"read_affinity": "",
+                            "sorting_method": "shuffle",
+                            "write_affinity": "",
+                            "write_affinity_node_count_fn": 6,
+                            "write_affinity_handoff_delete_count": None}
+        exp_options = {None: expected_default,
+                       POLICIES[0]: {"read_affinity": "r1=100",
+                                     "sorting_method": "affinity",
+                                     "write_affinity": "r1",
+                                     "write_affinity_node_count_fn": 3,
+                                     "write_affinity_handoff_delete_count": 4},
+                       POLICIES[1]: expected_default}
+        exp_is_local = {POLICIES[0]: [({'region': 1, 'zone': 2}, True),
+                                      ({'region': 2, 'zone': 1}, False)],
+                        POLICIES[1]: None}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, exp_is_local)
+
+        default_options = app.get_policy_options(None)
+        self.assertEqual(
+            "ProxyOverrideOptions({}, {'sorting_method': 'shuffle', "
+            "'read_affinity': '', 'write_affinity': '', "
+            "'write_affinity_node_count': '2 * replicas', "
+            "'write_affinity_handoff_delete_count': None})",
+            repr(default_options))
+        self.assertEqual(default_options, eval(repr(default_options), {
+            'ProxyOverrideOptions': default_options.__class__}))
+
+        policy_0_options = app.get_policy_options(POLICIES[0])
+        self.assertEqual(
+            "ProxyOverrideOptions({}, {'sorting_method': 'affinity', "
+            "'read_affinity': 'r1=100', 'write_affinity': 'r1', "
+            "'write_affinity_node_count': '1 * replicas', "
+            "'write_affinity_handoff_delete_count': 4})",
+            repr(policy_0_options))
+        self.assertEqual(policy_0_options, eval(repr(policy_0_options), {
+            'ProxyOverrideOptions': policy_0_options.__class__}))
+        self.assertNotEqual(default_options, policy_0_options)
+
+        policy_1_options = app.get_policy_options(POLICIES[1])
+        self.assertIs(default_options, policy_1_options)
+
+    def test_per_policy_conf_inherits_defaults(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = affinity
+        write_affinity_node_count = 1 * replicas
+        write_affinity_handoff_delete_count = 3
+
+        [proxy-server:policy:0]
+        read_affinity = r1=100
+        write_affinity = r1
+        """
+        expected_default = {"read_affinity": "",
+                            "sorting_method": "affinity",
+                            "write_affinity": "",
+                            "write_affinity_node_count_fn": 3,
+                            "write_affinity_handoff_delete_count": 3}
+        exp_options = {None: expected_default,
+                       POLICIES[0]: {"read_affinity": "r1=100",
+                                     "sorting_method": "affinity",
+                                     "write_affinity": "r1",
+                                     "write_affinity_node_count_fn": 3,
+                                     "write_affinity_handoff_delete_count": 3},
+                       POLICIES[1]: expected_default}
+        exp_is_local = {POLICIES[0]: [({'region': 1, 'zone': 2}, True),
+                                      ({'region': 2, 'zone': 1}, False)],
+                        POLICIES[1]: None}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, exp_is_local)
+
+    def test_per_policy_conf_overrides_default_affinity(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = affinity
+        read_affinity = r2=10
+        write_affinity_node_count = 1 * replicas
+        write_affinity = r2
+        write_affinity_handoff_delete_count = 2
+
+        [proxy-server:policy:0]
+        read_affinity = r1=100
+        write_affinity = r1
+        write_affinity_node_count = 5
+        write_affinity_handoff_delete_count = 3
+
+        [proxy-server:policy:1]
+        read_affinity = r1=1
+        write_affinity = r3
+        write_affinity_node_count = 4
+        write_affinity_handoff_delete_count = 4
+        """
+        exp_options = {None: {"read_affinity": "r2=10",
+                              "sorting_method": "affinity",
+                              "write_affinity": "r2",
+                              "write_affinity_node_count_fn": 3,
+                              "write_affinity_handoff_delete_count": 2},
+                       POLICIES[0]: {"read_affinity": "r1=100",
+                                     "sorting_method": "affinity",
+                                     "write_affinity": "r1",
+                                     "write_affinity_node_count_fn": 5,
+                                     "write_affinity_handoff_delete_count": 3},
+                       POLICIES[1]: {"read_affinity": "r1=1",
+                                     "sorting_method": "affinity",
+                                     "write_affinity": "r3",
+                                     "write_affinity_node_count_fn": 4,
+                                     "write_affinity_handoff_delete_count": 4}}
+        exp_is_local = {POLICIES[0]: [({'region': 1, 'zone': 2}, True),
+                                      ({'region': 2, 'zone': 1}, False)],
+                        POLICIES[1]: [({'region': 3, 'zone': 2}, True),
+                                      ({'region': 1, 'zone': 1}, False),
+                                      ({'region': 2, 'zone': 1}, False)]}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, exp_is_local)
+
+    def test_per_policy_conf_overrides_default_sorting_method(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = timing
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        read_affinity = r1=100
+
+        [proxy-server:policy:1]
+        sorting_method = affinity
+        read_affinity = r1=1
+        """
+        exp_options = {None: {"read_affinity": "",
+                              "sorting_method": "timing"},
+                       POLICIES[0]: {"read_affinity": "r1=100",
+                                     "sorting_method": "affinity"},
+                       POLICIES[1]: {"read_affinity": "r1=1",
+                                     "sorting_method": "affinity"}}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
+
+    def test_per_policy_conf_with_DEFAULT_options(self):
+        conf_body = """
+        [DEFAULT]
+        write_affinity = r0
+        read_affinity = r0=100
+        swift_dir = %s
+
+        [pipeline:main]
+        pipeline = proxy-server
+
+        [app:proxy-server]
+        use = egg:swift#proxy
+        # in a paste-deploy section, DEFAULT section value overrides
+        write_affinity = r2
+        # ...but the use of 'set' overrides the DEFAULT section value
+        set read_affinity = r1=100
+
+        [proxy-server:policy:0]
+        # not a paste-deploy section so any value here overrides DEFAULT
+        sorting_method = affinity
+        write_affinity = r2
+        read_affinity = r2=100
+
+        [proxy-server:policy:1]
+        sorting_method = affinity
+        """ % self.tempdir
+
+        # Don't just use _write_conf_and_load_app, as we don't want to have
+        # duplicate DEFAULT sections
+        conf_path = self._write_conf(conf_body)
+        with mock.patch('swift.proxy.server.get_logger',
+                        return_value=FakeLogger()):
+            app = loadapp(conf_path, allow_modify_pipeline=False)
+
+        exp_options = {
+            # default read_affinity is r1, set in proxy-server section
+            None: {"read_affinity": "r1=100",
+                   "sorting_method": "shuffle",
+                   "write_affinity": "r0",
+                   "write_affinity_node_count_fn": 6,
+                   "write_affinity_handoff_delete_count": None},
+            # policy 0 read affinity is r2, dictated by policy 0 section
+            POLICIES[0]: {"read_affinity": "r2=100",
+                          "sorting_method": "affinity",
+                          "write_affinity": "r2",
+                          "write_affinity_node_count_fn": 6,
+                          "write_affinity_handoff_delete_count": None},
+            # policy 1 read_affinity is r0, dictated by DEFAULT section,
+            # overrides proxy server section
+            POLICIES[1]: {"read_affinity": "r0=100",
+                          "sorting_method": "affinity",
+                          "write_affinity": "r0",
+                          "write_affinity_node_count_fn": 6,
+                          "write_affinity_handoff_delete_count": None}}
+        exp_is_local = {
+            # default write_affinity is r0, dictated by DEFAULT section
+            None: [({'region': 0, 'zone': 2}, True),
+                   ({'region': 1, 'zone': 1}, False)],
+            # policy 0 write_affinity is r2, dictated by policy 0 section
+            POLICIES[0]: [({'region': 0, 'zone': 2}, False),
+                          ({'region': 2, 'zone': 1}, True)],
+            # policy 1 write_affinity is r0, inherited from default
+            POLICIES[1]: [({'region': 0, 'zone': 2}, True),
+                          ({'region': 1, 'zone': 1}, False)]}
+        self._check_policy_options(app, exp_options, exp_is_local)
+
+    def test_per_policy_conf_warns_about_sorting_method_mismatch(self):
+        # verify that policy specific warnings are emitted when read_affinity
+        # is set but sorting_method is not affinity
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        read_affinity = r2=10
+        sorting_method = timing
+
+        [proxy-server:policy:0]
+        read_affinity = r1=100
+
+        [proxy-server:policy:1]
+        sorting_method = affinity
+        read_affinity = r1=1
+        """
+        exp_options = {None: {"read_affinity": "r2=10",
+                              "sorting_method": "timing"},
+                       POLICIES[0]: {"read_affinity": "r1=100",
+                                     "sorting_method": "timing"},
+                       POLICIES[1]: {"read_affinity": "r1=1",
+                                     "sorting_method": "affinity"}}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
+        lines = app.logger.get_lines_for_level('warning')
+        labels = {'default', 'policy 0 (nulo)'}
+        for line in lines[:2]:
+            self.assertIn(
+                "sorting_method is set to 'timing', not 'affinity'", line)
+            for label in labels:
+                if label in line:
+                    labels.remove(label)
+                    break
+            else:
+                self.fail("None of %s found in warning: %r" % (labels, line))
+        self.assertFalse(labels)
+
+    def test_per_policy_conf_warns_override_sorting_method_mismatch(self):
+        # verify that policy specific warnings are emitted when read_affinity
+        # is set but sorting_method is not affinity in a policy config
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = affinity
+        read_affinity = r2=10
+
+        [proxy-server:policy:0]
+        sorting_method = timing
+        """
+        exp_options = {None: {"read_affinity": "r2=10",
+                              "write_affinity": "",
+                              "sorting_method": "affinity"},
+                       POLICIES[0]: {"read_affinity": "r2=10",
+                                     "write_affinity": "",
+                                     "sorting_method": "timing"}}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
+        lines = app.logger.get_lines_for_level('warning')
+        for line in lines:
+            # proxy-server gets instantiated twice during loadapp so expect two
+            # warnings; check that both warnings refer to policy 0 and not the
+            # default config
+            self.assertIn(
+                "sorting_method is set to 'timing', not 'affinity'", line)
+            self.assertIn('policy 0 (nulo)', line)
+        self.assertFalse(lines[2:])
+
+    def test_per_policy_conf_section_name_inherits_from_app_section_name(self):
+        conf_sections = """
+        [app:proxy-srv]
+        use = egg:swift#proxy
+        sorting_method = affinity
+
+        [proxy-server:policy:0]
+        sorting_method = timing
+        # ignored!
+
+        [proxy-srv:policy:1]
+        sorting_method = shuffle
+        """
+        exp_options = {None: {'sorting_method': 'affinity'},
+                       POLICIES[0]: {'sorting_method': 'affinity'},
+                       POLICIES[1]: {'sorting_method': 'shuffle'}}
+        app = self._write_conf_and_load_app(conf_sections, 'proxy-srv')
+        self._check_policy_options(app, exp_options, {})
+
+    def test_per_policy_conf_with_unknown_policy(self):
+        # verify that unknown policy section raises an error
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        read_affinity = r2=10
+        sorting_method = affinity
+
+        [proxy-server:policy:999]
+        read_affinity = r2z1=1
+        """
+        with self.assertRaises(ValueError) as cm:
+            self._write_conf_and_load_app(conf_sections)
+        self.assertIn('No policy found for override config, index: 999',
+                      cm.exception.message)
+
+    def test_per_policy_conf_sets_timing_sorting_method(self):
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = affinity
+
+        [proxy-server:policy:0]
+        sorting_method = timing
+
+        [proxy-server:policy:1]
+        read_affinity = r1=1
+        """
+        exp_options = {None: {"read_affinity": "",
+                              "sorting_method": "affinity"},
+                       POLICIES[0]: {"read_affinity": "",
+                                     "sorting_method": "timing"},
+                       POLICIES[1]: {"read_affinity": "r1=1",
+                                     "sorting_method": "affinity"}}
+        app = self._write_conf_and_load_app(conf_sections)
+        self._check_policy_options(app, exp_options, {})
+
+    def test_per_policy_conf_invalid_sorting_method_value(self):
+        def do_test(conf_sections, scope):
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertEqual(
+                'Invalid sorting_method value; must be one of shuffle, '
+                "timing, affinity, not 'broken' for %s" % scope,
+                cm.exception.message)
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = shuffle
+
+        [proxy-server:policy:0]
+        sorting_method = broken
+        """
+        do_test(conf_sections, 'policy 0 (nulo)')
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = broken
+
+        [proxy-server:policy:0]
+        sorting_method = shuffle
+        """
+        do_test(conf_sections, '(default)')
+
+    def test_per_policy_conf_invalid_read_affinity_value(self):
+        def do_test(conf_sections, label):
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertIn('broken', cm.exception.message)
+            self.assertIn(
+                'Invalid read_affinity value:', cm.exception.message)
+            self.assertIn(label, cm.exception.message)
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = affinity
+        read_affinity = r1=1
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        read_affinity = broken
+        """
+        do_test(conf_sections, 'policy 0 (nulo)')
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        sorting_method = affinity
+        read_affinity = broken
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        read_affinity = r1=1
+        """
+        do_test(conf_sections, '(default)')
+
+    def test_per_policy_conf_invalid_write_affinity_value(self):
+        def do_test(conf_sections, label):
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertIn('broken', cm.exception.message)
+            self.assertIn(
+                'Invalid write_affinity value:', cm.exception.message)
+            self.assertIn(label, cm.exception.message)
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        write_affinity = r1
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        write_affinity = broken
+        """
+        do_test(conf_sections, 'policy 0 (nulo)')
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        write_affinity = broken
+
+        [proxy-server:policy:0]
+        write_affinity = r1
+        """
+        do_test(conf_sections, '(default)')
+
+    def test_per_policy_conf_invalid_write_affinity_node_count_value(self):
+        def do_test(conf_sections, label):
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertIn('2* replicas', cm.exception.message)
+            self.assertIn('Invalid write_affinity_node_count value:',
+                          cm.exception.message)
+            self.assertIn(label, cm.exception.message)
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        write_affinity_node_count = 2 * replicas
+
+        [proxy-server:policy:0]
+        sorting_method = affinity
+        write_affinity_node_count = 2* replicas
+        """
+        do_test(conf_sections, 'policy 0 (nulo)')
+
+        conf_sections = """
+        [app:proxy-server]
+        use = egg:swift#proxy
+        write_affinity_node_count = 2* replicas
+
+        [proxy-server:policy:0]
+        write_affinity_node_count = 2 * replicas
+        """
+        do_test(conf_sections, '(default)')
+
+    def test_per_policy_conf_bad_section_name(self):
+        def do_test(policy):
+            conf_sections = """
+                [app:proxy-server]
+                use = egg:swift#proxy
+
+                [proxy-server:policy:%s]
+            """ % policy
+            with self.assertRaises(ValueError) as cm:
+                self._write_conf_and_load_app(conf_sections)
+            self.assertEqual(
+                "Override config must refer to policy index: %r" % policy,
+                cm.exception.message)
+
+        do_test('')
+        do_test('uno')
+        do_test('0.0')
+
+
+class TestProxyServerConfigStringLoading(TestProxyServerConfigLoading):
+    # The proxy may be loaded from a conf string rather than a conf file, for
+    # example when ContainerSync creates an InternalClient from a default
+    # config string. So repeat super-class tests using a string loader.
+    def _write_conf(self, conf_body):
+        # this is broken out to a method so that subclasses can override
+        return ConfigString(conf_body)
+
+
+class BaseTestObjectController(object):
+    """
+    A root of TestObjController that implements helper methods for child
+    TestObjControllers.
+    """
+    def setUp(self):
+        # clear proxy logger result for each test
+        _test_servers[0].logger._clear()
 
     def assert_status_map(self, method, statuses, expected, raise_exc=False):
         with save_globals():
@@ -1215,6 +1934,135 @@ class TestObjectController(unittest.TestCase):
             sleep(sleeptime)
             if condition():
                 break
+
+    def put_container(self, policy_name, container_name):
+        # Note: only works if called with unpatched policies
+        prolis = _test_sockets[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: 0\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'X-Storage-Policy: %s\r\n'
+                 '\r\n' % (container_name, policy_name))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 2'
+        self.assertEqual(headers[:len(exp)], exp)
+
+    def _test_conditional_GET(self, policy):
+        container_name = uuid.uuid4().hex
+        object_path = '/v1/a/%s/conditionals' % container_name
+        self.put_container(policy.name, container_name)
+
+        obj = 'this object has an etag and is otherwise unimportant'
+        etag = md5(obj).hexdigest()
+        not_etag = md5(obj + "blahblah").hexdigest()
+
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT %s HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (object_path, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        for verb, body in (('GET', obj), ('HEAD', '')):
+            # If-Match
+            req = Request.blank(
+                object_path,
+                environ={'REQUEST_METHOD': verb},
+                headers={'If-Match': etag})
+            resp = req.get_response(prosrv)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.body, body)
+            self.assertEqual(etag, resp.headers.get('etag'))
+            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
+
+            req = Request.blank(
+                object_path,
+                environ={'REQUEST_METHOD': verb},
+                headers={'If-Match': not_etag})
+            resp = req.get_response(prosrv)
+            self.assertEqual(resp.status_int, 412)
+            self.assertEqual(etag, resp.headers.get('etag'))
+
+            req = Request.blank(
+                object_path,
+                environ={'REQUEST_METHOD': verb},
+                headers={'If-Match': "*"})
+            resp = req.get_response(prosrv)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.body, body)
+            self.assertEqual(etag, resp.headers.get('etag'))
+            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
+
+            # If-None-Match
+            req = Request.blank(
+                object_path,
+                environ={'REQUEST_METHOD': verb},
+                headers={'If-None-Match': etag})
+            resp = req.get_response(prosrv)
+            self.assertEqual(resp.status_int, 304)
+            self.assertEqual(etag, resp.headers.get('etag'))
+            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
+
+            req = Request.blank(
+                object_path,
+                environ={'REQUEST_METHOD': verb},
+                headers={'If-None-Match': not_etag})
+            resp = req.get_response(prosrv)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.body, body)
+            self.assertEqual(etag, resp.headers.get('etag'))
+            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
+
+            req = Request.blank(
+                object_path,
+                environ={'REQUEST_METHOD': verb},
+                headers={'If-None-Match': "*"})
+            resp = req.get_response(prosrv)
+            self.assertEqual(resp.status_int, 304)
+            self.assertEqual(etag, resp.headers.get('etag'))
+            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
+
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+
+@patch_policies([StoragePolicy(0, 'zero', True,
+                               object_ring=FakeRing(base_port=3000))])
+class TestReplicatedObjectController(
+        BaseTestObjectController, unittest.TestCase):
+    """
+    Test suite for replication policy
+    """
+    def setUp(self):
+        skip_if_no_xattrs()
+        self.app = proxy_server.Application(
+            None, FakeMemcache(),
+            logger=debug_logger('proxy-ut'),
+            account_ring=FakeRing(),
+            container_ring=FakeRing())
+        super(TestReplicatedObjectController, self).setUp()
+
+    def tearDown(self):
+        self.app.account_ring.set_replicas(3)
+        self.app.container_ring.set_replicas(3)
+        for policy in POLICIES:
+            policy.object_ring = FakeRing(base_port=3000)
 
     @unpatch_policies
     def test_policy_IO(self):
@@ -1784,810 +2632,10 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(got_byteranges[2], obj[2000:2501])
 
     @unpatch_policies
-    def test_PUT_ec(self):
-        policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        obj = 'abCD' * 10  # small, so we don't get multiple EC stripes
-        prolis = _test_sockets[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/o1 HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Etag: "%s"\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        ecd = policy.pyeclib_driver
-        expected_pieces = set(ecd.encode(obj))
-
-        # go to disk to make sure it's there and all erasure-coded
-        partition, nodes = policy.object_ring.get_nodes('a', 'ec-con', 'o1')
-        conf = {'devices': _testdir, 'mount_check': 'false'}
-        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[policy]
-
-        got_pieces = set()
-        got_indices = set()
-        got_durable = []
-        for node_index, node in enumerate(nodes):
-            df = df_mgr.get_diskfile(node['device'], partition,
-                                     'a', 'ec-con', 'o1',
-                                     policy=policy)
-            with df.open():
-                meta = df.get_metadata()
-                contents = ''.join(df.reader())
-                got_pieces.add(contents)
-
-                lmeta = dict((k.lower(), v) for k, v in meta.items())
-                got_indices.add(
-                    lmeta['x-object-sysmeta-ec-frag-index'])
-
-                self.assertEqual(
-                    lmeta['x-object-sysmeta-ec-etag'],
-                    md5(obj).hexdigest())
-                self.assertEqual(
-                    lmeta['x-object-sysmeta-ec-content-length'],
-                    str(len(obj)))
-                self.assertEqual(
-                    lmeta['x-object-sysmeta-ec-segment-size'],
-                    '4096')
-                self.assertEqual(
-                    lmeta['x-object-sysmeta-ec-scheme'],
-                    '%s 2+1' % DEFAULT_TEST_EC_TYPE)
-                self.assertEqual(
-                    lmeta['etag'],
-                    md5(contents).hexdigest())
-
-                # check presence for a durable data file for the timestamp
-                durable_file = (
-                    utils.Timestamp(df.timestamp).internal +
-                    '#%s' % lmeta['x-object-sysmeta-ec-frag-index'] +
-                    '#d.data')
-                durable_file = os.path.join(
-                    _testdir, node['device'], storage_directory(
-                        diskfile.get_data_dir(policy),
-                        partition, hash_path('a', 'ec-con', 'o1')),
-                    durable_file)
-                if os.path.isfile(durable_file):
-                    got_durable.append(True)
-
-        self.assertEqual(expected_pieces, got_pieces)
-        self.assertEqual(set(('0', '1', '2')), got_indices)
-
-        # verify at least 2 puts made it all the way to the end of 2nd
-        # phase, ie at least 2 durable statuses were written
-        num_durable_puts = sum(d is True for d in got_durable)
-        self.assertGreaterEqual(num_durable_puts, 2)
-
-    @unpatch_policies
-    def test_PUT_ec_multiple_segments(self):
-        ec_policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        pyeclib_header_size = len(ec_policy.pyeclib_driver.encode("")[0])
-        segment_size = ec_policy.ec_segment_size
-
-        # Big enough to have multiple segments. Also a multiple of the
-        # segment size to get coverage of that path too.
-        obj = 'ABC' * segment_size
-
-        prolis = _test_sockets[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/o2 HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        # it's a 2+1 erasure code, so each fragment archive should be half
-        # the length of the object, plus three inline pyeclib metadata
-        # things (one per segment)
-        expected_length = (len(obj) / 2 + pyeclib_header_size * 3)
-
-        partition, nodes = ec_policy.object_ring.get_nodes(
-            'a', 'ec-con', 'o2')
-
-        conf = {'devices': _testdir, 'mount_check': 'false'}
-        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[ec_policy]
-
-        got_durable = []
-        fragment_archives = []
-        for node in nodes:
-            df = df_mgr.get_diskfile(
-                node['device'], partition, 'a',
-                'ec-con', 'o2', policy=ec_policy)
-            with df.open():
-                meta = df.get_metadata()
-                contents = ''.join(df.reader())
-                fragment_archives.append(contents)
-                self.assertEqual(len(contents), expected_length)
-
-                # check presence for a durable data file for the timestamp
-                durable_file = (
-                    utils.Timestamp(df.timestamp).internal +
-                    '#%s' % meta['X-Object-Sysmeta-Ec-Frag-Index'] +
-                    '#d.data')
-                durable_file = os.path.join(
-                    _testdir, node['device'], storage_directory(
-                        diskfile.get_data_dir(ec_policy),
-                        partition, hash_path('a', 'ec-con', 'o2')),
-                    durable_file)
-
-                if os.path.isfile(durable_file):
-                    got_durable.append(True)
-
-        # Verify that we can decode each individual fragment and that they
-        # are all the correct size
-        fragment_size = ec_policy.fragment_size
-        nfragments = int(
-            math.ceil(float(len(fragment_archives[0])) / fragment_size))
-
-        for fragment_index in range(nfragments):
-            fragment_start = fragment_index * fragment_size
-            fragment_end = (fragment_index + 1) * fragment_size
-
-            try:
-                frags = [fa[fragment_start:fragment_end]
-                         for fa in fragment_archives]
-                seg = ec_policy.pyeclib_driver.decode(frags)
-            except ECDriverError:
-                self.fail("Failed to decode fragments %d; this probably "
-                          "means the fragments are not the sizes they "
-                          "should be" % fragment_index)
-
-            segment_start = fragment_index * segment_size
-            segment_end = (fragment_index + 1) * segment_size
-
-            self.assertEqual(seg, obj[segment_start:segment_end])
-
-        # verify at least 2 puts made it all the way to the end of 2nd
-        # phase, ie at least 2 durable statuses were written
-        num_durable_puts = sum(d is True for d in got_durable)
-        self.assertGreaterEqual(num_durable_puts, 2)
-
-    @unpatch_policies
-    def test_PUT_ec_object_etag_mismatch(self):
-        ec_policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        obj = '90:6A:02:60:B1:08-96da3e706025537fc42464916427727e'
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/o3 HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Etag: %s\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (md5('something else').hexdigest(), len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 422'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        # nothing should have made it to disk on the object servers
-        partition, nodes = prosrv.get_object_ring(3).get_nodes(
-            'a', 'ec-con', 'o3')
-        conf = {'devices': _testdir, 'mount_check': 'false'}
-
-        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[ec_policy]
-
-        for node in nodes:
-            df = df_mgr.get_diskfile(node['device'], partition,
-                                     'a', 'ec-con', 'o3', policy=POLICIES[3])
-            self.assertRaises(DiskFileNotExist, df.open)
-
-    @unpatch_policies
-    def test_PUT_ec_fragment_archive_etag_mismatch(self):
-        ec_policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        # Cause a hash mismatch by feeding one particular MD5 hasher some
-        # extra data. The goal here is to get exactly one of the hashers in
-        # an object server.
-        countdown = [1]
-
-        def busted_md5_constructor(initial_str=""):
-            hasher = md5(initial_str)
-            if countdown[0] == 0:
-                hasher.update('wrong')
-            countdown[0] -= 1
-            return hasher
-
-        obj = 'uvarovite-esurience-cerated-symphysic'
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        with mock.patch('swift.obj.server.md5', busted_md5_constructor):
-            fd = sock.makefile()
-            fd.write('PUT /v1/a/ec-con/pimento HTTP/1.1\r\n'
-                     'Host: localhost\r\n'
-                     'Connection: close\r\n'
-                     'Etag: %s\r\n'
-                     'Content-Length: %d\r\n'
-                     'X-Storage-Token: t\r\n'
-                     'Content-Type: application/octet-stream\r\n'
-                     '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 503'  # no quorum
-        self.assertEqual(headers[:len(exp)], exp)
-
-        # 2/3 of the fragment archives should have landed on disk
-        partition, nodes = prosrv.get_object_ring(3).get_nodes(
-            'a', 'ec-con', 'pimento')
-        conf = {'devices': _testdir, 'mount_check': 'false'}
-
-        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[ec_policy]
-
-        found = 0
-        for node in nodes:
-            df = df_mgr.get_diskfile(node['device'], partition,
-                                     'a', 'ec-con', 'pimento',
-                                     policy=POLICIES[3])
-            try:
-                # diskfile open won't succeed because no durable was written,
-                # so look under the hood for data files.
-                files = os.listdir(df._datadir)
-                if len(files) > 0:
-                    # Although the third fragment archive hasn't landed on
-                    # disk, the directory df._datadir is pre-maturely created
-                    # and is empty when we use O_TMPFILE + linkat()
-                    num_data_files = \
-                        len([f for f in files if f.endswith('.data')])
-                    self.assertEqual(1, num_data_files)
-                    found += 1
-            except OSError:
-                pass
-        self.assertEqual(found, 2)
-
-    @unpatch_policies
-    def test_PUT_ec_fragment_quorum_archive_etag_mismatch(self):
-        ec_policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        def busted_md5_constructor(initial_str=""):
-            hasher = md5(initial_str)
-            hasher.update('wrong')
-            return hasher
-
-        obj = 'uvarovite-esurience-cerated-symphysic'
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-
-        call_count = [0]
-
-        def mock_committer(self):
-            call_count[0] += 1
-
-        commit_confirmation = \
-            'swift.proxy.controllers.obj.MIMEPutter.send_commit_confirmation'
-
-        with mock.patch('swift.obj.server.md5', busted_md5_constructor), \
-                mock.patch(commit_confirmation, mock_committer):
-            fd = sock.makefile()
-            fd.write('PUT /v1/a/ec-con/quorum HTTP/1.1\r\n'
-                     'Host: localhost\r\n'
-                     'Connection: close\r\n'
-                     'Etag: %s\r\n'
-                     'Content-Length: %d\r\n'
-                     'X-Storage-Token: t\r\n'
-                     'Content-Type: application/octet-stream\r\n'
-                     '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 503'  # no quorum
-        self.assertEqual(headers[:len(exp)], exp)
-        # Don't send commit to object-server if quorum responses consist of 4xx
-        self.assertEqual(0, call_count[0])
-
-        # no fragment archives should have landed on disk
-        partition, nodes = prosrv.get_object_ring(3).get_nodes(
-            'a', 'ec-con', 'quorum')
-        conf = {'devices': _testdir, 'mount_check': 'false'}
-
-        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[ec_policy]
-
-        for node in nodes:
-            df = df_mgr.get_diskfile(node['device'], partition,
-                                     'a', 'ec-con', 'quorum',
-                                     policy=POLICIES[3])
-            if os.path.exists(df._datadir):
-                self.assertFalse(os.listdir(df._datadir))  # should be empty
-
-    @unpatch_policies
-    def test_PUT_ec_fragment_quorum_bad_request(self):
-        ec_policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        obj = 'uvarovite-esurience-cerated-symphysic'
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-
-        call_count = [0]
-
-        def mock_committer(self):
-            call_count[0] += 1
-
-        read_footer = \
-            'swift.obj.server.ObjectController._read_metadata_footer'
-        commit_confirmation = \
-            'swift.proxy.controllers.obj.MIMEPutter.send_commit_confirmation'
-
-        with mock.patch(read_footer) as read_footer_call, \
-                mock.patch(commit_confirmation, mock_committer):
-            # Emulate missing footer MIME doc in all object-servers
-            read_footer_call.side_effect = HTTPBadRequest(
-                body="couldn't find footer MIME doc")
-
-            fd = sock.makefile()
-            fd.write('PUT /v1/a/ec-con/quorum HTTP/1.1\r\n'
-                     'Host: localhost\r\n'
-                     'Connection: close\r\n'
-                     'Etag: %s\r\n'
-                     'Content-Length: %d\r\n'
-                     'X-Storage-Token: t\r\n'
-                     'Content-Type: application/octet-stream\r\n'
-                     '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-
-        # Don't show a result of the bad conversation between proxy-server
-        # and object-server
-        exp = 'HTTP/1.1 503'
-        self.assertEqual(headers[:len(exp)], exp)
-        # Don't send commit to object-server if quorum responses consist of 4xx
-        self.assertEqual(0, call_count[0])
-
-        # no fragment archives should have landed on disk
-        partition, nodes = prosrv.get_object_ring(3).get_nodes(
-            'a', 'ec-con', 'quorum')
-        conf = {'devices': _testdir, 'mount_check': 'false'}
-
-        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[ec_policy]
-
-        for node in nodes:
-            df = df_mgr.get_diskfile(node['device'], partition,
-                                     'a', 'ec-con', 'quorum',
-                                     policy=POLICIES[3])
-            if os.path.exists(df._datadir):
-                self.assertFalse(os.listdir(df._datadir))  # should be empty
-
-    @unpatch_policies
-    def test_PUT_ec_if_none_match(self):
-        self.put_container("ec", "ec-con")
-
-        obj = 'ananepionic-lepidophyllous-ropewalker-neglectful'
-        prolis = _test_sockets[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/inm HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Etag: "%s"\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/inm HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'If-None-Match: *\r\n'
-                 'Etag: "%s"\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 412'
-        self.assertEqual(headers[:len(exp)], exp)
-
-    @unpatch_policies
-    def test_GET_ec(self):
-        self.put_container("ec", "ec-con")
-
-        obj = '0123456' * 11 * 17
-
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/go-get-it HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'X-Object-Meta-Color: chartreuse\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('GET /v1/a/ec-con/go-get-it HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        headers = parse_headers_string(headers)
-        self.assertEqual(str(len(obj)), headers['Content-Length'])
-        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
-        self.assertEqual('chartreuse', headers['X-Object-Meta-Color'])
-
-        gotten_obj = ''
-        while True:
-            buf = fd.read(64)
-            if not buf:
-                break
-            gotten_obj += buf
-        self.assertEqual(gotten_obj, obj)
-        error_lines = prosrv.logger.get_lines_for_level('error')
-        warn_lines = prosrv.logger.get_lines_for_level('warning')
-        self.assertEqual(len(error_lines), 0)  # sanity
-        self.assertEqual(len(warn_lines), 0)  # sanity
-
-    def _test_conditional_GET(self, policy):
-        container_name = uuid.uuid4().hex
-        object_path = '/v1/a/%s/conditionals' % container_name
-        self.put_container(policy.name, container_name)
-
-        obj = 'this object has an etag and is otherwise unimportant'
-        etag = md5(obj).hexdigest()
-        not_etag = md5(obj + "blahblah").hexdigest()
-
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT %s HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (object_path, len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        for verb, body in (('GET', obj), ('HEAD', '')):
-            # If-Match
-            req = Request.blank(
-                object_path,
-                environ={'REQUEST_METHOD': verb},
-                headers={'If-Match': etag})
-            resp = req.get_response(prosrv)
-            self.assertEqual(resp.status_int, 200)
-            self.assertEqual(resp.body, body)
-            self.assertEqual(etag, resp.headers.get('etag'))
-            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
-
-            req = Request.blank(
-                object_path,
-                environ={'REQUEST_METHOD': verb},
-                headers={'If-Match': not_etag})
-            resp = req.get_response(prosrv)
-            self.assertEqual(resp.status_int, 412)
-            self.assertEqual(etag, resp.headers.get('etag'))
-
-            req = Request.blank(
-                object_path,
-                environ={'REQUEST_METHOD': verb},
-                headers={'If-Match': "*"})
-            resp = req.get_response(prosrv)
-            self.assertEqual(resp.status_int, 200)
-            self.assertEqual(resp.body, body)
-            self.assertEqual(etag, resp.headers.get('etag'))
-            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
-
-            # If-None-Match
-            req = Request.blank(
-                object_path,
-                environ={'REQUEST_METHOD': verb},
-                headers={'If-None-Match': etag})
-            resp = req.get_response(prosrv)
-            self.assertEqual(resp.status_int, 304)
-            self.assertEqual(etag, resp.headers.get('etag'))
-            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
-
-            req = Request.blank(
-                object_path,
-                environ={'REQUEST_METHOD': verb},
-                headers={'If-None-Match': not_etag})
-            resp = req.get_response(prosrv)
-            self.assertEqual(resp.status_int, 200)
-            self.assertEqual(resp.body, body)
-            self.assertEqual(etag, resp.headers.get('etag'))
-            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
-
-            req = Request.blank(
-                object_path,
-                environ={'REQUEST_METHOD': verb},
-                headers={'If-None-Match': "*"})
-            resp = req.get_response(prosrv)
-            self.assertEqual(resp.status_int, 304)
-            self.assertEqual(etag, resp.headers.get('etag'))
-            self.assertEqual('bytes', resp.headers.get('accept-ranges'))
-
-        error_lines = prosrv.logger.get_lines_for_level('error')
-        warn_lines = prosrv.logger.get_lines_for_level('warning')
-        self.assertEqual(len(error_lines), 0)  # sanity
-        self.assertEqual(len(warn_lines), 0)  # sanity
-
-    @unpatch_policies
-    def test_conditional_GET_ec(self):
-        policy = POLICIES[3]
-        self.assertEqual('erasure_coding', policy.policy_type)  # sanity
-        self._test_conditional_GET(policy)
-
-    @unpatch_policies
     def test_conditional_GET_replication(self):
         policy = POLICIES[0]
         self.assertEqual('replication', policy.policy_type)  # sanity
         self._test_conditional_GET(policy)
-
-    @unpatch_policies
-    def test_GET_ec_big(self):
-        self.put_container("ec", "ec-con")
-
-        # our EC segment size is 4 KiB, so this is multiple (3) segments;
-        # we'll verify that with a sanity check
-        obj = 'a moose once bit my sister' * 400
-        self.assertGreater(
-            len(obj), POLICIES.get_by_name("ec").ec_segment_size * 2,
-            "object is too small for proper testing")
-
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/big-obj-get HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('GET /v1/a/ec-con/big-obj-get HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        headers = parse_headers_string(headers)
-        self.assertEqual(str(len(obj)), headers['Content-Length'])
-        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
-
-        gotten_obj = ''
-        while True:
-            buf = fd.read(64)
-            if not buf:
-                break
-            gotten_obj += buf
-        # This may look like a redundant test, but when things fail, this
-        # has a useful failure message while the subsequent one spews piles
-        # of garbage and demolishes your terminal's scrollback buffer.
-        self.assertEqual(len(gotten_obj), len(obj))
-        self.assertEqual(gotten_obj, obj)
-        error_lines = prosrv.logger.get_lines_for_level('error')
-        warn_lines = prosrv.logger.get_lines_for_level('warning')
-        self.assertEqual(len(error_lines), 0)  # sanity
-        self.assertEqual(len(warn_lines), 0)  # sanity
-
-    @unpatch_policies
-    def test_GET_ec_failure_handling(self):
-        self.put_container("ec", "ec-con")
-
-        obj = 'look at this object; it is simply amazing ' * 500
-        prolis = _test_sockets[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/crash-test-dummy HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        def explodey_iter(inner_iter):
-            yield next(inner_iter)
-            raise Exception("doom ba doom")
-
-        def explodey_doc_parts_iter(inner_iter_iter):
-            try:
-                for item in inner_iter_iter:
-                    item = item.copy()  # paranoia about mutable data
-                    item['part_iter'] = explodey_iter(item['part_iter'])
-                    yield item
-            except GeneratorExit:
-                inner_iter_iter.close()
-                raise
-
-        real_ec_app_iter = swift.proxy.controllers.obj.ECAppIter
-
-        def explodey_ec_app_iter(path, policy, iterators, *a, **kw):
-            # Each thing in `iterators` here is a document-parts iterator,
-            # and we want to fail after getting a little into each part.
-            #
-            # That way, we ensure we've started streaming the response to
-            # the client when things go wrong.
-            return real_ec_app_iter(
-                path, policy,
-                [explodey_doc_parts_iter(i) for i in iterators],
-                *a, **kw)
-
-        with mock.patch("swift.proxy.controllers.obj.ECAppIter",
-                        explodey_ec_app_iter):
-            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-            fd = sock.makefile()
-            fd.write('GET /v1/a/ec-con/crash-test-dummy HTTP/1.1\r\n'
-                     'Host: localhost\r\n'
-                     'Connection: close\r\n'
-                     'X-Storage-Token: t\r\n'
-                     '\r\n')
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-            exp = 'HTTP/1.1 200'
-            self.assertEqual(headers[:len(exp)], exp)
-
-            headers = parse_headers_string(headers)
-            self.assertEqual(str(len(obj)), headers['Content-Length'])
-            self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
-
-            gotten_obj = ''
-            try:
-                with Timeout(300):  # don't hang the testrun when this fails
-                    while True:
-                        buf = fd.read(64)
-                        if not buf:
-                            break
-                        gotten_obj += buf
-            except Timeout:
-                self.fail("GET hung when connection failed")
-
-            # Ensure we failed partway through, otherwise the mocks could
-            # get out of date without anyone noticing
-            self.assertTrue(0 < len(gotten_obj) < len(obj))
-
-    @unpatch_policies
-    def test_HEAD_ec(self):
-        self.put_container("ec", "ec-con")
-
-        obj = '0123456' * 11 * 17
-
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/ec-con/go-head-it HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'X-Object-Meta-Color: chartreuse\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('HEAD /v1/a/ec-con/go-head-it HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        headers = parse_headers_string(headers)
-        self.assertEqual(str(len(obj)), headers['Content-Length'])
-        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
-        self.assertEqual('chartreuse', headers['X-Object-Meta-Color'])
-        error_lines = prosrv.logger.get_lines_for_level('error')
-        warn_lines = prosrv.logger.get_lines_for_level('warning')
-        self.assertEqual(len(error_lines), 0)  # sanity
-        self.assertEqual(len(warn_lines), 0)  # sanity
-
-    @unpatch_policies
-    def test_GET_ec_404(self):
-        self.put_container("ec", "ec-con")
-
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('GET /v1/a/ec-con/yes-we-have-no-bananas HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 404'
-        self.assertEqual(headers[:len(exp)], exp)
-        error_lines = prosrv.logger.get_lines_for_level('error')
-        warn_lines = prosrv.logger.get_lines_for_level('warning')
-        self.assertEqual(len(error_lines), 0)  # sanity
-        self.assertEqual(len(warn_lines), 0)  # sanity
-
-    @unpatch_policies
-    def test_HEAD_ec_404(self):
-        self.put_container("ec", "ec-con")
-
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('HEAD /v1/a/ec-con/yes-we-have-no-bananas HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 404'
-        self.assertEqual(headers[:len(exp)], exp)
-        error_lines = prosrv.logger.get_lines_for_level('error')
-        warn_lines = prosrv.logger.get_lines_for_level('warning')
-        self.assertEqual(len(error_lines), 0)  # sanity
-        self.assertEqual(len(warn_lines), 0)  # sanity
 
     def test_PUT_expect_header_zero_content_length(self):
         test_errors = []
@@ -2595,9 +2643,12 @@ class TestObjectController(unittest.TestCase):
         def test_connect(ipaddr, port, device, partition, method, path,
                          headers=None, query_string=None):
             if path == '/a/c/o.jpg':
-                if 'expect' in headers or 'Expect' in headers:
-                    test_errors.append('Expect was in headers for object '
-                                       'server!')
+                if headers.get('Transfer-Encoding') != 'chunked':
+                    test_errors.append('"Transfer-Encoding: chunked" should '
+                                       'be in headers for object server!')
+                if 'Expect' not in headers:
+                    test_errors.append('Expect should be in headers for '
+                                       'object server!')
 
         with save_globals():
             controller = ReplicatedObjectController(
@@ -2654,7 +2705,8 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(test_errors, [])
             self.assertTrue(res.status.startswith('201 '))
 
-    def test_PUT_respects_write_affinity(self):
+    def _check_PUT_respects_write_affinity(self, conf, policy,
+                                           expected_region):
         written_to = []
 
         def test_connect(ipaddr, port, device, partition, method, path,
@@ -2662,33 +2714,65 @@ class TestObjectController(unittest.TestCase):
             if path == '/a/c/o.jpg':
                 written_to.append((ipaddr, port, device))
 
-        with save_globals():
-            def is_r0(node):
-                return node['region'] == 0
-
-            object_ring = self.app.get_object_ring(None)
-            object_ring.max_more_nodes = 100
-            self.app.write_affinity_is_local_fn = is_r0
-            self.app.write_affinity_node_count = lambda r: 3
-
-            controller = \
-                ReplicatedObjectController(
-                    self.app, 'a', 'c', 'o.jpg')
-            set_http_connect(200, 200, 201, 201, 201,
-                             give_connect=test_connect)
-            req = Request.blank('/v1/a/c/o.jpg', {})
-            req.content_length = 1
-            req.body = 'a'
-            self.app.memcache.store = {}
-            res = controller.PUT(req)
-            self.assertTrue(res.status.startswith('201 '))
-
+        # mock shuffle to be a no-op to ensure that the only way nodes would
+        # not be used in ring order is if affinity is respected.
+        with mock.patch('swift.proxy.server.shuffle', lambda x: x):
+            app = proxy_server.Application(
+                conf, FakeMemcache(),
+                logger=debug_logger('proxy-ut'),
+                account_ring=FakeRing(),
+                container_ring=FakeRing())
+            with save_globals():
+                object_ring = app.get_object_ring(policy)
+                object_ring.max_more_nodes = 100
+                controller = \
+                    ReplicatedObjectController(
+                        app, 'a', 'c', 'o.jpg')
+                # requests go to acc, con, obj, obj, obj
+                set_http_connect(200, 200, 201, 201, 201,
+                                 give_connect=test_connect)
+                req = Request.blank(
+                    '/v1/a/c/o.jpg', method='PUT', body='a',
+                    headers={'X-Backend-Storage-Policy-Index': str(policy)})
+                app.memcache.store = {}
+                res = controller.PUT(req)
+        self.assertTrue(res.status.startswith('201 '))
         self.assertEqual(3, len(written_to))
         for ip, port, device in written_to:
             # this is kind of a hokey test, but in FakeRing, the port is even
             # when the region is 0, and odd when the region is 1, so this test
             # asserts that we only wrote to nodes in region 0.
-            self.assertEqual(0, port % 2)
+            self.assertEqual(expected_region, port % 2)
+
+    @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
+                     StoragePolicy(1, 'one', False, object_ring=FakeRing())])
+    def test_PUT_respects_write_affinity(self):
+        # nodes in fake ring order have r0z0, r1z1, r0z2
+        # Check default conf via proxy server conf
+        conf = {'write_affinity': 'r0'}
+        self._check_PUT_respects_write_affinity(conf, 0, 0)
+
+        # policy 0 and policy 1 have conf via per policy conf section
+        conf = {
+            'write_affinity': '',
+            'policy_config': {
+                '0': {'write_affinity': 'r0'},
+                '1': {'write_affinity': 'r1'}
+            }
+        }
+        self._check_PUT_respects_write_affinity(conf, 0, 0)
+        self._check_PUT_respects_write_affinity(conf, 1, 1)
+
+        # policy 0 conf via per policy conf section override proxy server conf,
+        # policy 1 uses default
+        conf = {
+            'write_affinity': 'r0',
+            'policy_config': {
+                '0': {'write_affinity': 'r1'}
+            }
+        }
+        self._check_PUT_respects_write_affinity(conf, 0, 1)
+        self._check_PUT_respects_write_affinity(conf, 1, 0)
 
     def test_PUT_respects_write_affinity_with_507s(self):
         written_to = []
@@ -2702,10 +2786,11 @@ class TestObjectController(unittest.TestCase):
             def is_r0(node):
                 return node['region'] == 0
 
-            object_ring = self.app.get_object_ring(None)
+            object_ring = self.app.get_object_ring(0)
             object_ring.max_more_nodes = 100
-            self.app.write_affinity_is_local_fn = is_r0
-            self.app.write_affinity_node_count = lambda r: 3
+            policy_options = self.app.get_policy_options(POLICIES[0])
+            policy_options.write_affinity_is_local_fn = is_r0
+            policy_options.write_affinity_node_count_fn = lambda r: 3
 
             controller = \
                 ReplicatedObjectController(
@@ -2722,13 +2807,13 @@ class TestObjectController(unittest.TestCase):
             res = controller.PUT(req)
             self.assertTrue(res.status.startswith('201 '))
 
-        self.assertEqual(3, len(written_to))
         # this is kind of a hokey test, but in FakeRing, the port is even when
         # the region is 0, and odd when the region is 1, so this test asserts
         # that we wrote to 2 nodes in region 0, then went to 1 non-r0 node.
-        self.assertEqual(0, written_to[0][1] % 2)   # it's (ip, port, device)
-        self.assertEqual(0, written_to[1][1] % 2)
-        self.assertNotEqual(0, written_to[2][1] % 2)
+        def get_region(x):
+            return x[1] % 2  # it's (ip, port, device)
+
+        self.assertEqual([0, 0, 1], [get_region(x) for x in written_to])
 
     @unpatch_policies
     def test_PUT_no_etag_fallocate(self):
@@ -3038,96 +3123,6 @@ class TestObjectController(unittest.TestCase):
             test_content_type('test.css', iter(['', '', 'text/css',
                                                 'text/css', 'text/css']))
 
-    @unpatch_policies
-    def test_reload_ring_ec(self):
-        policy = POLICIES[3]
-        self.put_container("ec", "ec-con")
-
-        orig_rtime = policy.object_ring._rtime
-        # save original file as back up
-        copyfile(policy.object_ring.serialized_path,
-                 policy.object_ring.serialized_path + '.bak')
-
-        try:
-            # overwrite with 2 replica, 2 devices ring
-            obj_devs = []
-            obj_devs.append(
-                {'port': _test_sockets[-3].getsockname()[1],
-                 'device': 'sdg1'})
-            obj_devs.append(
-                {'port': _test_sockets[-2].getsockname()[1],
-                 'device': 'sdh1'})
-            write_fake_ring(policy.object_ring.serialized_path,
-                            *obj_devs)
-
-            def get_ring_reloaded_response(method):
-                # force to reload at the request
-                policy.object_ring._rtime = 0
-
-                trans_data = ['%s /v1/a/ec-con/o2 HTTP/1.1\r\n' % method,
-                              'Host: localhost\r\n',
-                              'Connection: close\r\n',
-                              'X-Storage-Token: t\r\n']
-
-                if method == 'PUT':
-                    # small, so we don't get multiple EC stripes
-                    obj = 'abCD' * 10
-
-                    extra_trans_data = [
-                        'Etag: "%s"\r\n' % md5(obj).hexdigest(),
-                        'Content-Length: %d\r\n' % len(obj),
-                        'Content-Type: application/octet-stream\r\n',
-                        '\r\n%s' % obj
-                    ]
-                    trans_data.extend(extra_trans_data)
-                else:
-                    trans_data.append('\r\n')
-
-                prolis = _test_sockets[0]
-                sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-                fd = sock.makefile()
-                fd.write(''.join(trans_data))
-                fd.flush()
-                headers = readuntil2crlfs(fd)
-
-                # use older ring with rollbacking
-                return headers
-
-            for method in ('PUT', 'HEAD', 'GET', 'POST', 'DELETE'):
-                headers = get_ring_reloaded_response(method)
-                exp = 'HTTP/1.1 20'
-                self.assertEqual(headers[:len(exp)], exp)
-
-                # proxy didn't load newest ring, use older one
-                self.assertEqual(3, policy.object_ring.replica_count)
-
-                if method == 'POST':
-                    # Take care fast post here!
-                    orig_post_as_copy = getattr(
-                        _test_servers[0], 'object_post_as_copy', None)
-                    try:
-                        _test_servers[0].object_post_as_copy = False
-                        with mock.patch.object(
-                                _test_servers[0],
-                                'object_post_as_copy', False):
-                            headers = get_ring_reloaded_response(method)
-                    finally:
-                        if orig_post_as_copy is None:
-                            del _test_servers[0].object_post_as_copy
-                        else:
-                            _test_servers[0].object_post_as_copy = \
-                                orig_post_as_copy
-
-                    exp = 'HTTP/1.1 20'
-                    self.assertEqual(headers[:len(exp)], exp)
-                    # sanity
-                    self.assertEqual(3, policy.object_ring.replica_count)
-
-        finally:
-            policy.object_ring._rtime = orig_rtime
-            os.rename(policy.object_ring.serialized_path + '.bak',
-                      policy.object_ring.serialized_path)
-
     def test_custom_mime_types_files(self):
         swift_dir = mkdtemp()
         try:
@@ -3264,8 +3259,6 @@ class TestObjectController(unittest.TestCase):
 
     def test_POST(self):
         with save_globals():
-            self.app.object_post_as_copy = False
-
             def test_status_map(statuses, expected):
                 set_http_connect(*statuses)
                 self.app.memcache.store = {}
@@ -3290,97 +3283,198 @@ class TestObjectController(unittest.TestCase):
     def test_POST_backend_headers(self):
         # reset the router post patch_policies
         self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
-        self.app.object_post_as_copy = False
-        self.app.sort_nodes = lambda nodes: nodes
-        backend_requests = []
+        self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
 
-        def capture_requests(ip, port, method, path, headers, *args,
-                             **kwargs):
-            backend_requests.append((method, path, headers))
+        def do_test(resp_headers):
+            self.app.memcache.store = {}
+            backend_requests = []
 
-        req = Request.blank('/v1/a/c/o', {}, method='POST',
-                            headers={'X-Object-Meta-Color': 'Blue',
-                                     'Content-Type': 'text/plain'})
+            def capture_requests(ip, port, method, path, headers, *args,
+                                 **kwargs):
+                backend_requests.append((method, path, headers))
 
-        # we want the container_info response to says a policy index of 1
-        resp_headers = {'X-Backend-Storage-Policy-Index': 1}
-        with mocked_http_conn(
-                200, 200, 202, 202, 202,
-                headers=resp_headers, give_connect=capture_requests
-        ) as fake_conn:
-            resp = req.get_response(self.app)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+            req = Request.blank('/v1/a/c/o', {}, method='POST',
+                                headers={'X-Object-Meta-Color': 'Blue',
+                                         'Content-Type': 'text/plain'})
 
-        self.assertEqual(resp.status_int, 202)
-        self.assertEqual(len(backend_requests), 5)
+            # we want the container_info response to says a policy index of 1
+            with mocked_http_conn(
+                    200, 200, 202, 202, 202,
+                    headers=resp_headers, give_connect=capture_requests
+            ) as fake_conn:
+                resp = req.get_response(self.app)
+                self.assertRaises(StopIteration, fake_conn.code_iter.next)
 
-        def check_request(req, method, path, headers=None):
-            req_method, req_path, req_headers = req
-            self.assertEqual(method, req_method)
-            # caller can ignore leading path parts
-            self.assertTrue(req_path.endswith(path),
-                            'expected path to end with %s, it was %s' % (
-                                path, req_path))
-            headers = headers or {}
-            # caller can ignore some headers
-            for k, v in headers.items():
-                self.assertEqual(req_headers[k], v)
-        account_request = backend_requests.pop(0)
-        check_request(account_request, method='HEAD', path='/sda/0/a')
-        container_request = backend_requests.pop(0)
-        check_request(container_request, method='HEAD', path='/sda/0/a/c')
-        # make sure backend requests included expected container headers
-        container_headers = {}
-        for request in backend_requests:
-            req_headers = request[2]
-            device = req_headers['x-container-device']
-            host = req_headers['x-container-host']
-            container_headers[device] = host
-            expectations = {
-                'method': 'POST',
-                'path': '/0/a/c/o',
-                'headers': {
-                    'X-Container-Partition': '0',
-                    'Connection': 'close',
-                    'User-Agent': 'proxy-server %s' % os.getpid(),
-                    'Host': 'localhost:80',
-                    'Referer': 'POST http://localhost/v1/a/c/o',
-                    'X-Object-Meta-Color': 'Blue',
-                    'X-Backend-Storage-Policy-Index': '1'
-                },
-            }
-            check_request(request, **expectations)
+            self.assertEqual(resp.status_int, 202)
+            self.assertEqual(len(backend_requests), 5)
 
-        expected = {}
-        for i, device in enumerate(['sda', 'sdb', 'sdc']):
-            expected[device] = '10.0.0.%d:100%d' % (i, i)
-        self.assertEqual(container_headers, expected)
+            def check_request(req, method, path, headers=None):
+                req_method, req_path, req_headers = req
+                self.assertEqual(method, req_method)
+                # caller can ignore leading path parts
+                self.assertTrue(req_path.endswith(path),
+                                'expected path to end with %s, it was %s' % (
+                                    path, req_path))
+                headers = headers or {}
+                # caller can ignore some headers
+                for k, v in headers.items():
+                    self.assertEqual(req_headers[k], v)
+                self.assertNotIn('X-Backend-Container-Path', req_headers)
 
-        # and again with policy override
-        self.app.memcache.store = {}
-        backend_requests = []
-        req = Request.blank('/v1/a/c/o', {}, method='POST',
-                            headers={'X-Object-Meta-Color': 'Blue',
-                                     'Content-Type': 'text/plain',
-                                     'X-Backend-Storage-Policy-Index': 0})
-        with mocked_http_conn(
-                200, 200, 202, 202, 202,
-                headers=resp_headers, give_connect=capture_requests
-        ) as fake_conn:
-            resp = req.get_response(self.app)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
-        self.assertEqual(resp.status_int, 202)
-        self.assertEqual(len(backend_requests), 5)
-        for request in backend_requests[2:]:
-            expectations = {
-                'method': 'POST',
-                'path': '/0/a/c/o',  # ignore device bit
-                'headers': {
-                    'X-Object-Meta-Color': 'Blue',
-                    'X-Backend-Storage-Policy-Index': '0',
+            account_request = backend_requests.pop(0)
+            check_request(account_request, method='HEAD', path='/sda/0/a')
+            container_request = backend_requests.pop(0)
+            check_request(container_request, method='HEAD', path='/sda/0/a/c')
+            # make sure backend requests included expected container headers
+            container_headers = {}
+            for request in backend_requests:
+                req_headers = request[2]
+                device = req_headers['x-container-device']
+                host = req_headers['x-container-host']
+                container_headers[device] = host
+                expectations = {
+                    'method': 'POST',
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Connection': 'close',
+                        'User-Agent': 'proxy-server %s' % os.getpid(),
+                        'Host': 'localhost:80',
+                        'Referer': 'POST http://localhost/v1/a/c/o',
+                        'X-Object-Meta-Color': 'Blue',
+                        'X-Backend-Storage-Policy-Index': '1'
+                    },
                 }
-            }
-            check_request(request, **expectations)
+                check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
+            # and again with policy override
+            self.app.memcache.store = {}
+            backend_requests = []
+            req = Request.blank('/v1/a/c/o', {}, method='POST',
+                                headers={'X-Object-Meta-Color': 'Blue',
+                                         'Content-Type': 'text/plain',
+                                         'X-Backend-Storage-Policy-Index': 0})
+            with mocked_http_conn(
+                    200, 200, 202, 202, 202,
+                    headers=resp_headers, give_connect=capture_requests
+            ) as fake_conn:
+                resp = req.get_response(self.app)
+                self.assertRaises(StopIteration, fake_conn.code_iter.next)
+            self.assertEqual(resp.status_int, 202)
+            self.assertEqual(len(backend_requests), 5)
+            for request in backend_requests[2:]:
+                expectations = {
+                    'method': 'POST',
+                    'path': '/0/a/c/o',  # ignore device bit
+                    'headers': {
+                        'X-Object-Meta-Color': 'Blue',
+                        'X-Backend-Storage-Policy-Index': '0',
+                    }
+                }
+                check_request(request, **expectations)
+
+        resp_headers = {'X-Backend-Storage-Policy-Index': 1}
+        do_test(resp_headers)
+        resp_headers['X-Backend-Sharding-State'] = 'unsharded'
+        do_test(resp_headers)
+
+    @patch_policies([
+        StoragePolicy(0, 'zero', is_default=True, object_ring=FakeRing()),
+        StoragePolicy(1, 'one', object_ring=FakeRing()),
+    ])
+    def test_backend_headers_update_shard_container(self):
+        # verify that when container is sharded the backend container update is
+        # directed to the shard container
+        # reset the router post patch_policies
+        self.app.obj_controller_router = proxy_server.ObjectControllerRouter()
+        self.app.sort_nodes = lambda nodes, *args, **kwargs: nodes
+
+        def do_test(method, sharding_state):
+            self.app.memcache.store = {}
+            req = Request.blank('/v1/a/c/o', {}, method=method, body='',
+                                headers={'Content-Type': 'text/plain'})
+
+            # we want the container_info response to say policy index of 1 and
+            # sharding state
+            # acc HEAD, cont HEAD, cont shard GET, obj POSTs
+            status_codes = (200, 200, 200, 202, 202, 202)
+            resp_headers = {'X-Backend-Storage-Policy-Index': 1,
+                            'x-backend-sharding-state': sharding_state,
+                            'X-Backend-Record-Type': 'shard'}
+            shard_range = utils.ShardRange(
+                '.shards_a/c_shard', utils.Timestamp.now(), 'l', 'u')
+            body = json.dumps([dict(shard_range)])
+            with mocked_http_conn(*status_codes, headers=resp_headers,
+                                  body=body) as fake_conn:
+                resp = req.get_response(self.app)
+
+            self.assertEqual(resp.status_int, 202)
+            backend_requests = fake_conn.requests
+
+            def check_request(req, method, path, headers=None, params=None):
+                self.assertEqual(method, req['method'])
+                # caller can ignore leading path parts
+                self.assertTrue(req['path'].endswith(path),
+                                'expected path to end with %s, it was %s' % (
+                                    path, req['path']))
+                headers = headers or {}
+                # caller can ignore some headers
+                for k, v in headers.items():
+                    self.assertEqual(req['headers'][k], v,
+                                     'Expected %s but got %s for key %s' %
+                                     (v, req['headers'][k], k))
+                params = params or {}
+                req_params = dict(parse_qsl(req['qs'])) if req['qs'] else {}
+                for k, v in params.items():
+                    self.assertEqual(req_params[k], v,
+                                     'Expected %s but got %s for key %s' %
+                                     (v, req_params[k], k))
+
+            account_request = backend_requests[0]
+            check_request(account_request, method='HEAD', path='/sda/0/a')
+            container_request = backend_requests[1]
+            check_request(container_request, method='HEAD', path='/sda/0/a/c')
+            container_request_shard = backend_requests[2]
+            check_request(
+                container_request_shard, method='GET', path='/sda/0/a/c',
+                params={'includes': 'o'})
+
+            # make sure backend requests included expected container headers
+            container_headers = {}
+
+            for request in backend_requests[3:]:
+                req_headers = request['headers']
+                device = req_headers['x-container-device']
+                container_headers[device] = req_headers['x-container-host']
+                expectations = {
+                    'method': method,
+                    'path': '/0/a/c/o',
+                    'headers': {
+                        'X-Container-Partition': '0',
+                        'Host': 'localhost:80',
+                        'Referer': '%s http://localhost/v1/a/c/o' % method,
+                        'X-Backend-Storage-Policy-Index': '1',
+                        'X-Backend-Container-Path': shard_range.name
+                    },
+                }
+                check_request(request, **expectations)
+
+            expected = {}
+            for i, device in enumerate(['sda', 'sdb', 'sdc']):
+                expected[device] = '10.0.0.%d:100%d' % (i, i)
+            self.assertEqual(container_headers, expected)
+
+        do_test('POST', 'sharding')
+        do_test('POST', 'sharded')
+        do_test('DELETE', 'sharding')
+        do_test('DELETE', 'sharded')
+        do_test('PUT', 'sharding')
+        do_test('PUT', 'sharded')
 
     def test_DELETE(self):
         with save_globals():
@@ -3508,7 +3602,6 @@ class TestObjectController(unittest.TestCase):
     def test_POST_meta_val_len(self):
         with save_globals():
             limit = constraints.MAX_META_VALUE_LENGTH
-            self.app.object_post_as_copy = False
             ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
             set_http_connect(200, 200, 202, 202, 202)
@@ -3534,7 +3627,6 @@ class TestObjectController(unittest.TestCase):
             return
         with save_globals():
             limit = constraints.MAX_META_VALUE_LENGTH
-            self.app.object_post_as_copy = False
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
             set_http_connect(200, 200, 202, 202, 202)
@@ -3550,7 +3642,6 @@ class TestObjectController(unittest.TestCase):
     def test_POST_meta_key_len(self):
         with save_globals():
             limit = constraints.MAX_META_NAME_LENGTH
-            self.app.object_post_as_copy = False
             set_http_connect(200, 200, 202, 202, 202)
             #                acct cont obj  obj  obj
             req = Request.blank(
@@ -3985,10 +4076,11 @@ class TestObjectController(unittest.TestCase):
             for node in self.app.iter_nodes(object_ring, 0):
                 pass
             sort_nodes.assert_called_once_with(
-                object_ring.get_part_nodes(0))
+                object_ring.get_part_nodes(0), policy=None)
 
     def test_iter_nodes_skips_error_limited(self):
-        with mock.patch.object(self.app, 'sort_nodes', lambda n: n):
+        with mock.patch.object(self.app, 'sort_nodes',
+                               lambda n, *args, **kwargs: n):
             object_ring = self.app.get_object_ring(None)
             first_nodes = list(self.app.iter_nodes(object_ring, 0))
             second_nodes = list(self.app.iter_nodes(object_ring, 0))
@@ -4000,7 +4092,8 @@ class TestObjectController(unittest.TestCase):
 
     def test_iter_nodes_gives_extra_if_error_limited_inline(self):
         object_ring = self.app.get_object_ring(None)
-        with mock.patch.object(self.app, 'sort_nodes', lambda n: n), \
+        with mock.patch.object(self.app, 'sort_nodes',
+                               lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 6), \
                 mock.patch.object(object_ring, 'max_more_nodes', 99):
@@ -4017,14 +4110,14 @@ class TestObjectController(unittest.TestCase):
         object_ring = self.app.get_object_ring(None)
         node_list = [dict(id=n, ip='1.2.3.4', port=n, device='D')
                      for n in range(10)]
-        with mock.patch.object(self.app, 'sort_nodes', lambda n: n), \
+        with mock.patch.object(self.app, 'sort_nodes', lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 3):
             got_nodes = list(self.app.iter_nodes(object_ring, 0,
                                                  node_iter=iter(node_list)))
         self.assertEqual(node_list[:3], got_nodes)
 
-        with mock.patch.object(self.app, 'sort_nodes', lambda n: n), \
+        with mock.patch.object(self.app, 'sort_nodes', lambda n, *args, **kwargs: n), \
                 mock.patch.object(self.app, 'request_node_count',
                                   lambda r: 1000000):
             got_nodes = list(self.app.iter_nodes(object_ring, 0,
@@ -4091,7 +4184,7 @@ class TestObjectController(unittest.TestCase):
         with save_globals():
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
-            controller.app.sort_nodes = lambda l: l
+            controller.app.sort_nodes = lambda l, *args, **kwargs: l
             object_ring = controller.app.get_object_ring(None)
             self.assert_status_map(controller.HEAD, (200, 200, 503, 200, 200),
                                    200)
@@ -4130,7 +4223,7 @@ class TestObjectController(unittest.TestCase):
         with save_globals():
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
-            controller.app.sort_nodes = lambda l: l
+            controller.app.sort_nodes = lambda l, *args, **kwargs: l
             object_ring = controller.app.get_object_ring(None)
             self.assert_status_map(controller.HEAD, (200, 200, 503, 200, 200),
                                    200)
@@ -4159,7 +4252,7 @@ class TestObjectController(unittest.TestCase):
         with save_globals():
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
-            controller.app.sort_nodes = lambda l: l
+            controller.app.sort_nodes = lambda l, *args, **kwargs: l
             object_ring = controller.app.get_object_ring(None)
             # acc con obj obj obj
             self.assert_status_map(controller.PUT, (200, 200, 503, 200, 200),
@@ -4179,7 +4272,7 @@ class TestObjectController(unittest.TestCase):
         with save_globals():
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
-            controller.app.sort_nodes = lambda l: l
+            controller.app.sort_nodes = lambda l, *args, **kwargs: l
             object_ring = controller.app.get_object_ring(None)
             # acc con obj obj obj
             self.assert_status_map(controller.PUT, (200, 200, 200, 200, 503),
@@ -4294,7 +4387,6 @@ class TestObjectController(unittest.TestCase):
 
     def test_PUT_POST_requires_container_exist(self):
         with save_globals():
-            self.app.object_post_as_copy = False
             self.app.memcache = FakeMemcacheReturnsNone()
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
@@ -4434,7 +4526,7 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_bad_version(self):
         # Check bad version
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v0 HTTP/1.1\r\nHost: localhost\r\n'
@@ -4448,7 +4540,7 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_bad_path(self):
         # Check bad path
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET invalid HTTP/1.1\r\nHost: localhost\r\n'
@@ -4462,7 +4554,7 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_bad_utf8(self):
         # Check invalid utf-8
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a%80 HTTP/1.1\r\nHost: localhost\r\n'
@@ -4477,7 +4569,7 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_bad_path_no_controller(self):
         # Check bad path, no controller
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1 HTTP/1.1\r\nHost: localhost\r\n'
@@ -4492,7 +4584,7 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_bad_method(self):
         # Check bad method
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('LICK /v1/a HTTP/1.1\r\nHost: localhost\r\n'
@@ -4507,9 +4599,9 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_unhandled_exception(self):
         # Check unhandled exception
         (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv,
-         obj2srv, obj3srv) = _test_servers
+         obj2srv, obj3srv, obj4srv, obj5srv, obj6srv) = _test_servers
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         orig_update_request = prosrv.update_request
 
         def broken_update_request(*args, **kwargs):
@@ -4533,7 +4625,7 @@ class TestObjectController(unittest.TestCase):
         # the part Application.log_request that 'enforces' a
         # content_length on the response.
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('HEAD /v1/a HTTP/1.1\r\nHost: localhost\r\n'
@@ -4557,7 +4649,7 @@ class TestObjectController(unittest.TestCase):
         ustr_short = '\xe1\xbc\xb8\xce\xbf\xe1\xbd\xbatest'
         # Create ustr container
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/%s HTTP/1.1\r\nHost: localhost\r\n'
@@ -4669,7 +4761,7 @@ class TestObjectController(unittest.TestCase):
     def test_chunked_put_chunked_put(self):
         # Do chunked object put
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         # Also happens to assert that x-storage-token is taken as a
@@ -4698,7 +4790,7 @@ class TestObjectController(unittest.TestCase):
     @unpatch_policies
     def test_conditional_range_get(self):
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis,
-         obj3lis) = _test_sockets
+         obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
 
         # make a container
@@ -4812,6 +4904,78 @@ class TestObjectController(unittest.TestCase):
             controller.GET(req)
         self.assertTrue(called[0])
 
+    def _check_GET_respects_read_affinity(self, conf, policy, expected_nodes):
+        actual_nodes = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                actual_nodes.append(ipaddr)
+
+        # mock shuffle to be a no-op to ensure that the only way nodes would
+        # not be used in ring order is if affinity is respected.
+        with mock.patch('swift.proxy.server.shuffle', lambda x: x):
+            app = proxy_server.Application(
+                conf, FakeMemcache(),
+                logger=debug_logger('proxy-ut'),
+                account_ring=FakeRing(),
+                container_ring=FakeRing())
+            with save_globals():
+                object_ring = app.get_object_ring(policy)
+                object_ring.max_more_nodes = 100
+                controller = \
+                    ReplicatedObjectController(
+                        app, 'a', 'c', 'o.jpg')
+                # requests go to acc, con, obj, obj, obj
+                set_http_connect(200, 200, 404, 404, 200,
+                                 give_connect=test_connect)
+                req = Request.blank(
+                    '/v1/a/c/o.jpg',
+                    headers={'X-Backend-Storage-Policy-Index': str(policy)})
+                app.memcache.store = {}
+                res = controller.GET(req)
+        self.assertTrue(res.status.startswith('200 '))
+        self.assertEqual(3, len(actual_nodes))
+        self.assertEqual(expected_nodes, actual_nodes)
+
+    @patch_policies([StoragePolicy(0, 'zero', True, object_ring=FakeRing()),
+                     StoragePolicy(1, 'one', False, object_ring=FakeRing())])
+    def test_GET_respects_read_affinity(self):
+        # nodes in fake ring order have r0z0, r1z1, r0z2
+        # Check default conf via proxy server conf
+        conf = {'read_affinity': 'r0z2=1, r1=2',
+                'sorting_method': 'affinity'}
+        expected_nodes = ['10.0.0.2', '10.0.0.1', '10.0.0.0']
+        self._check_GET_respects_read_affinity(conf, 0, expected_nodes)
+
+        # policy 0 and policy 1 have conf via per policy conf section
+        conf = {
+            'read_affinity': '',
+            'sorting_method': 'shuffle',
+            'policy_config': {
+                '0': {'read_affinity': 'r1z1=1, r0z2=2',
+                      'sorting_method': 'affinity'},
+                '1': {'read_affinity': 'r0z2=1, r0z0=2',
+                      'sorting_method': 'affinity'}
+            }
+        }
+        expected_nodes = ['10.0.0.1', '10.0.0.2', '10.0.0.0']
+        self._check_GET_respects_read_affinity(conf, 0, expected_nodes)
+        expected_nodes = ['10.0.0.2', '10.0.0.0', '10.0.0.1']
+        self._check_GET_respects_read_affinity(conf, 1, expected_nodes)
+
+        # policy 0 conf via per policy conf section overrides proxy server conf
+        conf = {
+            'read_affinity': 'r1z1=1, r0z2=2',
+            'sorting_method': 'affinity',
+            'policy_config': {
+                '0': {'read_affinity': 'r0z2=1, r0=2',
+                      'sorting_method': 'affinity'}
+            }
+        }
+        expected_nodes = ['10.0.0.2', '10.0.0.0', '10.0.0.1']
+        self._check_GET_respects_read_affinity(conf, 0, expected_nodes)
+
     def test_HEAD_calls_authorize(self):
         called = [False]
 
@@ -4835,7 +4999,6 @@ class TestObjectController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            self.app.object_post_as_copy = False
             set_http_connect(200, 200, 201, 201, 201)
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
@@ -4866,7 +5029,6 @@ class TestObjectController(unittest.TestCase):
 
     def test_POST_converts_delete_after_to_delete_at(self):
         with save_globals():
-            self.app.object_post_as_copy = False
             controller = ReplicatedObjectController(
                 self.app, 'account', 'container', 'object')
             set_http_connect(200, 200, 202, 202, 202)
@@ -4885,127 +5047,6 @@ class TestObjectController(unittest.TestCase):
                                  str(int(t + 60)))
             finally:
                 time.time = orig_time
-
-    @unpatch_policies
-    def test_ec_client_disconnect(self):
-        prolis = _test_sockets[0]
-
-        # create connection
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-
-        # create container
-        fd.write('PUT /v1/a/ec-discon HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Content-Length: 0\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'X-Storage-Policy: ec\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 2'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        # create object
-        obj = 'a' * 4 * 64 * 2 ** 10
-        fd.write('PUT /v1/a/ec-discon/test HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: donuts\r\n'
-                 '\r\n%s' % (len(obj), obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        class WrappedTimeout(ChunkWriteTimeout):
-            def __enter__(self):
-                timeouts[self] = traceback.extract_stack()
-                return super(WrappedTimeout, self).__enter__()
-
-            def __exit__(self, typ, value, tb):
-                timeouts[self] = None
-                return super(WrappedTimeout, self).__exit__(typ, value, tb)
-
-        timeouts = {}
-        with mock.patch('swift.proxy.controllers.base.ChunkWriteTimeout',
-                        WrappedTimeout):
-            with mock.patch.object(_test_servers[0], 'client_timeout', new=5):
-                # get object
-                fd.write('GET /v1/a/ec-discon/test HTTP/1.1\r\n'
-                         'Host: localhost\r\n'
-                         'Connection: close\r\n'
-                         'X-Storage-Token: t\r\n'
-                         '\r\n')
-                fd.flush()
-                headers = readuntil2crlfs(fd)
-                exp = 'HTTP/1.1 200'
-                self.assertEqual(headers[:len(exp)], exp)
-
-                # read most of the object, and disconnect
-                fd.read(10)
-                sock.fd._sock.close()
-                self._sleep_enough(
-                    lambda:
-                    _test_servers[0].logger.get_lines_for_level('warning'))
-
-        # check for disconnect message!
-        expected = ['Client disconnected on read'] * 2
-        self.assertEqual(
-            _test_servers[0].logger.get_lines_for_level('warning'),
-            expected)
-        # check that no coro was left waiting to write
-        self.assertTrue(timeouts)  # sanity - WrappedTimeout did get called
-        missing_exits = [tb for tb in timeouts.values() if tb is not None]
-        self.assertFalse(
-            missing_exits, 'Failed to exit all ChunkWriteTimeouts.\n' +
-            ''.join(['No exit from ChunkWriteTimeout entered at:\n' +
-                     ''.join(traceback.format_list(tb)[:-1])
-                     for tb in missing_exits]))
-        # and check that the ChunkWriteTimeouts did not raise Exceptions
-        self.assertFalse(_test_servers[0].logger.get_lines_for_level('error'))
-
-    @unpatch_policies
-    def test_ec_client_put_disconnect(self):
-        prolis = _test_sockets[0]
-
-        # create connection
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-
-        # create container
-        fd.write('PUT /v1/a/ec-discon HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Content-Length: 0\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'X-Storage-Policy: ec\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 2'
-        self.assertEqual(headers[:len(exp)], exp)
-
-        # create object
-        obj = 'a' * 4 * 64 * 2 ** 10
-        fd.write('PUT /v1/a/ec-discon/test HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Content-Length: %d\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Type: donuts\r\n'
-                 '\r\n%s' % (len(obj), obj[:-10]))
-        fd.flush()
-        fd.close()
-        sock.close()
-        # sleep to trampoline enough
-        condition = \
-            lambda: _test_servers[0].logger.get_lines_for_level('warning')
-        self._sleep_enough(condition)
-        expected = ['Client disconnected without sending enough data']
-        warns = _test_servers[0].logger.get_lines_for_level('warning')
-        self.assertEqual(expected, warns)
-        errors = _test_servers[0].logger.get_lines_for_level('error')
-        self.assertEqual([], errors)
 
     @unpatch_policies
     def test_leak_1(self):
@@ -5081,6 +5122,8 @@ class TestObjectController(unittest.TestCase):
                          'Access-Control-Request-Method': 'GET'})
             resp = controller.OPTIONS(req)
             self.assertEqual(401, resp.status_int)
+            self.assertNotIn('Access-Control-Allow-Origin', resp.headers)
+            self.assertNotIn('Vary', resp.headers)
 
             def my_empty_origin_container_info(*args):
                 return {'cors': {'allow_origin': None}}
@@ -5092,6 +5135,8 @@ class TestObjectController(unittest.TestCase):
                          'Access-Control-Request-Method': 'GET'})
             resp = controller.OPTIONS(req)
             self.assertEqual(401, resp.status_int)
+            self.assertNotIn('Access-Control-Allow-Origin', resp.headers)
+            self.assertNotIn('Vary', resp.headers)
 
             def my_container_info(*args):
                 return {
@@ -5112,13 +5157,13 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(
                 'https://foo.bar',
                 resp.headers['access-control-allow-origin'])
-            for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
-                self.assertIn(verb,
-                              resp.headers['access-control-allow-methods'])
+            self.assertEqual('Origin', resp.headers.get('vary'))
             self.assertEqual(
-                len(resp.headers['access-control-allow-methods'].split(', ')),
-                6)
+                sorted(resp.headers['access-control-allow-methods']
+                       .split(', ')),
+                sorted('OPTIONS GET POST PUT DELETE HEAD'.split()))
             self.assertEqual('999', resp.headers['access-control-max-age'])
+
             req = Request.blank(
                 '/v1/a/c/o.jpg',
                 {'REQUEST_METHOD': 'OPTIONS'},
@@ -5126,19 +5171,28 @@ class TestObjectController(unittest.TestCase):
             req.content_length = 0
             resp = controller.OPTIONS(req)
             self.assertEqual(401, resp.status_int)
+            self.assertNotIn('Access-Control-Allow-Origin', resp.headers)
+            self.assertNotIn('Vary', resp.headers)
+
             req = Request.blank('/v1/a/c/o.jpg', {'REQUEST_METHOD': 'OPTIONS'})
             req.content_length = 0
             resp = controller.OPTIONS(req)
             self.assertEqual(200, resp.status_int)
-            for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
-                self.assertIn(verb, resp.headers['Allow'])
-            self.assertEqual(len(resp.headers['Allow'].split(', ')), 6)
+            self.assertEqual(
+                sorted(resp.headers['Allow'].split(', ')),
+                sorted('OPTIONS GET POST PUT DELETE HEAD'.split()))
+            self.assertNotIn('Access-Control-Allow-Origin', resp.headers)
+            self.assertNotIn('Vary', resp.headers)
+
             req = Request.blank(
                 '/v1/a/c/o.jpg',
                 {'REQUEST_METHOD': 'OPTIONS'},
                 headers={'Origin': 'http://foo.com'})
             resp = controller.OPTIONS(req)
             self.assertEqual(401, resp.status_int)
+            self.assertNotIn('Access-Control-Allow-Origin', resp.headers)
+            self.assertNotIn('Vary', resp.headers)
+
             req = Request.blank(
                 '/v1/a/c/o.jpg',
                 {'REQUEST_METHOD': 'OPTIONS'},
@@ -5147,6 +5201,7 @@ class TestObjectController(unittest.TestCase):
             controller.app.cors_allow_origin = ['http://foo.bar', ]
             resp = controller.OPTIONS(req)
             self.assertEqual(200, resp.status_int)
+            self.assertEqual('Origin', resp.headers.get('vary'))
 
             def my_container_info_wildcard(*args):
                 return {
@@ -5165,12 +5220,11 @@ class TestObjectController(unittest.TestCase):
             resp = controller.OPTIONS(req)
             self.assertEqual(200, resp.status_int)
             self.assertEqual('*', resp.headers['access-control-allow-origin'])
-            for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
-                self.assertIn(verb,
-                              resp.headers['access-control-allow-methods'])
+            self.assertNotIn('Vary', resp.headers)
             self.assertEqual(
-                len(resp.headers['access-control-allow-methods'].split(', ')),
-                6)
+                sorted(resp.headers['access-control-allow-methods']
+                       .split(', ')),
+                sorted('OPTIONS GET POST PUT DELETE HEAD'.split()))
             self.assertEqual('999', resp.headers['access-control-max-age'])
 
     def _get_CORS_response(self, container_cors, strict_mode, object_get=None):
@@ -5285,6 +5339,14 @@ class TestObjectController(unittest.TestCase):
         self.assertNotIn('access-control-expose-headers', resp.headers)
         self.assertNotIn('access-control-allow-origin', resp.headers)
 
+        # test proxy server cors_allow_origin option
+        self.app.cors_allow_origin = ['http://foo.bar']
+        resp = self._get_CORS_response(
+            container_cors=container_cors, strict_mode=True)
+        self.assertEqual('http://foo.bar',
+                         resp.headers['access-control-allow-origin'])
+        self.assertEqual(expected_exposed, exposed)
+
     def test_CORS_valid_with_obj_headers(self):
         container_cors = {'allow_origin': 'http://foo.bar'}
 
@@ -5305,6 +5367,76 @@ class TestObjectController(unittest.TestCase):
                          resp.headers['access-control-allow-origin'])
         self.assertEqual('x-trans-id',
                          resp.headers['access-control-expose-headers'])
+
+    def test_CORS_expose_headers(self):
+        default_expected_exposed = set([
+            'cache-control', 'content-language', 'content-type', 'expires',
+            'last-modified', 'pragma', 'etag', 'x-timestamp', 'x-trans-id',
+            'x-openstack-request-id'])
+
+        def objectGET(controller, req):
+                return Response(headers={
+                    'X-Custom-Operator': 'hush',
+                    'X-Custom-User': 'hush',
+                })
+
+        # test default expose_headers
+        self.app.cors_expose_headers = []
+        container_cors = {'allow_origin': 'http://foo.bar'}
+        resp = self._get_CORS_response(container_cors=container_cors,
+                                       strict_mode=False, object_get=objectGET)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertIn('access-control-expose-headers', resp.headers)
+        exposed = set(
+            h.strip() for h in
+            resp.headers['access-control-expose-headers'].split(','))
+        self.assertEqual(default_expected_exposed, exposed)
+
+        # test operator expose_headers
+        self.app.cors_expose_headers = ['x-custom-operator', ]
+        container_cors = {'allow_origin': 'http://foo.bar'}
+        resp = self._get_CORS_response(container_cors=container_cors,
+                                       strict_mode=False, object_get=objectGET)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertIn('access-control-expose-headers', resp.headers)
+        exposed = set(
+            h.strip() for h in
+            resp.headers['access-control-expose-headers'].split(','))
+        self.assertEqual(default_expected_exposed | set(['x-custom-operator']),
+                         exposed)
+
+        # test user expose_headers
+        self.app.cors_expose_headers = []
+        container_cors = {'allow_origin': 'http://foo.bar',
+                          'expose_headers': 'x-custom-user'}
+        resp = self._get_CORS_response(container_cors=container_cors,
+                                       strict_mode=False, object_get=objectGET)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertIn('access-control-expose-headers', resp.headers)
+        exposed = set(
+            h.strip() for h in
+            resp.headers['access-control-expose-headers'].split(','))
+        self.assertEqual(default_expected_exposed | set(['x-custom-user']),
+                         exposed)
+
+        # test user and operator expose_headers
+        self.app.cors_expose_headers = ['x-custom-operator', ]
+        container_cors = {'allow_origin': 'http://foo.bar',
+                          'expose_headers': 'x-custom-user'}
+        resp = self._get_CORS_response(container_cors=container_cors,
+                                       strict_mode=False, object_get=objectGET)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertIn('access-control-expose-headers', resp.headers)
+        exposed = set(
+            h.strip() for h in
+            resp.headers['access-control-expose-headers'].split(','))
+        self.assertEqual(default_expected_exposed | set(['x-custom-user',
+                                                         'x-custom-operator']),
+                         exposed)
 
     def _gather_x_container_headers(self, controller_call, req, *connect_args,
                                     **kwargs):
@@ -5369,12 +5501,61 @@ class TestObjectController(unittest.TestCase):
                 {'X-Container-Host': '10.0.0.0:1000',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sda'},
+                {'X-Container-Host': '10.0.0.1:1001',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdb'},
+                {'X-Container-Host': None,
+                 'X-Container-Partition': None,
+                 'X-Container-Device': None}])
+
+    def test_PUT_x_container_headers_with_many_object_replicas(self):
+        POLICIES[0].object_ring.set_replicas(11)
+
+        req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Content-Length': '5'}, body='12345')
+        controller = ReplicatedObjectController(
+            self.app, 'a', 'c', 'o')
+        seen_headers = self._gather_x_container_headers(
+            controller.PUT, req,
+            # HEAD HEAD PUT PUT PUT PUT PUT PUT PUT PUT PUT PUT PUT
+            200, 200, 201, 201, 201, 201, 201, 201, 201, 201, 201, 201, 201)
+
+        self.assertEqual(
+            sorted(seen_headers), sorted([
+                {'X-Container-Host': '10.0.0.0:1000',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda'},
+                {'X-Container-Host': '10.0.0.0:1000',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sda'},
                 {'X-Container-Host': '10.0.0.0:1000',
                  'X-Container-Partition': '0',
                  'X-Container-Device': 'sda'},
                 {'X-Container-Host': '10.0.0.1:1001',
                  'X-Container-Partition': '0',
-                 'X-Container-Device': 'sdb'}])
+                 'X-Container-Device': 'sdb'},
+                {'X-Container-Host': '10.0.0.1:1001',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdb'},
+                {'X-Container-Host': '10.0.0.2:1002',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdc'},
+                {'X-Container-Host': '10.0.0.2:1002',
+                 'X-Container-Partition': '0',
+                 'X-Container-Device': 'sdc'},
+                {'X-Container-Host': None,
+                 'X-Container-Partition': None,
+                 'X-Container-Device': None},
+                {'X-Container-Host': None,
+                 'X-Container-Partition': None,
+                 'X-Container-Device': None},
+                {'X-Container-Host': None,
+                 'X-Container-Partition': None,
+                 'X-Container-Device': None},
+                {'X-Container-Host': None,
+                 'X-Container-Partition': None,
+                 'X-Container-Device': None},
+            ]))
 
     def test_PUT_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
@@ -5401,7 +5582,6 @@ class TestObjectController(unittest.TestCase):
 
     def test_POST_x_container_headers_with_more_container_replicas(self):
         self.app.container_ring.set_replicas(4)
-        self.app.object_post_as_copy = False
 
         req = Request.blank('/v1/a/c/o',
                             environ={'REQUEST_METHOD': 'POST'},
@@ -5478,9 +5658,9 @@ class TestObjectController(unittest.TestCase):
              'X-Delete-At-Partition': '0',
              'X-Delete-At-Device': 'sdb'},
             {'X-Delete-At-Host': None,
-             'X-Delete-At-Container': None,
              'X-Delete-At-Partition': None,
-             'X-Delete-At-Device': None}
+             'X-Delete-At-Container': None,
+             'X-Delete-At-Device': None},
         ])
 
     @mock.patch('time.time', new=lambda: STATIC_TIME)
@@ -5520,7 +5700,933 @@ class TestObjectController(unittest.TestCase):
         ])
 
 
+class BaseTestECObjectController(BaseTestObjectController):
+    def test_PUT_ec(self):
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        obj = 'abCD' * 10  # small, so we don't get multiple EC stripes
+        prolis = _test_sockets[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/o1 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Etag: "%s"\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, md5(obj).hexdigest(),
+                             len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        ecd = self.ec_policy.pyeclib_driver
+        expected_pieces = set(ecd.encode(obj))
+
+        # go to disk to make sure it's there and all erasure-coded
+        partition, nodes = self.ec_policy.object_ring.get_nodes(
+            'a', self.ec_policy.name, 'o1')
+        conf = {'devices': _testdir, 'mount_check': 'false'}
+        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[self.ec_policy]
+
+        got_pieces = set()
+        got_indices = set()
+        got_durable = []
+        for node_index, node in enumerate(nodes):
+            df = df_mgr.get_diskfile(node['device'], partition,
+                                     'a', self.ec_policy.name, 'o1',
+                                     policy=self.ec_policy)
+            with df.open():
+                meta = df.get_metadata()
+                contents = ''.join(df.reader())
+                got_pieces.add(contents)
+
+                lmeta = dict((k.lower(), v) for k, v in meta.items())
+                got_indices.add(
+                    lmeta['x-object-sysmeta-ec-frag-index'])
+
+                self.assertEqual(
+                    lmeta['x-object-sysmeta-ec-etag'],
+                    md5(obj).hexdigest())
+                self.assertEqual(
+                    lmeta['x-object-sysmeta-ec-content-length'],
+                    str(len(obj)))
+                self.assertEqual(
+                    lmeta['x-object-sysmeta-ec-segment-size'],
+                    '4096')
+                self.assertEqual(
+                    lmeta['x-object-sysmeta-ec-scheme'],
+                    '%s 2+1' % DEFAULT_TEST_EC_TYPE)
+                self.assertEqual(
+                    lmeta['etag'],
+                    md5(contents).hexdigest())
+
+                # check presence for a durable data file for the timestamp
+                durable_file = (
+                    utils.Timestamp(df.timestamp).internal +
+                    '#%s' % lmeta['x-object-sysmeta-ec-frag-index'] +
+                    '#d.data')
+                durable_file = os.path.join(
+                    _testdir, node['device'], storage_directory(
+                        diskfile.get_data_dir(self.ec_policy),
+                        partition, hash_path('a', self.ec_policy.name, 'o1')),
+                    durable_file)
+                if os.path.isfile(durable_file):
+                    got_durable.append(True)
+
+        self.assertEqual(expected_pieces, got_pieces)
+        self.assertEqual(set(('0', '1', '2')), got_indices)
+
+        # verify at least 2 puts made it all the way to the end of 2nd
+        # phase, ie at least 2 durable statuses were written
+        num_durable_puts = sum(d is True for d in got_durable)
+        self.assertGreaterEqual(num_durable_puts, 2)
+
+    def test_PUT_ec_multiple_segments(self):
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        pyeclib_header_size = len(self.ec_policy.pyeclib_driver.encode("")[0])
+        segment_size = self.ec_policy.ec_segment_size
+
+        # Big enough to have multiple segments. Also a multiple of the
+        # segment size to get coverage of that path too.
+        obj = 'ABC' * segment_size
+
+        prolis = _test_sockets[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/o2 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # it's a 2+1 erasure code, so each fragment archive should be half
+        # the length of the object, plus three inline pyeclib metadata
+        # things (one per segment)
+        expected_length = (len(obj) / 2 + pyeclib_header_size * 3)
+
+        partition, nodes = self.ec_policy.object_ring.get_nodes(
+            'a', self.ec_policy.name, 'o2')
+
+        conf = {'devices': _testdir, 'mount_check': 'false'}
+        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[self.ec_policy]
+
+        got_durable = []
+        fragment_archives = []
+        for node in nodes:
+            df = df_mgr.get_diskfile(
+                node['device'], partition, 'a',
+                self.ec_policy.name, 'o2', policy=self.ec_policy)
+            with df.open():
+                meta = df.get_metadata()
+                contents = ''.join(df.reader())
+                fragment_archives.append(contents)
+                self.assertEqual(len(contents), expected_length)
+
+                durable_file = (
+                    utils.Timestamp(df.timestamp).internal +
+                    '#%s' % meta['X-Object-Sysmeta-Ec-Frag-Index'] +
+                    '#d.data')
+                durable_file = os.path.join(
+                    _testdir, node['device'], storage_directory(
+                        diskfile.get_data_dir(self.ec_policy),
+                        partition, hash_path('a', self.ec_policy.name, 'o2')),
+                    durable_file)
+                if os.path.isfile(durable_file):
+                    got_durable.append(True)
+
+        # Verify that we can decode each individual fragment and that they
+        # are all the correct size
+        fragment_size = self.ec_policy.fragment_size
+        nfragments = int(
+            math.ceil(float(len(fragment_archives[0])) / fragment_size))
+
+        for fragment_index in range(nfragments):
+            fragment_start = fragment_index * fragment_size
+            fragment_end = (fragment_index + 1) * fragment_size
+
+            try:
+                frags = [fa[fragment_start:fragment_end]
+                         for fa in fragment_archives]
+                seg = self.ec_policy.pyeclib_driver.decode(frags)
+            except ECDriverError:
+                self.fail("Failed to decode fragments %d; this probably "
+                          "means the fragments are not the sizes they "
+                          "should be" % fragment_index)
+
+            segment_start = fragment_index * segment_size
+            segment_end = (fragment_index + 1) * segment_size
+
+            self.assertEqual(seg, obj[segment_start:segment_end])
+
+        # verify at least 2 puts made it all the way to the end of 2nd
+        # phase, ie at least 2 .durable statuses were written
+        num_durable_puts = sum(d is True for d in got_durable)
+        self.assertGreaterEqual(num_durable_puts, 2)
+
+    def test_PUT_ec_object_etag_mismatch(self):
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        obj = '90:6A:02:60:B1:08-96da3e706025537fc42464916427727e'
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/o3 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Etag: %s\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name,
+                             md5('something else').hexdigest(),
+                             len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 422'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # nothing should have made it to disk on the object servers
+        partition, nodes = prosrv.get_object_ring(
+            int(self.ec_policy)).get_nodes('a', self.ec_policy.name, 'o3')
+        conf = {'devices': _testdir, 'mount_check': 'false'}
+
+        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[self.ec_policy]
+
+        for node in nodes:
+            df = df_mgr.get_diskfile(node['device'], partition,
+                                     'a', self.ec_policy.name, 'o3',
+                                     policy=self.ec_policy)
+            self.assertRaises(DiskFileNotExist, df.open)
+
+    def test_PUT_ec_fragment_archive_etag_mismatch(self):
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        # Cause a hash mismatch by feeding one particular MD5 hasher some
+        # extra data. The goal here is to get exactly more than one of the
+        # hashers in an object server.
+        count = (
+            self.ec_policy.object_ring.replica_count - self.ec_policy.ec_ndata)
+        countdown = [count]
+
+        def busted_md5_constructor(initial_str=""):
+            hasher = md5(initial_str)
+            if countdown[0] > 0:
+                hasher.update('wrong')
+            countdown[0] -= 1
+            return hasher
+
+        obj = 'uvarovite-esurience-cerated-symphysic'
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        with mock.patch('swift.obj.diskfile.md5',
+                        busted_md5_constructor):
+            fd = sock.makefile()
+            fd.write('PUT /v1/a/%s/pimento HTTP/1.1\r\n'
+                     'Host: localhost\r\n'
+                     'Connection: close\r\n'
+                     'Etag: %s\r\n'
+                     'Content-Length: %d\r\n'
+                     'X-Storage-Token: t\r\n'
+                     'Content-Type: application/octet-stream\r\n'
+                     '\r\n%s' % (self.ec_policy.name, md5(obj).hexdigest(),
+                                 len(obj), obj))
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 503'  # no quorum
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # replica count - 1 of the fragment archives should have
+        # landed on disk
+        partition, nodes = prosrv.get_object_ring(
+            int(self.ec_policy)).get_nodes('a', self.ec_policy.name, 'pimento')
+        conf = {'devices': _testdir, 'mount_check': 'false'}
+
+        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[self.ec_policy]
+
+        found = 0
+        for node in nodes:
+            df = df_mgr.get_diskfile(node['device'], partition,
+                                     'a', self.ec_policy.name, 'pimento',
+                                     policy=self.ec_policy)
+            try:
+                # diskfile open won't succeed because no durable was written,
+                # so look under the hood for data files.
+                files = os.listdir(df._datadir)
+                if len(files) > 0:
+                    # Although the third fragment archive hasn't landed on
+                    # disk, the directory df._datadir is pre-maturely created
+                    # and is empty when we use O_TMPFILE + linkat()
+                    num_data_files = \
+                        len([f for f in files if f.endswith('.data')])
+                    self.assertEqual(1, num_data_files)
+                    found += 1
+            except OSError:
+                pass
+        self.assertEqual(found, self.ec_policy.ec_ndata)
+
+    def test_PUT_ec_fragment_quorum_archive_etag_mismatch(self):
+        self.put_container("ec", "ec-con")
+
+        def busted_md5_constructor(initial_str=""):
+            hasher = md5(initial_str)
+            hasher.update('wrong')
+            return hasher
+
+        obj = 'uvarovite-esurience-cerated-symphysic'
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+
+        call_count = [0]
+
+        def mock_committer(self):
+            call_count[0] += 1
+
+        commit_confirmation = \
+            'swift.proxy.controllers.obj.MIMEPutter.send_commit_confirmation'
+
+        with mock.patch('swift.obj.server.md5', busted_md5_constructor), \
+                mock.patch(commit_confirmation, mock_committer):
+            fd = sock.makefile()
+            fd.write('PUT /v1/a/ec-con/quorum HTTP/1.1\r\n'
+                     'Host: localhost\r\n'
+                     'Connection: close\r\n'
+                     'Etag: %s\r\n'
+                     'Content-Length: %d\r\n'
+                     'X-Storage-Token: t\r\n'
+                     'Content-Type: application/octet-stream\r\n'
+                     '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 503'  # no quorum
+        self.assertEqual(headers[:len(exp)], exp)
+        # Don't send commit to object-server if quorum responses consist of 4xx
+        self.assertEqual(0, call_count[0])
+
+        # no fragment archives should have landed on disk
+        partition, nodes = prosrv.get_object_ring(3).get_nodes(
+            'a', 'ec-con', 'quorum')
+        conf = {'devices': _testdir, 'mount_check': 'false'}
+
+        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[self.ec_policy]
+
+        for node in nodes:
+            df = df_mgr.get_diskfile(node['device'], partition,
+                                     'a', 'ec-con', 'quorum',
+                                     policy=self.ec_policy)
+            if os.path.exists(df._datadir):
+                self.assertFalse(os.listdir(df._datadir))  # should be empty
+
+    def test_PUT_ec_fragment_quorum_bad_request(self):
+        self.put_container("ec", "ec-con")
+
+        obj = 'uvarovite-esurience-cerated-symphysic'
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+
+        call_count = [0]
+
+        def mock_committer(self):
+            call_count[0] += 1
+
+        read_footer = \
+            'swift.obj.server.ObjectController._read_metadata_footer'
+        commit_confirmation = \
+            'swift.proxy.controllers.obj.MIMEPutter.send_commit_confirmation'
+
+        with mock.patch(read_footer) as read_footer_call, \
+                mock.patch(commit_confirmation, mock_committer):
+            # Emulate missing footer MIME doc in all object-servers
+            read_footer_call.side_effect = HTTPBadRequest(
+                body="couldn't find footer MIME doc")
+
+            fd = sock.makefile()
+            fd.write('PUT /v1/a/ec-con/quorum HTTP/1.1\r\n'
+                     'Host: localhost\r\n'
+                     'Connection: close\r\n'
+                     'Etag: %s\r\n'
+                     'Content-Length: %d\r\n'
+                     'X-Storage-Token: t\r\n'
+                     'Content-Type: application/octet-stream\r\n'
+                     '\r\n%s' % (md5(obj).hexdigest(), len(obj), obj))
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+
+        # Don't show a result of the bad conversation between proxy-server
+        # and object-server
+        exp = 'HTTP/1.1 503'
+        self.assertEqual(headers[:len(exp)], exp)
+        # Don't send commit to object-server if quorum responses consist of 4xx
+        self.assertEqual(0, call_count[0])
+
+        # no fragment archives should have landed on disk
+        partition, nodes = prosrv.get_object_ring(3).get_nodes(
+            'a', 'ec-con', 'quorum')
+        conf = {'devices': _testdir, 'mount_check': 'false'}
+
+        df_mgr = diskfile.DiskFileRouter(conf, FakeLogger())[self.ec_policy]
+
+        for node in nodes:
+            df = df_mgr.get_diskfile(node['device'], partition,
+                                     'a', 'ec-con', 'quorum',
+                                     policy=self.ec_policy)
+            if os.path.exists(df._datadir):
+                self.assertFalse(os.listdir(df._datadir))  # should be empty
+
+    def test_PUT_ec_if_none_match(self):
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        obj = 'ananepionic-lepidophyllous-ropewalker-neglectful'
+        prolis = _test_sockets[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/inm HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Etag: "%s"\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, md5(obj).hexdigest(),
+                             len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/inm HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'If-None-Match: *\r\n'
+                 'Etag: "%s"\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, md5(obj).hexdigest(),
+                             len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 412'
+        self.assertEqual(headers[:len(exp)], exp)
+
+    def test_GET_ec(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        obj = '0123456' * 11 * 17
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'X-Object-Meta-Color: chartreuse\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/%s/go-get-it HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 '\r\n' % self.ec_policy.name)
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        headers = parse_headers_string(headers)
+        self.assertEqual(str(len(obj)), headers['Content-Length'])
+        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+        self.assertEqual('chartreuse', headers['X-Object-Meta-Color'])
+
+        gotten_obj = ''
+        while True:
+            buf = fd.read(64)
+            if not buf:
+                break
+            gotten_obj += buf
+        self.assertEqual(gotten_obj, obj)
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+    def test_conditional_GET_ec(self):
+        # sanity
+        self.assertEqual('erasure_coding', self.ec_policy.policy_type)
+        self._test_conditional_GET(self.ec_policy)
+
+    def test_GET_ec_big(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        # our EC segment size is 4 KiB, so this is multiple (3) segments;
+        # we'll verify that with a sanity check
+        obj = 'a moose once bit my sister' * 400
+        self.assertGreater(
+            len(obj), self.ec_policy.ec_segment_size * 2,
+            "object is too small for proper testing")
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/big-obj-get HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/%s/big-obj-get HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 '\r\n' % self.ec_policy.name)
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        headers = parse_headers_string(headers)
+        self.assertEqual(str(len(obj)), headers['Content-Length'])
+        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+
+        gotten_obj = ''
+        while True:
+            buf = fd.read(64)
+            if not buf:
+                break
+            gotten_obj += buf
+        # This may look like a redundant test, but when things fail, this
+        # has a useful failure message while the subsequent one spews piles
+        # of garbage and demolishes your terminal's scrollback buffer.
+        self.assertEqual(len(gotten_obj), len(obj))
+        self.assertEqual(gotten_obj, obj)
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+    def test_GET_ec_failure_handling(self):
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        obj = 'look at this object; it is simply amazing ' * 500
+        prolis = _test_sockets[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/crash-test-dummy HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        def explodey_iter(inner_iter):
+            yield next(inner_iter)
+            raise Exception("doom ba doom")
+
+        def explodey_doc_parts_iter(inner_iter_iter):
+            try:
+                for item in inner_iter_iter:
+                    item = item.copy()  # paranoia about mutable data
+                    item['part_iter'] = explodey_iter(item['part_iter'])
+                    yield item
+            except GeneratorExit:
+                inner_iter_iter.close()
+                raise
+
+        real_ec_app_iter = swift.proxy.controllers.obj.ECAppIter
+
+        def explodey_ec_app_iter(path, policy, iterators, *a, **kw):
+            # Each thing in `iterators` here is a document-parts iterator,
+            # and we want to fail after getting a little into each part.
+            #
+            # That way, we ensure we've started streaming the response to
+            # the client when things go wrong.
+            return real_ec_app_iter(
+                path, policy,
+                [explodey_doc_parts_iter(i) for i in iterators],
+                *a, **kw)
+
+        with mock.patch("swift.proxy.controllers.obj.ECAppIter",
+                        explodey_ec_app_iter):
+            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+            fd = sock.makefile()
+            fd.write('GET /v1/a/%s/crash-test-dummy HTTP/1.1\r\n'
+                     'Host: localhost\r\n'
+                     'Connection: close\r\n'
+                     'X-Storage-Token: t\r\n'
+                     '\r\n' % self.ec_policy.name)
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+            exp = 'HTTP/1.1 200'
+            self.assertEqual(headers[:len(exp)], exp)
+
+            headers = parse_headers_string(headers)
+            self.assertEqual(str(len(obj)), headers['Content-Length'])
+            self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+
+            gotten_obj = ''
+            try:
+                # don't hang the test run when this fails
+                with Timeout(300):
+                    while True:
+                        buf = fd.read(64)
+                        if not buf:
+                            break
+                        gotten_obj += buf
+            except Timeout:
+                self.fail("GET hung when connection failed")
+
+            # Ensure we failed partway through, otherwise the mocks could
+            # get out of date without anyone noticing
+            self.assertTrue(0 < len(gotten_obj) < len(obj))
+
+    def test_HEAD_ec(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        obj = '0123456' * 11 * 17
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/%s/go-head-it HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'X-Object-Meta-Color: chartreuse\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('HEAD /v1/a/%s/go-head-it HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 '\r\n' % self.ec_policy.name)
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        headers = parse_headers_string(headers)
+        self.assertEqual(str(len(obj)), headers['Content-Length'])
+        self.assertEqual(md5(obj).hexdigest(), headers['Etag'])
+        self.assertEqual('chartreuse', headers['X-Object-Meta-Color'])
+
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+    def test_GET_ec_404(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/%s/yes-we-have-no-bananas HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 '\r\n' % self.ec_policy.name)
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 404'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+    def test_HEAD_ec_404(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+
+        self.put_container(self.ec_policy.name, self.ec_policy.name)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('HEAD /v1/a/%s/yes-we-have-no-bananas HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 '\r\n' % self.ec_policy.name)
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 404'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        error_lines = prosrv.logger.get_lines_for_level('error')
+        warn_lines = prosrv.logger.get_lines_for_level('warning')
+        self.assertEqual(len(error_lines), 0)  # sanity
+        self.assertEqual(len(warn_lines), 0)  # sanity
+
+    def test_reload_ring_ec(self):
+        self.put_container("ec", "ec-con")
+
+        orig_rtime = self.ec_policy.object_ring._rtime
+        orig_replica_count = self.ec_policy.object_ring.replica_count
+        # save original file as back up
+        copyfile(self.ec_policy.object_ring.serialized_path,
+                 self.ec_policy.object_ring.serialized_path + '.bak')
+
+        try:
+            # overwrite with 2 replica, 2 devices ring
+            obj_devs = []
+            obj_devs.append(
+                {'port': _test_sockets[-3].getsockname()[1],
+                 'device': 'sdg1'})
+            obj_devs.append(
+                {'port': _test_sockets[-2].getsockname()[1],
+                 'device': 'sdh1'})
+            write_fake_ring(self.ec_policy.object_ring.serialized_path,
+                            *obj_devs)
+
+            def get_ring_reloaded_response(method):
+                # force to reload at the request
+                self.ec_policy.object_ring._rtime = 0
+
+                trans_data = ['%s /v1/a/ec-con/o2 HTTP/1.1\r\n' % method,
+                              'Host: localhost\r\n',
+                              'Connection: close\r\n',
+                              'X-Storage-Token: t\r\n']
+
+                if method == 'PUT':
+                    # small, so we don't get multiple EC stripes
+                    obj = 'abCD' * 10
+
+                    extra_trans_data = [
+                        'Etag: "%s"\r\n' % md5(obj).hexdigest(),
+                        'Content-Length: %d\r\n' % len(obj),
+                        'Content-Type: application/octet-stream\r\n',
+                        '\r\n%s' % obj
+                    ]
+                    trans_data.extend(extra_trans_data)
+                else:
+                    trans_data.append('\r\n')
+
+                prolis = _test_sockets[0]
+                sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+                fd = sock.makefile()
+                fd.write(''.join(trans_data))
+                fd.flush()
+                headers = readuntil2crlfs(fd)
+
+                # use older ring with rollbacking
+                return headers
+
+            for method in ('PUT', 'HEAD', 'GET', 'POST', 'DELETE'):
+                headers = get_ring_reloaded_response(method)
+                exp = 'HTTP/1.1 20'
+                self.assertEqual(headers[:len(exp)], exp)
+
+                # proxy didn't load newest ring, use older one
+                self.assertEqual(orig_replica_count,
+                                 self.ec_policy.object_ring.replica_count)
+
+                if method == 'POST':
+                    headers = get_ring_reloaded_response(method)
+
+                    exp = 'HTTP/1.1 20'
+                    self.assertEqual(headers[:len(exp)], exp)
+                    # sanity
+                    self.assertEqual(orig_replica_count,
+                                     self.ec_policy.object_ring.replica_count)
+
+        finally:
+            self.ec_policy.object_ring._rtime = orig_rtime
+            os.rename(self.ec_policy.object_ring.serialized_path + '.bak',
+                      self.ec_policy.object_ring.serialized_path)
+
+    def test_ec_client_disconnect(self):
+        prolis = _test_sockets[0]
+
+        # create connection
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+
+        # create container
+        fd.write('PUT /v1/a/%s-discon HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Content-Length: 0\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'X-Storage-Policy: %s\r\n'
+                 '\r\n' % (self.ec_policy.name, self.ec_policy.name))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 2'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # create object
+        obj = 'a' * 4 * 64 * 2 ** 10
+        fd.write('PUT /v1/a/%s-discon/test HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: donuts\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        class WrappedTimeout(ChunkWriteTimeout):
+            def __enter__(self):
+                timeouts[self] = traceback.extract_stack()
+                return super(WrappedTimeout, self).__enter__()
+
+            def __exit__(self, typ, value, tb):
+                timeouts[self] = None
+                return super(WrappedTimeout, self).__exit__(typ, value, tb)
+
+        timeouts = {}
+        with mock.patch('swift.proxy.controllers.base.ChunkWriteTimeout',
+                        WrappedTimeout):
+            with mock.patch.object(_test_servers[0], 'client_timeout', new=5):
+                # get object
+                fd.write('GET /v1/a/%s-discon/test HTTP/1.1\r\n'
+                         'Host: localhost\r\n'
+                         'Connection: close\r\n'
+                         'X-Storage-Token: t\r\n'
+                         '\r\n' % self.ec_policy.name)
+                fd.flush()
+                headers = readuntil2crlfs(fd)
+                exp = 'HTTP/1.1 200'
+                self.assertEqual(headers[:len(exp)], exp)
+
+                # read most of the object, and disconnect
+                fd.read(10)
+                sock.fd._sock.close()
+                self._sleep_enough(
+                    lambda:
+                    _test_servers[0].logger.get_lines_for_level('warning'))
+
+        # check for disconnect message!
+        expected = ['Client disconnected on read'] * 2
+        self.assertEqual(
+            _test_servers[0].logger.get_lines_for_level('warning'),
+            expected)
+        # check that no coro was left waiting to write
+        self.assertTrue(timeouts)  # sanity - WrappedTimeout did get called
+        missing_exits = [tb for tb in timeouts.values() if tb is not None]
+        self.assertFalse(
+            missing_exits, 'Failed to exit all ChunkWriteTimeouts.\n' +
+            ''.join(['No exit from ChunkWriteTimeout entered at:\n' +
+                     ''.join(traceback.format_list(tb)[:-1])
+                     for tb in missing_exits]))
+        # and check that the ChunkWriteTimeouts did not raise Exceptions
+        self.assertFalse(_test_servers[0].logger.get_lines_for_level('error'))
+
+    def test_ec_client_put_disconnect(self):
+        prolis = _test_sockets[0]
+
+        # create connection
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+
+        # create container
+        fd.write('PUT /v1/a/%s-discon HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Content-Length: 0\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'X-Storage-Policy: %s\r\n'
+                 '\r\n' % (self.ec_policy.name, self.ec_policy.name))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 2'
+        self.assertEqual(headers[:len(exp)], exp)
+
+        # create object
+        obj = 'a' * 4 * 64 * 2 ** 10
+        fd.write('PUT /v1/a/%s-discon/test HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Content-Length: %d\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: donuts\r\n'
+                 '\r\n%s' % (self.ec_policy.name, len(obj), obj[:-10]))
+        fd.flush()
+        fd.close()
+        sock.close()
+        # sleep to trampoline enough
+        condition = \
+            lambda: _test_servers[0].logger.get_lines_for_level('warning')
+        self._sleep_enough(condition)
+        expected = ['Client disconnected without sending enough data']
+        warns = _test_servers[0].logger.get_lines_for_level('warning')
+        self.assertEqual(expected, warns)
+        errors = _test_servers[0].logger.get_lines_for_level('error')
+        self.assertEqual([], errors)
+
+
+class TestECObjectController(BaseTestECObjectController, unittest.TestCase):
+    def setUp(self):
+        skip_if_no_xattrs()
+        self.ec_policy = POLICIES[3]
+        super(TestECObjectController, self).setUp()
+
+
+class TestECDuplicationObjectController(
+        BaseTestECObjectController, unittest.TestCase):
+    def setUp(self):
+        skip_if_no_xattrs()
+        self.ec_policy = POLICIES[4]
+        super(TestECDuplicationObjectController, self).setUp()
+
+
 class TestECMismatchedFA(unittest.TestCase):
+    def setUp(self):
+        skip_if_no_xattrs()
+
     def tearDown(self):
         prosrv = _test_servers[0]
         # don't leak error limits and poison other tests
@@ -5528,7 +6634,8 @@ class TestECMismatchedFA(unittest.TestCase):
 
     def test_mixing_different_objects_fragment_archives(self):
         (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv,
-         obj2srv, obj3srv) = _test_servers
+         obj2srv, obj3srv, obj4srv, obj5srv, obj6srv) = _test_servers
+
         ec_policy = POLICIES[3]
 
         @public
@@ -5607,12 +6714,114 @@ class TestECMismatchedFA(unittest.TestCase):
             resp = get_req.get_response(prosrv)
         self.assertEqual(resp.status_int, 503)
 
+    def test_mixing_different_objects_fragment_archives_with_dup_factor(self):
+        (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv,
+         obj2srv, obj3srv, obj4srv, obj5srv, obj6srv) = _test_servers
+
+        ec_policy = POLICIES[4]
+
+        @public
+        def bad_disk(req):
+            return Response(status=507, body="borken")
+
+        ensure_container = Request.blank(
+            "/v1/a/ec-dup-crazytown",
+            environ={"REQUEST_METHOD": "PUT"},
+            headers={"X-Storage-Policy": "ec-dup", "X-Auth-Token": "t"})
+        resp = ensure_container.get_response(prosrv)
+        self.assertIn(resp.status_int, (201, 202))
+
+        obj1 = "first version..."
+        put_req1 = Request.blank(
+            "/v1/a/ec-dup-crazytown/obj",
+            environ={"REQUEST_METHOD": "PUT"},
+            headers={"X-Auth-Token": "t"})
+        put_req1.body = obj1
+
+        obj2 = u"versión segundo".encode("utf-8")
+        put_req2 = Request.blank(
+            "/v1/a/ec-dup-crazytown/obj",
+            environ={"REQUEST_METHOD": "PUT"},
+            headers={"X-Auth-Token": "t"})
+        put_req2.body = obj2
+
+        # pyeclib has checks for unequal-length; we don't want to trip those
+        self.assertEqual(len(obj1), len(obj2))
+
+        # First subset of object server will have the first version of the
+        # object
+        prosrv._error_limiting = {}
+        with mock.patch.object(obj4srv, 'PUT', bad_disk), \
+                mock.patch.object(obj5srv, 'PUT', bad_disk), \
+                mock.patch.object(obj6srv, 'PUT', bad_disk), \
+                mock.patch(
+                    'swift.common.storage_policy.ECStoragePolicy.quorum'):
+            type(ec_policy).quorum = mock.PropertyMock(return_value=3)
+            resp = put_req1.get_response(prosrv)
+        self.assertEqual(resp.status_int, 201)
+
+        # Second subset will have the second version of the object.
+        prosrv._error_limiting = {}
+        with mock.patch.object(obj1srv, 'PUT', bad_disk), \
+                mock.patch.object(obj2srv, 'PUT', bad_disk), \
+                mock.patch.object(obj3srv, 'PUT', bad_disk), \
+                mock.patch(
+                    'swift.common.storage_policy.ECStoragePolicy.quorum'):
+            type(ec_policy).quorum = mock.PropertyMock(return_value=3)
+            resp = put_req2.get_response(prosrv)
+        self.assertEqual(resp.status_int, 201)
+
+        # A GET that only sees 1 fragment archive should fail
+        get_req = Request.blank("/v1/a/ec-dup-crazytown/obj",
+                                environ={"REQUEST_METHOD": "GET"},
+                                headers={"X-Auth-Token": "t"})
+        prosrv._error_limiting = {}
+        with mock.patch.object(obj2srv, 'GET', bad_disk), \
+                mock.patch.object(obj3srv, 'GET', bad_disk), \
+                mock.patch.object(obj4srv, 'GET', bad_disk), \
+                mock.patch.object(obj5srv, 'GET', bad_disk), \
+                mock.patch.object(obj6srv, 'GET', bad_disk):
+            resp = get_req.get_response(prosrv)
+        self.assertEqual(resp.status_int, 503)
+
+        # A GET that sees 2 matching FAs will work
+        get_req = Request.blank("/v1/a/ec-dup-crazytown/obj",
+                                environ={"REQUEST_METHOD": "GET"},
+                                headers={"X-Auth-Token": "t"})
+        prosrv._error_limiting = {}
+        with mock.patch.object(obj1srv, 'GET', bad_disk), \
+                mock.patch.object(obj2srv, 'GET', bad_disk), \
+                mock.patch.object(obj3srv, 'GET', bad_disk), \
+                mock.patch.object(obj6srv, 'GET', bad_disk):
+            resp = get_req.get_response(prosrv)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body, obj2)
+
+        # A GET that sees 2 mismatching FAs will fail
+        get_req = Request.blank("/v1/a/ec-dup-crazytown/obj",
+                                environ={"REQUEST_METHOD": "GET"},
+                                headers={"X-Auth-Token": "t"})
+        prosrv._error_limiting = {}
+        with mock.patch.object(obj2srv, 'GET', bad_disk), \
+                mock.patch.object(obj3srv, 'GET', bad_disk), \
+                mock.patch.object(obj4srv, 'GET', bad_disk), \
+                mock.patch.object(obj6srv, 'GET', bad_disk):
+            resp = get_req.get_response(prosrv)
+        self.assertEqual(resp.status_int, 503)
+
 
 class TestECGets(unittest.TestCase):
+    def setUp(self):
+        super(TestECGets, self).setUp()
+        skip_if_no_xattrs()
+        self.tempdir = mkdtemp()
+
     def tearDown(self):
+        rmtree(self.tempdir, ignore_errors=True)
         prosrv = _test_servers[0]
         # don't leak error limits and poison other tests
         prosrv._error_limiting = {}
+        super(TestECGets, self).tearDown()
 
     def _setup_nodes_and_do_GET(self, objs, node_state):
         """
@@ -5630,7 +6839,7 @@ class TestECGets(unittest.TestCase):
                            hash_dir should be marked as durable or not.
         """
         (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv,
-         obj2srv, obj3srv) = _test_servers
+         obj2srv, obj3srv, _obj4srv, _obj5srv, _obj6srv) = _test_servers
         ec_policy = POLICIES[3]
         container_name = uuid.uuid4().hex
         obj_name = uuid.uuid4().hex
@@ -5672,7 +6881,7 @@ class TestECGets(unittest.TestCase):
 
             # move all hash dir files to per-node, per-obj tempdir
             for node_index, hash_dir in node_hash_dirs.items():
-                node_tmp_dirs[node_index][ref] = mkdtemp()
+                node_tmp_dirs[node_index][ref] = mkdtemp(dir=self.tempdir)
                 for f in os.listdir(hash_dir):
                     move(os.path.join(hash_dir, f),
                          os.path.join(node_tmp_dirs[node_index][ref], f))
@@ -5876,6 +7085,7 @@ class TestObjectDisconnectCleanup(unittest.TestCase):
                 mkdirs(data_path)
 
     def setUp(self):
+        skip_if_no_xattrs()
         debug.hub_exceptions(False)
         self._cleanup_devices()
 
@@ -5984,9 +7194,11 @@ class TestObjectECRangedGET(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        skip_if_no_xattrs()
         cls.obj_name = 'range-get-test'
         cls.tiny_obj_name = 'range-get-test-tiny'
         cls.aligned_obj_name = 'range-get-test-aligned'
+        cls.zero_byte_obj_name = 'range-get-test-zero-byte'
 
         # Note: only works if called with unpatched policies
         prolis = _test_sockets[0]
@@ -6022,7 +7234,8 @@ class TestObjectECRangedGET(unittest.TestCase):
 
         for obj_name, obj in ((cls.obj_name, cls.obj),
                               (cls.tiny_obj_name, cls.tiny_obj),
-                              (cls.aligned_obj_name, cls.aligned_obj)):
+                              (cls.aligned_obj_name, cls.aligned_obj),
+                              (cls.zero_byte_obj_name, b"")):
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
             fd.write('PUT /v1/a/ec-con/%s HTTP/1.1\r\n'
@@ -6180,6 +7393,48 @@ class TestObjectECRangedGET(unittest.TestCase):
         self.assertIn('Content-Range', headers)
         self.assertEqual('bytes */%d' % obj_len, headers['Content-Range'])
 
+    def test_unsatisfiable_socket_leak(self):
+        unclosed_http_responses = {}
+        tracked_responses = [0]
+
+        class LeakTrackingHTTPResponse(BufferedHTTPResponse):
+            def begin(self):
+                # no super(); we inherit from an old-style class (it's
+                # httplib's fault; don't try and fix it).
+                retval = BufferedHTTPResponse.begin(self)
+                if self.status != 204:
+                    # This mock is overly broad and catches account and
+                    # container HEAD requests too. We don't care about
+                    # those; it's the object GETs that were leaky.
+                    #
+                    # Unfortunately, we don't have access to the request
+                    # path here, so we use "status == 204" as a crude proxy
+                    # for "not an object response".
+                    unclosed_http_responses[id(self)] = self
+                    tracked_responses[0] += 1
+                return retval
+
+            def close(self, *args, **kwargs):
+                rv = BufferedHTTPResponse.close(self, *args, **kwargs)
+                unclosed_http_responses.pop(id(self), None)
+                return rv
+
+            def __repr__(self):
+                swift_conn = getattr(self, 'swift_conn', None)
+                method = getattr(swift_conn, '_method', '<unknown>')
+                path = getattr(swift_conn, '_path', '<unknown>')
+                return '%s<method=%r path=%r>' % (
+                    self.__class__.__name__, method, path)
+
+        obj_len = len(self.obj)
+        with mock.patch('swift.common.bufferedhttp.BufferedHTTPConnection'
+                        '.response_class', LeakTrackingHTTPResponse):
+            status, headers, _junk = self._get_obj(
+                "bytes=%d-%d" % (obj_len, obj_len + 100))
+        self.assertEqual(status, 416)  # sanity check
+        self.assertGreater(tracked_responses[0], 0)  # ensure tracking happened
+        self.assertEqual(unclosed_http_responses, {})
+
     def test_off_end(self):
         # Ranged GET that's mostly off the end of the object, but overlaps
         # it in just the last byte
@@ -6244,6 +7499,13 @@ class TestObjectECRangedGET(unittest.TestCase):
         self.assertEqual(headers['Content-Length'], '100')
         self.assertEqual(headers['Content-Range'], 'bytes 8092-8191/8192')
         self.assertEqual(len(gotten_obj), 100)
+
+    def test_suffix_zero_byte_object(self):
+        status, headers, gotten_obj = self._get_obj("bytes=-100",
+                                                    self.zero_byte_obj_name)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(gotten_obj), 0)
+        self.assertEqual(gotten_obj, b"")
 
     def test_suffix_two_segs(self):
         # Ask for enough data that we need the last two segments. The last
@@ -6563,10 +7825,9 @@ class TestContainerController(unittest.TestCase):
     def assert_status_map(self, method, statuses, expected,
                           raise_exc=False, missing_container=False):
         with save_globals():
-            kwargs = {}
+            kwargs = {'missing_container': missing_container}
             if raise_exc:
                 kwargs['raise_exc'] = raise_exc
-            kwargs['missing_container'] = missing_container
             set_http_connect(*statuses, **kwargs)
             self.app.memcache.store = {}
             req = Request.blank('/v1/a/c', headers={'Content-Length': '0',
@@ -6660,10 +7921,9 @@ class TestContainerController(unittest.TestCase):
             # return 404 (as account is not found) and don't cache container
             test_status_map((404, 404, 404), 404, None, 404)
 
-            # cache a 204 for the account because it's sort of like it
-            # exists
+            # cache a 200 for the account because it appears to be created
             self.app.account_autocreate = True
-            test_status_map((404, 404, 404), 404, None, 204)
+            test_status_map((404, 404, 404), 404, None, 200)
 
     def test_PUT_policy_headers(self):
         backend_requests = []
@@ -6746,7 +8006,7 @@ class TestContainerController(unittest.TestCase):
             # fail to retrieve account info
             test_status_map(
                 (503, 503, 503),  # account_info fails on 503
-                404, missing_container=True)
+                500, missing_container=True)
             # account fail after creation
             test_status_map(
                 (404, 404, 404,   # account_info fails on 404
@@ -6757,7 +8017,7 @@ class TestContainerController(unittest.TestCase):
                 (503, 503, 404,   # account_info fails on 404
                  503, 503, 503,   # PUT account
                  503, 503, 404),  # account_info fail
-                404, missing_container=True)
+                500, missing_container=True)
             # put fails
             test_status_map(
                 (404, 404, 404,   # account_info fails on 404
@@ -6875,17 +8135,36 @@ class TestContainerController(unittest.TestCase):
                                    missing_container=True)
 
     def test_PUT_max_container_name_length(self):
-        with save_globals():
-            limit = constraints.MAX_CONTAINER_NAME_LENGTH
-            controller = proxy_server.ContainerController(self.app, 'account',
-                                                          '1' * limit)
-            self.assert_status_map(controller.PUT,
-                                   (200, 201, 201, 201), 201,
-                                   missing_container=True)
-            controller = proxy_server.ContainerController(self.app, 'account',
-                                                          '2' * (limit + 1))
-            self.assert_status_map(controller.PUT, (201, 201, 201), 400,
-                                   missing_container=True)
+        limit = constraints.MAX_CONTAINER_NAME_LENGTH
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '1' * limit)
+        self.assert_status_map(controller.PUT, (200, 201, 201, 201), 201,
+                               missing_container=True)
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '2' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400,
+                               missing_container=True)
+
+        # internal auto-created-accounts get higher limits
+        limit *= 2
+        controller = proxy_server.ContainerController(self.app, '.account',
+                                                      '3' * limit)
+        self.assert_status_map(controller.PUT, (200, 201, 201, 201), 201,
+                               missing_container=True)
+        controller = proxy_server.ContainerController(self.app, '.account',
+                                                      '4' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400,
+                               missing_container=True)
+
+        self.app.auto_create_account_prefix = 'acc'
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '1' * limit)
+        self.assert_status_map(controller.PUT, (200, 201, 201, 201), 201,
+                               missing_container=True)
+        controller = proxy_server.ContainerController(self.app, 'account',
+                                                      '2' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400,
+                               missing_container=True)
 
     def test_PUT_connect_exceptions(self):
         with save_globals():
@@ -6981,7 +8260,7 @@ class TestContainerController(unittest.TestCase):
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             container_ring = controller.app.container_ring
-            controller.app.sort_nodes = lambda l: l
+            controller.app.sort_nodes = lambda l, *args, **kwargs: l
             self.assert_status_map(controller.HEAD, (200, 503, 200, 200), 200,
                                    missing_container=False)
 
@@ -7259,6 +8538,29 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(res.content_length, 0)
             self.assertNotIn('transfer-encoding', res.headers)
 
+    def test_GET_account_non_existent(self):
+        with save_globals():
+            set_http_connect(404, 404, 404)
+            controller = proxy_server.ContainerController(self.app, 'a', 'c')
+            req = Request.blank('/v1/a/c')
+            self.app.update_request(req)
+            res = controller.GET(req)
+            self.assertEqual(res.status_int, 404)
+            self.assertNotIn('container/a/c', res.environ['swift.infocache'])
+
+    def test_GET_auto_create_prefix_account_non_existent(self):
+        with save_globals():
+            set_http_connect(404, 404, 404, 204, 204, 204)
+            controller = proxy_server.ContainerController(self.app, '.a', 'c')
+            req = Request.blank('/v1/a/c')
+            self.app.update_request(req)
+            res = controller.GET(req)
+            self.assertEqual(res.status_int, 204)
+            ic = res.environ['swift.infocache']
+            self.assertEqual(ic['container/.a/c']['status'], 204)
+            self.assertEqual(res.content_length, 0)
+            self.assertNotIn('transfer-encoding', res.headers)
+
     def test_GET_calls_authorize(self):
         called = [False]
 
@@ -7485,11 +8787,13 @@ class TestContainerController(unittest.TestCase):
                 '/v1/a/c/o.jpg',
                 {'REQUEST_METHOD': 'OPTIONS'},
                 headers={'Origin': 'https://bar.baz',
+                         'Access-Control-Request-Headers': ' , ,,',
                          'Access-Control-Request-Method': 'GET'})
             req.content_length = 0
             resp = controller.OPTIONS(req)
             self.assertEqual(200, resp.status_int)
             self.assertEqual('*', resp.headers['access-control-allow-origin'])
+            self.assertNotIn('access-control-allow-headers', resp.headers)
             for verb in 'OPTIONS GET POST PUT DELETE HEAD'.split():
                 self.assertIn(verb,
                               resp.headers['access-control-allow-methods'])
@@ -7503,7 +8807,7 @@ class TestContainerController(unittest.TestCase):
                 {'REQUEST_METHOD': 'OPTIONS'},
                 headers={'Origin': 'https://bar.baz',
                          'Access-Control-Request-Headers':
-                         'x-foo, x-bar, x-auth-token',
+                         'x-foo, x-bar, , x-auth-token',
                          'Access-Control-Request-Method': 'GET'}
             )
             req.content_length = 0
@@ -7512,6 +8816,8 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(
                 sortHeaderNames('x-foo, x-bar, x-auth-token'),
                 sortHeaderNames(resp.headers['access-control-allow-headers']))
+            self.assertEqual('Access-Control-Request-Headers',
+                             resp.headers.get('vary'))
 
     def test_CORS_valid(self):
         with save_globals():
@@ -7727,7 +9033,8 @@ class TestContainerController(unittest.TestCase):
 class TestAccountController(unittest.TestCase):
 
     def setUp(self):
-        self.app = proxy_server.Application(None, FakeMemcache(),
+        conf = {'error_suppression_interval': 0}
+        self.app = proxy_server.Application(conf, FakeMemcache(),
                                             account_ring=FakeRing(),
                                             container_ring=FakeRing())
 
@@ -7828,14 +9135,38 @@ class TestAccountController(unittest.TestCase):
             # ALL nodes are asked to create the account
             # If successful, the GET request is repeated.
             controller.app.account_autocreate = True
-            self.assert_status_map(controller.GET,
-                                   (404, 404, 404), 204)
-            self.assert_status_map(controller.GET,
-                                   (404, 503, 404), 204)
-
+            expected = 200
+            self.assert_status_map(controller.GET, (404, 404, 404), expected)
+            self.assert_status_map(controller.GET, (404, 503, 404), expected)
             # We always return 503 if no majority between 4xx, 3xx or 2xx found
             self.assert_status_map(controller.GET,
                                    (500, 500, 400), 503)
+
+    def _check_autocreate_listing_with_query_string(self, query_string):
+        controller = proxy_server.AccountController(self.app, 'a')
+        controller.app.account_autocreate = True
+        statuses = (404, 404, 404)
+        expected = 200
+        # get the response to check it has json content
+        with save_globals():
+            set_http_connect(*statuses)
+            req = Request.blank('/v1/a' + query_string)
+            self.app.update_request(req)
+            res = controller.GET(req)
+            headers = res.headers
+            self.assertEqual(
+                'yes', headers.get('X-Backend-Fake-Account-Listing'))
+            self.assertEqual(
+                'application/json; charset=utf-8',
+                headers.get('Content-Type'))
+            self.assertEqual([], json.loads(res.body))
+            self.assertEqual(res.status_int, expected)
+
+    def test_auto_create_account_listing_response_is_json(self):
+        self._check_autocreate_listing_with_query_string('')
+        self._check_autocreate_listing_with_query_string('?format=plain')
+        self._check_autocreate_listing_with_query_string('?format=json')
+        self._check_autocreate_listing_with_query_string('?format=xml')
 
     def test_HEAD(self):
         # Same behaviour as GET
@@ -7865,9 +9196,9 @@ class TestAccountController(unittest.TestCase):
                                    (404, 404, 404), 404)
             controller.app.account_autocreate = True
             self.assert_status_map(controller.HEAD,
-                                   (404, 404, 404), 204)
+                                   (404, 404, 404), 200)
             self.assert_status_map(controller.HEAD,
-                                   (500, 404, 404), 204)
+                                   (500, 404, 404), 200)
             # We always return 503 if no majority between 4xx, 3xx or 2xx found
             self.assert_status_map(controller.HEAD,
                                    (500, 500, 400), 503)
@@ -7985,14 +9316,39 @@ class TestAccountController(unittest.TestCase):
             test_status_map((204, 500, 404), 503)
 
     def test_PUT_max_account_name_length(self):
-        with save_globals():
-            self.app.allow_account_management = True
-            limit = constraints.MAX_ACCOUNT_NAME_LENGTH
-            controller = proxy_server.AccountController(self.app, '1' * limit)
-            self.assert_status_map(controller.PUT, (201, 201, 201), 201)
-            controller = proxy_server.AccountController(
-                self.app, '2' * (limit + 1))
-            self.assert_status_map(controller.PUT, (201, 201, 201), 400)
+        self.app.allow_account_management = True
+        limit = constraints.MAX_ACCOUNT_NAME_LENGTH
+        controller = proxy_server.AccountController(self.app, '1' * limit)
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, '2' * (limit + 1))
+        self.assert_status_map(controller.PUT, (), 400)
+
+        # internal auto-created accounts get higher limits
+        limit *= 2
+        controller = proxy_server.AccountController(
+            self.app, '.' + '3' * (limit - 1))
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, '.' + '4' * limit)
+        self.assert_status_map(controller.PUT, (), 400)
+
+        self.app.auto_create_account_prefix = 'FOO_'
+        limit /= 2
+        controller = proxy_server.AccountController(
+            self.app, '.' + '5' * (limit - 1))
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, '.' + '6' * limit)
+        self.assert_status_map(controller.PUT, (), 400)
+
+        limit *= 2
+        controller = proxy_server.AccountController(
+            self.app, 'FOO_' + '7' * (limit - 4))
+        self.assert_status_map(controller.PUT, (201, 201, 201), 201)
+        controller = proxy_server.AccountController(
+            self.app, 'FOO_' + '8' * (limit - 3))
+        self.assert_status_map(controller.PUT, (), 400)
 
     def test_PUT_connect_exceptions(self):
         with save_globals():
@@ -8195,10 +9551,11 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
     """
     def setUp(self):
         conf = {'account_autocreate': 'yes'}
-        self.app = proxy_server.Application(conf, FakeMemcache(),
-                                            account_ring=FakeRing(),
-                                            container_ring=FakeRing())
-        self.app.memcache = FakeMemcacheReturnsNone()
+        self.app = listing_formats.ListingFilter(
+            proxy_server.Application(conf, FakeMemcache(),
+                                     account_ring=FakeRing(),
+                                     container_ring=FakeRing()))
+        self.app.app.memcache = FakeMemcacheReturnsNone()
 
     def test_GET_autocreate_accept_json(self):
         with save_globals():
@@ -8265,6 +9622,24 @@ class TestAccountControllerFakeGetResponse(unittest.TestCase):
                                          'PATH_INFO': '/v1/a'})
             resp = req.get_response(self.app)
             self.assertEqual(406, resp.status_int)
+
+    def test_GET_autocreate_bad_accept(self):
+        with save_globals():
+            set_http_connect(*([404] * 100))  # nonexistent: all backends 404
+            req = Request.blank('/v1/a', headers={"Accept": "a/b;q=nope"},
+                                environ={'REQUEST_METHOD': 'GET',
+                                         'PATH_INFO': '/v1/a'})
+            resp = req.get_response(self.app)
+            self.assertEqual(400, resp.status_int)
+            self.assertEqual('Invalid Accept header', resp.body)
+
+            set_http_connect(*([404] * 100))  # nonexistent: all backends 404
+            req = Request.blank('/v1/a', headers={"Accept": "a/b;q=0.5;q=1"},
+                                environ={'REQUEST_METHOD': 'GET',
+                                         'PATH_INFO': '/v1/a'})
+            resp = req.get_response(self.app)
+            self.assertEqual(400, resp.status_int)
+            self.assertEqual('Invalid Accept header', resp.body)
 
     def test_GET_autocreate_format_invalid_utf8(self):
         with save_globals():
@@ -8465,6 +9840,7 @@ class TestProxyObjectPerformance(unittest.TestCase):
         # This is just a simple test that can be used to verify and debug the
         # various data paths between the proxy server and the object
         # server. Used as a play ground to debug buffer sizes for sockets.
+        skip_if_no_xattrs()
         prolis = _test_sockets[0]
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         # Client is transmitting in 2 MB chunks
@@ -8578,7 +9954,8 @@ class TestSocketObjectVersions(unittest.TestCase):
 
     def setUp(self):
         global _test_sockets
-        self.prolis = prolis = listen(('localhost', 0))
+        skip_if_no_xattrs()
+        self.prolis = prolis = listen_zero()
         self._orig_prolis = _test_sockets[0]
         allowed_headers = ', '.join([
             'content-encoding',
@@ -8588,12 +9965,15 @@ class TestSocketObjectVersions(unittest.TestCase):
         ])
         conf = {'devices': _testdir, 'swift_dir': _testdir,
                 'mount_check': 'false', 'allowed_headers': allowed_headers}
-        prosrv = versioned_writes.VersionedWritesMiddleware(
+        prosrv = listing_formats.ListingFilter(
             copy.ServerSideCopyMiddleware(
-                proxy_logging.ProxyLoggingMiddleware(
-                    _test_servers[0], conf,
-                    logger=_test_servers[0].logger), conf),
-            {})
+                versioned_writes.VersionedWritesMiddleware(
+                    proxy_logging.ProxyLoggingMiddleware(
+                        _test_servers[0], conf,
+                        logger=_test_servers[0].logger), {}),
+                {}
+            )
+        )
         self.coro = spawn(wsgi.server, prolis, prosrv, NullLogger())
         # replace global prosrv with one that's filtered with version
         # middleware
@@ -8612,7 +9992,7 @@ class TestSocketObjectVersions(unittest.TestCase):
         versions_to_create = 3
         # Create a container for our versioned object testing
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
-         obj2lis, obj3lis) = _test_sockets
+         obj2lis, obj3lis, obj4lis, obj5lis, obj6lis) = _test_sockets
         pre = quote('%03x' % len(o))
         osub = '%s/sub' % o
         presub = quote('%03x' % len(osub))
@@ -8863,8 +10243,8 @@ class TestSocketObjectVersions(unittest.TestCase):
         exp = 'HTTP/1.1 404'
         self.assertEqual(headers[:len(exp)], exp)
 
-        # make sure manifest files will be ignored
-        for _junk in range(1, versions_to_create):
+        # make sure manifest files are also versioned
+        for _junk in range(0, versions_to_create):
             sleep(.01)  # guarantee that the timestamp changes
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
@@ -8886,8 +10266,11 @@ class TestSocketObjectVersions(unittest.TestCase):
                  % (vc, pre, o))
         fd.flush()
         headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 204 No Content'
+        exp = 'HTTP/1.1 200 OK'
         self.assertEqual(headers[:len(exp)], exp)
+        body = fd.read()
+        versions = [x for x in body.split('\n') if x]
+        self.assertEqual(versions_to_create - 1, len(versions))
 
         # DELETE v1/a/c/obj shouldn't delete v1/a/c/obj/sub versions
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
@@ -9035,8 +10418,4 @@ class TestSocketObjectVersions(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    setup()
-    try:
-        unittest.main()
-    finally:
-        teardown()
+    unittest.main()

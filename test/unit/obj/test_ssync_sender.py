@@ -24,9 +24,11 @@ from swift.common import exceptions, utils
 from swift.common.storage_policy import POLICIES
 from swift.common.utils import Timestamp
 from swift.obj import ssync_sender, diskfile, ssync_receiver
+from swift.obj.replicator import ObjectReplicator
 
-from test.unit import patch_policies, make_timestamp_iter
-from test.unit.obj.common import FakeReplicator, BaseTest
+from test.unit.obj.common import BaseTest
+from test.unit import patch_policies, make_timestamp_iter, skip_if_no_xattrs, \
+    debug_logger
 
 
 class NullBufferedHTTPConnection(object):
@@ -50,7 +52,7 @@ class NullBufferedHTTPConnection(object):
         pass
 
 
-class FakeResponse(object):
+class FakeResponse(ssync_sender.SsyncBufferedHTTPResponse):
 
     def __init__(self, chunk_body=''):
         self.status = 200
@@ -58,6 +60,8 @@ class FakeResponse(object):
         if chunk_body:
             self.fp = six.StringIO(
                 '%x\r\n%s\r\n0\r\n\r\n' % (len(chunk_body), chunk_body))
+        self.ssync_response_buffer = ''
+        self.ssync_response_chunk_left = 0
 
     def read(self, *args, **kwargs):
         return ''
@@ -83,11 +87,13 @@ class FakeConnection(object):
 class TestSender(BaseTest):
 
     def setUp(self):
+        skip_if_no_xattrs()
         super(TestSender, self).setUp()
-        self.testdir = os.path.join(self.tmpdir, 'tmp_test_ssync_sender')
-        utils.mkdirs(os.path.join(self.testdir, 'dev'))
-        self.daemon = FakeReplicator(self.testdir)
-        self.sender = ssync_sender.Sender(self.daemon, None, None, None)
+        self.daemon_logger = debug_logger('test-ssync-sender')
+        self.daemon = ObjectReplicator(self.daemon_conf,
+                                       self.daemon_logger)
+        job = {'policy': POLICIES.legacy}  # sufficient for Sender.__init__
+        self.sender = ssync_sender.Sender(self.daemon, None, job, None)
 
     def test_call_catches_MessageTimeout(self):
 
@@ -106,7 +112,7 @@ class TestSender(BaseTest):
             success, candidates = self.sender()
             self.assertFalse(success)
             self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         self.assertEqual(1, len(error_lines))
         self.assertEqual('1.2.3.4:5678/sda1/9 1 second: test connect',
                          error_lines[0])
@@ -125,7 +131,7 @@ class TestSender(BaseTest):
             success, candidates = self.sender()
             self.assertFalse(success)
             self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         self.assertEqual(1, len(error_lines))
         self.assertEqual('1.2.3.4:5678/sda1/9 test connect',
                          error_lines[0])
@@ -140,52 +146,39 @@ class TestSender(BaseTest):
         success, candidates = self.sender()
         self.assertFalse(success)
         self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         for line in error_lines:
             self.assertTrue(line.startswith(
-                '1.2.3.4:5678/sda1/9 EXCEPTION in ssync.Sender:'))
+                '1.2.3.4:5678/sda1/9 EXCEPTION in ssync.Sender: '))
 
     def test_call_catches_exception_handling_exception(self):
-        job = node = None  # Will cause inside exception handler to fail
-        self.sender = ssync_sender.Sender(self.daemon, node, job, None)
+        self.sender.node = None  # Will cause inside exception handler to fail
         self.sender.suffixes = ['abc']
         self.sender.connect = 'cause exception'
         success, candidates = self.sender()
         self.assertFalse(success)
         self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         for line in error_lines:
             self.assertTrue(line.startswith(
                 'EXCEPTION in ssync.Sender'))
 
     def test_call_calls_others(self):
+        connection = FakeConnection()
+        response = FakeResponse()
         self.sender.suffixes = ['abc']
-        self.sender.connect = mock.MagicMock()
-        self.sender.missing_check = mock.MagicMock()
+        self.sender.connect = mock.MagicMock(return_value=(connection,
+                                                           response))
+        self.sender.missing_check = mock.MagicMock(return_value=({}, {}))
         self.sender.updates = mock.MagicMock()
         self.sender.disconnect = mock.MagicMock()
         success, candidates = self.sender()
         self.assertTrue(success)
         self.assertEqual(candidates, {})
         self.sender.connect.assert_called_once_with()
-        self.sender.missing_check.assert_called_once_with()
-        self.sender.updates.assert_called_once_with()
-        self.sender.disconnect.assert_called_once_with()
-
-    def test_call_calls_others_returns_failure(self):
-        self.sender.suffixes = ['abc']
-        self.sender.connect = mock.MagicMock()
-        self.sender.missing_check = mock.MagicMock()
-        self.sender.updates = mock.MagicMock()
-        self.sender.disconnect = mock.MagicMock()
-        self.sender.failures = 1
-        success, candidates = self.sender()
-        self.assertFalse(success)
-        self.assertEqual(candidates, {})
-        self.sender.connect.assert_called_once_with()
-        self.sender.missing_check.assert_called_once_with()
-        self.sender.updates.assert_called_once_with()
-        self.sender.disconnect.assert_called_once_with()
+        self.sender.missing_check.assert_called_once_with(connection, response)
+        self.sender.updates.assert_called_once_with(connection, response, {})
+        self.sender.disconnect.assert_called_once_with(connection)
 
     def test_connect(self):
         node = dict(replication_ip='1.2.3.4', replication_port=5678,
@@ -194,7 +187,7 @@ class TestSender(BaseTest):
         self.sender = ssync_sender.Sender(self.daemon, node, job, None)
         self.sender.suffixes = ['abc']
         with mock.patch(
-                'swift.obj.ssync_sender.bufferedhttp.BufferedHTTPConnection'
+                'swift.obj.ssync_sender.SsyncBufferedHTTPConnection'
         ) as mock_conn_class:
             mock_conn = mock_conn_class.return_value
             mock_resp = mock.MagicMock()
@@ -228,7 +221,7 @@ class TestSender(BaseTest):
         self.sender = ssync_sender.Sender(self.daemon, node, job, None)
         self.sender.suffixes = ['abc']
         with mock.patch(
-                'swift.obj.ssync_sender.bufferedhttp.BufferedHTTPConnection'
+                'swift.obj.ssync_sender.SsyncBufferedHTTPConnection'
         ) as mock_conn_class:
             mock_conn = mock_conn_class.return_value
             mock_resp = mock.MagicMock()
@@ -262,7 +255,7 @@ class TestSender(BaseTest):
         self.sender = ssync_sender.Sender(self.daemon, node, job, None)
         self.sender.suffixes = ['abc']
         with mock.patch(
-                'swift.obj.ssync_sender.bufferedhttp.BufferedHTTPConnection'
+                'swift.obj.ssync_sender.SsyncBufferedHTTPConnection'
         ) as mock_conn_class:
             mock_conn = mock_conn_class.return_value
             mock_resp = mock.MagicMock()
@@ -296,7 +289,7 @@ class TestSender(BaseTest):
         self.sender = ssync_sender.Sender(self.daemon, node, job, None)
         self.sender.suffixes = ['abc']
         with mock.patch(
-                'swift.obj.ssync_sender.bufferedhttp.BufferedHTTPConnection'
+                'swift.obj.ssync_sender.SsyncBufferedHTTPConnection'
         ) as mock_conn_class:
             mock_conn = mock_conn_class.return_value
             mock_resp = mock.MagicMock()
@@ -331,7 +324,7 @@ class TestSender(BaseTest):
         self.sender = ssync_sender.Sender(self.daemon, node, job, None)
         self.sender.suffixes = ['abc']
         with mock.patch(
-                'swift.obj.ssync_sender.bufferedhttp.BufferedHTTPConnection'
+                'swift.obj.ssync_sender.SsyncBufferedHTTPConnection'
         ) as mock_conn_class:
             mock_conn = mock_conn_class.return_value
             mock_resp = mock.MagicMock()
@@ -359,9 +352,14 @@ class TestSender(BaseTest):
                                  expected_calls))
 
     def test_call(self):
-        def patch_sender(sender):
-            sender.connect = mock.MagicMock()
+        def patch_sender(sender, available_map, send_map):
+            connection = FakeConnection()
+            response = FakeResponse()
+            sender.connect = mock.MagicMock(return_value=(connection,
+                                                          response))
             sender.missing_check = mock.MagicMock()
+            sender.missing_check = mock.MagicMock(return_value=(available_map,
+                                                                send_map))
             sender.updates = mock.MagicMock()
             sender.disconnect = mock.MagicMock()
 
@@ -383,8 +381,7 @@ class TestSender(BaseTest):
         # no suffixes -> no work done
         sender = ssync_sender.Sender(
             self.daemon, node, job, [], remote_check_objs=None)
-        patch_sender(sender)
-        sender.available_map = available_map
+        patch_sender(sender, available_map, {})
         success, candidates = sender()
         self.assertTrue(success)
         self.assertEqual({}, candidates)
@@ -392,8 +389,7 @@ class TestSender(BaseTest):
         # all objs in sync
         sender = ssync_sender.Sender(
             self.daemon, node, job, ['ignored'], remote_check_objs=None)
-        patch_sender(sender)
-        sender.available_map = available_map
+        patch_sender(sender, available_map, {})
         success, candidates = sender()
         self.assertTrue(success)
         self.assertEqual(available_map, candidates)
@@ -403,9 +399,7 @@ class TestSender(BaseTest):
         sender = ssync_sender.Sender(
             self.daemon, node, job, ['ignored'],
             remote_check_objs=None)
-        patch_sender(sender)
-        sender.send_map = {wanted: []}
-        sender.available_map = available_map
+        patch_sender(sender, available_map, {wanted: []})
         success, candidates = sender()
         self.assertTrue(success)
         self.assertEqual(available_map, candidates)
@@ -417,9 +411,7 @@ class TestSender(BaseTest):
         sender = ssync_sender.Sender(
             self.daemon, node, job, ['ignored'],
             remote_check_objs=remote_check_objs)
-        patch_sender(sender)
-        sender.send_map = {wanted: []}
-        sender.available_map = available_map
+        patch_sender(sender, available_map, {wanted: []})
         success, candidates = sender()
         self.assertTrue(success)
         expected_map = dict([('9d41d8cd98f00b204e9800998ecf0abc',
@@ -433,8 +425,6 @@ class TestSender(BaseTest):
             if device == 'dev' and partition == '9' and suffixes == ['abc'] \
                     and policy == POLICIES.legacy:
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000),
                      'ts_meta': Timestamp(1380155570.00005)})
@@ -442,7 +432,7 @@ class TestSender(BaseTest):
                 raise Exception(
                     'No match for %r %r %r' % (device, partition, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.node = {}
         self.sender.job = {
             'device': 'dev',
@@ -451,7 +441,7 @@ class TestSender(BaseTest):
             'frag_index': 0,
         }
         self.sender.suffixes = ['abc']
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 '9d41d8cd98f00b204e9800998ecf0abc\r\n'
@@ -459,8 +449,9 @@ class TestSender(BaseTest):
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'
             ))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.connect = mock.MagicMock()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.sender.connect = mock.MagicMock(return_value=(connection,
+                                                           response))
         df = mock.MagicMock()
         df.content_length = 0
         self.sender.df_mgr.get_diskfile_from_hash = mock.MagicMock(
@@ -469,29 +460,26 @@ class TestSender(BaseTest):
         success, candidates = self.sender()
         self.assertTrue(success)
         found_post = found_put = False
-        for chunk in self.sender.connection.sent:
+        for chunk in connection.sent:
             if 'POST' in chunk:
                 found_post = True
             if 'PUT' in chunk:
                 found_put = True
         self.assertFalse(found_post)
         self.assertTrue(found_put)
-        self.assertEqual(self.sender.failures, 0)
 
     def test_call_and_missing_check(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
             if device == 'dev' and partition == '9' and suffixes == ['abc'] \
                     and policy == POLICIES.legacy:
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
                 raise Exception(
                     'No match for %r %r %r' % (device, partition, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.node = {}
         self.sender.job = {
             'device': 'dev',
@@ -500,13 +488,14 @@ class TestSender(BaseTest):
             'frag_index': 0,
         }
         self.sender.suffixes = ['abc']
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 '9d41d8cd98f00b204e9800998ecf0abc d\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.connect = mock.MagicMock()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.sender.connect = mock.MagicMock(return_value=(connection,
+                                                           response))
         self.sender.updates = mock.MagicMock()
         self.sender.disconnect = mock.MagicMock()
         success, candidates = self.sender()
@@ -514,15 +503,12 @@ class TestSender(BaseTest):
         self.assertEqual(candidates,
                          dict([('9d41d8cd98f00b204e9800998ecf0abc',
                                 {'ts_data': Timestamp(1380144470.00000)})]))
-        self.assertEqual(self.sender.failures, 0)
 
     def test_call_and_missing_check_with_obj_list(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
             if device == 'dev' and partition == '9' and suffixes == ['abc'] \
                     and policy == POLICIES.legacy:
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -536,13 +522,14 @@ class TestSender(BaseTest):
         }
         self.sender = ssync_sender.Sender(self.daemon, None, job, ['abc'],
                                           ['9d41d8cd98f00b204e9800998ecf0abc'])
-        self.sender.connection = FakeConnection()
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.connect = mock.MagicMock()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.sender.connect = mock.MagicMock(return_value=(connection,
+                                                           response))
         self.sender.updates = mock.MagicMock()
         self.sender.disconnect = mock.MagicMock()
         success, candidates = self.sender()
@@ -550,15 +537,12 @@ class TestSender(BaseTest):
         self.assertEqual(candidates,
                          dict([('9d41d8cd98f00b204e9800998ecf0abc',
                                 {'ts_data': Timestamp(1380144470.00000)})]))
-        self.assertEqual(self.sender.failures, 0)
 
     def test_call_and_missing_check_with_obj_list_but_required(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
             if device == 'dev' and partition == '9' and suffixes == ['abc'] \
                     and policy == POLICIES.legacy:
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -572,14 +556,15 @@ class TestSender(BaseTest):
         }
         self.sender = ssync_sender.Sender(self.daemon, {}, job, ['abc'],
                                           ['9d41d8cd98f00b204e9800998ecf0abc'])
-        self.sender.connection = FakeConnection()
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 '9d41d8cd98f00b204e9800998ecf0abc d\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.connect = mock.MagicMock()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.sender.connect = mock.MagicMock(return_value=(connection,
+                                                           response))
         self.sender.updates = mock.MagicMock()
         self.sender.disconnect = mock.MagicMock()
         success, candidates = self.sender()
@@ -604,7 +589,7 @@ class TestSender(BaseTest):
             success, candidates = self.sender()
             self.assertFalse(success)
             self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         for line in error_lines:
             self.assertTrue(line.startswith(
                 '1.2.3.4:5678/sda1/9 0.01 seconds: connect send'))
@@ -623,12 +608,12 @@ class TestSender(BaseTest):
                 eventlet.sleep(0.1)
 
         with mock.patch.object(
-                ssync_sender.bufferedhttp, 'BufferedHTTPConnection',
+                ssync_sender, 'SsyncBufferedHTTPConnection',
                 FakeBufferedHTTPConnection):
             success, candidates = self.sender()
             self.assertFalse(success)
             self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         for line in error_lines:
             self.assertTrue(line.startswith(
                 '1.2.3.4:5678/sda1/9 0.02 seconds: connect receive'))
@@ -649,14 +634,14 @@ class TestSender(BaseTest):
         missing_check_fn = 'swift.obj.ssync_sender.Sender.missing_check'
         with mock.patch(missing_check_fn) as mock_missing_check:
             with mock.patch.object(
-                ssync_sender.bufferedhttp, 'BufferedHTTPConnection',
+                ssync_sender, 'SsyncBufferedHTTPConnection',
                     FakeBufferedHTTPConnection):
                 self.sender = ssync_sender.Sender(
                     self.daemon, node, job, ['abc'])
                 success, candidates = self.sender()
                 self.assertFalse(success)
                 self.assertEqual(candidates, {})
-        error_lines = self.daemon.logger.get_lines_for_level('error')
+        error_lines = self.daemon_logger.get_lines_for_level('error')
         for line in error_lines:
             self.assertTrue(line.startswith(
                 '1.2.3.4:5678/sda1/9 Expected status 200; got 503'))
@@ -665,62 +650,65 @@ class TestSender(BaseTest):
         self.assertFalse(mock_missing_check.called)
 
     def test_readline_newline_in_buffer(self):
-        self.sender.response_buffer = 'Has a newline already.\r\nOkay.'
-        self.assertEqual(self.sender.readline(), 'Has a newline already.\r\n')
-        self.assertEqual(self.sender.response_buffer, 'Okay.')
+        response = FakeResponse()
+        response.ssync_response_buffer = 'Has a newline already.\r\nOkay.'
+        self.assertEqual(response.readline(), 'Has a newline already.\r\n')
+        self.assertEqual(response.ssync_response_buffer, 'Okay.')
 
     def test_readline_buffer_exceeds_network_chunk_size_somehow(self):
-        self.daemon.network_chunk_size = 2
-        self.sender.response_buffer = '1234567890'
-        self.assertEqual(self.sender.readline(), '1234567890')
-        self.assertEqual(self.sender.response_buffer, '')
+        response = FakeResponse()
+        response.ssync_response_buffer = '1234567890'
+        self.assertEqual(response.readline(size=2), '1234567890')
+        self.assertEqual(response.ssync_response_buffer, '')
 
     def test_readline_at_start_of_chunk(self):
-        self.sender.response = FakeResponse()
-        self.sender.response.fp = six.StringIO('2\r\nx\n\r\n')
-        self.assertEqual(self.sender.readline(), 'x\n')
+        response = FakeResponse()
+        response.fp = six.StringIO('2\r\nx\n\r\n')
+        self.assertEqual(response.readline(), 'x\n')
 
     def test_readline_chunk_with_extension(self):
-        self.sender.response = FakeResponse()
-        self.sender.response.fp = six.StringIO(
+        response = FakeResponse()
+        response.fp = six.StringIO(
             '2 ; chunk=extension\r\nx\n\r\n')
-        self.assertEqual(self.sender.readline(), 'x\n')
+        self.assertEqual(response.readline(), 'x\n')
 
     def test_readline_broken_chunk(self):
-        self.sender.response = FakeResponse()
-        self.sender.response.fp = six.StringIO('q\r\nx\n\r\n')
+        response = FakeResponse()
+        response.fp = six.StringIO('q\r\nx\n\r\n')
         self.assertRaises(
-            exceptions.ReplicationException, self.sender.readline)
-        self.assertTrue(self.sender.response.close_called)
+            exceptions.ReplicationException, response.readline)
+        self.assertTrue(response.close_called)
 
     def test_readline_terminated_chunk(self):
-        self.sender.response = FakeResponse()
-        self.sender.response.fp = six.StringIO('b\r\nnot enough')
+        response = FakeResponse()
+        response.fp = six.StringIO('b\r\nnot enough')
         self.assertRaises(
-            exceptions.ReplicationException, self.sender.readline)
-        self.assertTrue(self.sender.response.close_called)
+            exceptions.ReplicationException, response.readline)
+        self.assertTrue(response.close_called)
 
     def test_readline_all(self):
-        self.sender.response = FakeResponse()
-        self.sender.response.fp = six.StringIO('2\r\nx\n\r\n0\r\n\r\n')
-        self.assertEqual(self.sender.readline(), 'x\n')
-        self.assertEqual(self.sender.readline(), '')
-        self.assertEqual(self.sender.readline(), '')
+        response = FakeResponse()
+        response.fp = six.StringIO('2\r\nx\n\r\n0\r\n\r\n')
+        self.assertEqual(response.readline(), 'x\n')
+        self.assertEqual(response.readline(), '')
+        self.assertEqual(response.readline(), '')
 
     def test_readline_all_trailing_not_newline_termed(self):
-        self.sender.response = FakeResponse()
-        self.sender.response.fp = six.StringIO(
+        response = FakeResponse()
+        response.fp = six.StringIO(
             '2\r\nx\n\r\n3\r\n123\r\n0\r\n\r\n')
-        self.assertEqual(self.sender.readline(), 'x\n')
-        self.assertEqual(self.sender.readline(), '123')
-        self.assertEqual(self.sender.readline(), '')
-        self.assertEqual(self.sender.readline(), '')
+        self.assertEqual(response.readline(), 'x\n')
+        self.assertEqual(response.readline(), '123')
+        self.assertEqual(response.readline(), '')
+        self.assertEqual(response.readline(), '')
 
     def test_missing_check_timeout(self):
-        self.sender.connection = FakeConnection()
-        self.sender.connection.send = lambda d: eventlet.sleep(1)
+        connection = FakeConnection()
+        connection.send = lambda d: eventlet.sleep(1)
+        response = FakeResponse()
         self.sender.daemon.node_timeout = 0.01
-        self.assertRaises(exceptions.MessageTimeout, self.sender.missing_check)
+        self.assertRaises(exceptions.MessageTimeout, self.sender.missing_check,
+                          connection, response)
 
     def test_missing_check_has_empty_suffixes(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -732,25 +720,26 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc', 'def']
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.missing_check()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '17\r\n:MISSING_CHECK: START\r\n\r\n'
             '15\r\n:MISSING_CHECK: END\r\n\r\n')
-        self.assertEqual(self.sender.send_map, {})
-        self.assertEqual(self.sender.available_map, {})
+        self.assertEqual(send_map, {})
+        self.assertEqual(available_map, {})
 
     def test_missing_check_has_suffixes(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -758,19 +747,13 @@ class TestSender(BaseTest):
                     policy == POLICIES.legacy and
                     suffixes == ['abc', 'def']):
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
                 yield (
-                    '/srv/node/dev/objects/9/def/'
-                    '9d41d8cd98f00b204e9800998ecf0def',
                     '9d41d8cd98f00b204e9800998ecf0def',
                     {'ts_data': Timestamp(1380144472.22222),
                      'ts_meta': Timestamp(1380144473.22222)})
                 yield (
-                    '/srv/node/dev/objects/9/def/'
-                    '9d41d8cd98f00b204e9800998ecf1def',
                     '9d41d8cd98f00b204e9800998ecf1def',
                     {'ts_data': Timestamp(1380144474.44444),
                      'ts_ctype': Timestamp(1380144474.44448),
@@ -780,21 +763,22 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc', 'def']
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.missing_check()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '17\r\n:MISSING_CHECK: START\r\n\r\n'
             '33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             '3b\r\n9d41d8cd98f00b204e9800998ecf0def 1380144472.22222 '
@@ -802,7 +786,7 @@ class TestSender(BaseTest):
             '3f\r\n9d41d8cd98f00b204e9800998ecf1def 1380144474.44444 '
             'm:186a0,t:4\r\n\r\n'
             '15\r\n:MISSING_CHECK: END\r\n\r\n')
-        self.assertEqual(self.sender.send_map, {})
+        self.assertEqual(send_map, {})
         candidates = [('9d41d8cd98f00b204e9800998ecf0abc',
                        dict(ts_data=Timestamp(1380144470.00000))),
                       ('9d41d8cd98f00b204e9800998ecf0def',
@@ -812,7 +796,7 @@ class TestSender(BaseTest):
                        dict(ts_data=Timestamp(1380144474.44444),
                             ts_meta=Timestamp(1380144475.44444),
                             ts_ctype=Timestamp(1380144474.44448)))]
-        self.assertEqual(self.sender.available_map, dict(candidates))
+        self.assertEqual(available_map, dict(candidates))
 
     def test_missing_check_far_end_disconnect(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -820,8 +804,6 @@ class TestSender(BaseTest):
                     policy == POLICIES.legacy and
                     suffixes == ['abc']):
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -829,29 +811,26 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc']
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.response = FakeResponse(chunk_body='\r\n')
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        response = FakeResponse(chunk_body='\r\n')
         exc = None
         try:
-            self.sender.missing_check()
+            self.sender.missing_check(connection, response)
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), 'Early disconnect')
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '17\r\n:MISSING_CHECK: START\r\n\r\n'
             '33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             '15\r\n:MISSING_CHECK: END\r\n\r\n')
-        self.assertEqual(self.sender.available_map,
-                         dict([('9d41d8cd98f00b204e9800998ecf0abc',
-                                dict(ts_data=Timestamp(1380144470.00000)))]))
 
     def test_missing_check_far_end_disconnect2(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -859,8 +838,6 @@ class TestSender(BaseTest):
                     policy == POLICIES.legacy and
                     suffixes == ['abc']):
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -868,30 +845,27 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc']
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.response = FakeResponse(
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        response = FakeResponse(
             chunk_body=':MISSING_CHECK: START\r\n')
         exc = None
         try:
-            self.sender.missing_check()
+            self.sender.missing_check(connection, response)
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), 'Early disconnect')
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '17\r\n:MISSING_CHECK: START\r\n\r\n'
             '33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             '15\r\n:MISSING_CHECK: END\r\n\r\n')
-        self.assertEqual(self.sender.available_map,
-                         dict([('9d41d8cd98f00b204e9800998ecf0abc',
-                                {'ts_data': Timestamp(1380144470.00000)})]))
 
     def test_missing_check_far_end_unexpected(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -899,8 +873,6 @@ class TestSender(BaseTest):
                     policy == POLICIES.legacy and
                     suffixes == ['abc']):
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -908,29 +880,26 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc']
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.response = FakeResponse(chunk_body='OH HAI\r\n')
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        response = FakeResponse(chunk_body='OH HAI\r\n')
         exc = None
         try:
-            self.sender.missing_check()
+            self.sender.missing_check(connection, response)
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), "Unexpected response: 'OH HAI'")
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '17\r\n:MISSING_CHECK: START\r\n\r\n'
             '33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             '15\r\n:MISSING_CHECK: END\r\n\r\n')
-        self.assertEqual(self.sender.available_map,
-                         dict([('9d41d8cd98f00b204e9800998ecf0abc',
-                                {'ts_data': Timestamp(1380144470.00000)})]))
 
     def test_missing_check_send_map(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -938,8 +907,6 @@ class TestSender(BaseTest):
                     policy == POLICIES.legacy and
                     suffixes == ['abc']):
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -947,28 +914,28 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc']
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 '0123abc dm\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.missing_check()
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '17\r\n:MISSING_CHECK: START\r\n\r\n'
             '33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             '15\r\n:MISSING_CHECK: END\r\n\r\n')
-        self.assertEqual(
-            self.sender.send_map, {'0123abc': {'data': True, 'meta': True}})
-        self.assertEqual(self.sender.available_map,
+        self.assertEqual(send_map, {'0123abc': {'data': True, 'meta': True}})
+        self.assertEqual(available_map,
                          dict([('9d41d8cd98f00b204e9800998ecf0abc',
                                 {'ts_data': Timestamp(1380144470.00000)})]))
 
@@ -980,8 +947,6 @@ class TestSender(BaseTest):
                     policy == POLICIES.legacy and
                     suffixes == ['abc']):
                 yield (
-                    '/srv/node/dev/objects/9/abc/'
-                    '9d41d8cd98f00b204e9800998ecf0abc',
                     '9d41d8cd98f00b204e9800998ecf0abc',
                     {'ts_data': Timestamp(1380144470.00000)})
             else:
@@ -989,80 +954,79 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
             'partition': '9',
             'policy': POLICIES.legacy,
         }
         self.sender.suffixes = ['abc']
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':MISSING_CHECK: START\r\n'
                 '0123abc d extra response parts\r\n'
                 ':MISSING_CHECK: END\r\n'))
-        self.sender.daemon._diskfile_mgr.yield_hashes = yield_hashes
-        self.sender.missing_check()
-        self.assertEqual(self.sender.send_map,
-                         {'0123abc': {'data': True}})
-        self.assertEqual(self.sender.available_map,
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
+        self.assertEqual(send_map, {'0123abc': {'data': True}})
+        self.assertEqual(available_map,
                          dict([('9d41d8cd98f00b204e9800998ecf0abc',
                                 {'ts_data': Timestamp(1380144470.00000)})]))
 
     def test_updates_timeout(self):
-        self.sender.connection = FakeConnection()
-        self.sender.connection.send = lambda d: eventlet.sleep(1)
+        connection = FakeConnection()
+        connection.send = lambda d: eventlet.sleep(1)
+        response = FakeResponse()
         self.sender.daemon.node_timeout = 0.01
-        self.assertRaises(exceptions.MessageTimeout, self.sender.updates)
+        self.assertRaises(exceptions.MessageTimeout, self.sender.updates,
+                          connection, response, {})
 
     def test_updates_empty_send_map(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, {})
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
     def test_updates_unexpected_response_lines1(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 'abc\r\n'
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
         exc = None
         try:
-            self.sender.updates()
+            self.sender.updates(connection, response, {})
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), "Unexpected response: 'abc'")
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
     def test_updates_unexpected_response_lines2(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 'abc\r\n'
                 ':UPDATES: END\r\n'))
         exc = None
         try:
-            self.sender.updates()
+            self.sender.updates(connection, response, {})
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), "Unexpected response: 'abc'")
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
@@ -1074,7 +1038,7 @@ class TestSender(BaseTest):
         object_hash = utils.hash_path(*object_parts)
         delete_timestamp = utils.normalize_timestamp(time.time())
         df.delete(delete_timestamp)
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': device,
             'partition': part,
@@ -1082,21 +1046,21 @@ class TestSender(BaseTest):
             'frag_index': 0,
         }
         self.sender.node = {}
-        self.sender.send_map = {object_hash: {'data': True}}
+        send_map = {object_hash: {'data': True}}
         self.sender.send_delete = mock.MagicMock()
         self.sender.send_put = mock.MagicMock()
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, send_map)
         self.sender.send_delete.assert_called_once_with(
-            '/a/c/o', delete_timestamp)
+            connection, '/a/c/o', delete_timestamp)
         self.assertEqual(self.sender.send_put.mock_calls, [])
         # note that the delete line isn't actually sent since we mock
         # send_delete; send_delete is tested separately.
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
@@ -1108,7 +1072,7 @@ class TestSender(BaseTest):
         object_hash = utils.hash_path(*object_parts)
         delete_timestamp = utils.normalize_timestamp(time.time())
         df.delete(delete_timestamp)
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': device,
             'partition': part,
@@ -1116,14 +1080,14 @@ class TestSender(BaseTest):
             'frag_index': 0,
         }
         self.sender.node = {}
-        self.sender.send_map = {object_hash: {'data': True}}
-        self.sender.response = FakeResponse(
+        send_map = {object_hash: {'data': True}}
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, send_map)
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             '30\r\n'
             'DELETE /a/c/o\r\n'
@@ -1147,7 +1111,7 @@ class TestSender(BaseTest):
         object_hash = utils.hash_path(*object_parts)
         df.open()
         expected = df.get_metadata()
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': device,
             'partition': part,
@@ -1156,27 +1120,27 @@ class TestSender(BaseTest):
         }
         self.sender.node = {}
         # receiver requested data only
-        self.sender.send_map = {object_hash: {'data': True}}
+        send_map = {object_hash: {'data': True}}
         self.sender.send_delete = mock.MagicMock()
         self.sender.send_put = mock.MagicMock()
         self.sender.send_post = mock.MagicMock()
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, send_map)
         self.assertEqual(self.sender.send_delete.mock_calls, [])
         self.assertEqual(self.sender.send_post.mock_calls, [])
         self.assertEqual(1, len(self.sender.send_put.mock_calls))
         args, _kwargs = self.sender.send_put.call_args
-        path, df = args
+        connection, path, df = args
         self.assertEqual(path, '/a/c/o')
         self.assertTrue(isinstance(df, diskfile.DiskFile))
         self.assertEqual(expected, df.get_metadata())
         # note that the put line isn't actually sent since we mock send_put;
         # send_put is tested separately.
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
@@ -1194,7 +1158,7 @@ class TestSender(BaseTest):
         object_hash = utils.hash_path(*object_parts)
         df.open()
         expected = df.get_metadata()
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': device,
             'partition': part,
@@ -1203,27 +1167,27 @@ class TestSender(BaseTest):
         }
         self.sender.node = {}
         # receiver requested only meta
-        self.sender.send_map = {object_hash: {'meta': True}}
+        send_map = {object_hash: {'meta': True}}
         self.sender.send_delete = mock.MagicMock()
         self.sender.send_put = mock.MagicMock()
         self.sender.send_post = mock.MagicMock()
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, send_map)
         self.assertEqual(self.sender.send_delete.mock_calls, [])
         self.assertEqual(self.sender.send_put.mock_calls, [])
         self.assertEqual(1, len(self.sender.send_post.mock_calls))
         args, _kwargs = self.sender.send_post.call_args
-        path, df = args
+        connection, path, df = args
         self.assertEqual(path, '/a/c/o')
         self.assertIsInstance(df, diskfile.DiskFile)
         self.assertEqual(expected, df.get_metadata())
         # note that the post line isn't actually sent since we mock send_post;
         # send_post is tested separately.
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
@@ -1241,7 +1205,7 @@ class TestSender(BaseTest):
         object_hash = utils.hash_path(*object_parts)
         df.open()
         expected = df.get_metadata()
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': device,
             'partition': part,
@@ -1250,32 +1214,32 @@ class TestSender(BaseTest):
         }
         self.sender.node = {}
         # receiver requested data and meta
-        self.sender.send_map = {object_hash: {'meta': True, 'data': True}}
+        send_map = {object_hash: {'meta': True, 'data': True}}
         self.sender.send_delete = mock.MagicMock()
         self.sender.send_put = mock.MagicMock()
         self.sender.send_post = mock.MagicMock()
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, send_map)
         self.assertEqual(self.sender.send_delete.mock_calls, [])
         self.assertEqual(1, len(self.sender.send_put.mock_calls))
         self.assertEqual(1, len(self.sender.send_post.mock_calls))
 
         args, _kwargs = self.sender.send_put.call_args
-        path, df = args
+        connection, path, df = args
         self.assertEqual(path, '/a/c/o')
         self.assertIsInstance(df, diskfile.DiskFile)
         self.assertEqual(expected, df.get_metadata())
 
         args, _kwargs = self.sender.send_post.call_args
-        path, df = args
+        connection, path, df = args
         self.assertEqual(path, '/a/c/o')
         self.assertIsInstance(df, diskfile.DiskFile)
         self.assertEqual(expected, df.get_metadata())
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
@@ -1287,155 +1251,151 @@ class TestSender(BaseTest):
                                       policy=POLICIES[0])
         object_hash = utils.hash_path(*object_parts)
         expected = df.get_metadata()
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.job = {
             'device': device,
             'partition': part,
             'policy': POLICIES[0],
             'frag_index': 0}
         self.sender.node = {}
-        self.sender.send_map = {object_hash: {'data': True}}
+        send_map = {object_hash: {'data': True}}
         self.sender.send_delete = mock.MagicMock()
         self.sender.send_put = mock.MagicMock()
-        self.sender.response = FakeResponse(
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        self.sender.updates()
+        self.sender.updates(connection, response, send_map)
         args, _kwargs = self.sender.send_put.call_args
-        path, df = args
+        connection, path, df = args
         self.assertEqual(path, '/a/c/o')
         self.assertTrue(isinstance(df, diskfile.DiskFile))
         self.assertEqual(expected, df.get_metadata())
-        self.assertEqual(os.path.join(self.testdir, 'dev/objects/9/',
+        self.assertEqual(os.path.join(self.tx_testdir, 'dev/objects/9/',
                                       object_hash[-3:], object_hash),
                          df._datadir)
 
     def test_updates_read_response_timeout_start(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        orig_readline = self.sender.readline
+        orig_readline = response.readline
 
-        def delayed_readline():
+        def delayed_readline(*args, **kwargs):
             eventlet.sleep(1)
-            return orig_readline()
+            return orig_readline(*args, **kwargs)
 
-        self.sender.readline = delayed_readline
+        response.readline = delayed_readline
         self.sender.daemon.http_timeout = 0.01
-        self.assertRaises(exceptions.MessageTimeout, self.sender.updates)
+        self.assertRaises(exceptions.MessageTimeout, self.sender.updates,
+                          connection, response, {})
 
     def test_updates_read_response_disconnect_start(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(chunk_body='\r\n')
+        connection = FakeConnection()
+        response = FakeResponse(chunk_body='\r\n')
         exc = None
         try:
-            self.sender.updates()
+            self.sender.updates(connection, response, {})
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), 'Early disconnect')
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
     def test_updates_read_response_unexp_start(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 'anything else\r\n'
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
         exc = None
         try:
-            self.sender.updates()
+            self.sender.updates(connection, response, {})
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), "Unexpected response: 'anything else'")
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
     def test_updates_read_response_timeout_end(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 ':UPDATES: END\r\n'))
-        orig_readline = self.sender.readline
+        orig_readline = response.readline
 
-        def delayed_readline():
-            rv = orig_readline()
+        def delayed_readline(*args, **kwargs):
+            rv = orig_readline(*args, **kwargs)
             if rv == ':UPDATES: END\r\n':
                 eventlet.sleep(1)
             return rv
 
-        self.sender.readline = delayed_readline
+        response.readline = delayed_readline
         self.sender.daemon.http_timeout = 0.01
-        self.assertRaises(exceptions.MessageTimeout, self.sender.updates)
+        self.assertRaises(exceptions.MessageTimeout, self.sender.updates,
+                          connection, response, {})
 
     def test_updates_read_response_disconnect_end(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 '\r\n'))
         exc = None
         try:
-            self.sender.updates()
+            self.sender.updates(connection, response, {})
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), 'Early disconnect')
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
     def test_updates_read_response_unexp_end(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_map = {}
-        self.sender.response = FakeResponse(
+        connection = FakeConnection()
+        response = FakeResponse(
             chunk_body=(
                 ':UPDATES: START\r\n'
                 'anything else\r\n'
                 ':UPDATES: END\r\n'))
         exc = None
         try:
-            self.sender.updates()
+            self.sender.updates(connection, response, {})
         except exceptions.ReplicationException as err:
             exc = err
         self.assertEqual(str(exc), "Unexpected response: 'anything else'")
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '11\r\n:UPDATES: START\r\n\r\n'
             'f\r\n:UPDATES: END\r\n\r\n')
 
     def test_send_delete_timeout(self):
-        self.sender.connection = FakeConnection()
-        self.sender.connection.send = lambda d: eventlet.sleep(1)
+        connection = FakeConnection()
+        connection.send = lambda d: eventlet.sleep(1)
         self.sender.daemon.node_timeout = 0.01
         exc = None
         try:
-            self.sender.send_delete('/a/c/o',
+            self.sender.send_delete(connection, '/a/c/o',
                                     utils.Timestamp('1381679759.90941'))
         except exceptions.MessageTimeout as err:
             exc = err
         self.assertEqual(str(exc), '0.01 seconds: send_delete')
 
     def test_send_delete(self):
-        self.sender.connection = FakeConnection()
-        self.sender.send_delete('/a/c/o',
+        connection = FakeConnection()
+        self.sender.send_delete(connection, '/a/c/o',
                                 utils.Timestamp('1381679759.90941'))
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
+            ''.join(connection.sent),
             '30\r\n'
             'DELETE /a/c/o\r\n'
             'X-Timestamp: 1381679759.90941\r\n'
@@ -1444,19 +1404,19 @@ class TestSender(BaseTest):
     def test_send_put_initial_timeout(self):
         df = self._make_open_diskfile()
         df._disk_chunk_size = 2
-        self.sender.connection = FakeConnection()
-        self.sender.connection.send = lambda d: eventlet.sleep(1)
+        connection = FakeConnection()
+        connection.send = lambda d: eventlet.sleep(1)
         self.sender.daemon.node_timeout = 0.01
         exc = None
         try:
-            self.sender.send_put('/a/c/o', df)
+            self.sender.send_put(connection, '/a/c/o', df)
         except exceptions.MessageTimeout as err:
             exc = err
         self.assertEqual(str(exc), '0.01 seconds: send_put')
 
     def test_send_put_chunk_timeout(self):
         df = self._make_open_diskfile()
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         self.sender.daemon.node_timeout = 0.01
 
         one_shot = [None]
@@ -1467,85 +1427,109 @@ class TestSender(BaseTest):
             except IndexError:
                 eventlet.sleep(1)
 
-        self.sender.connection.send = mock_send
+        connection.send = mock_send
 
         exc = None
         try:
-            self.sender.send_put('/a/c/o', df)
+            self.sender.send_put(connection, '/a/c/o', df)
         except exceptions.MessageTimeout as err:
             exc = err
         self.assertEqual(str(exc), '0.01 seconds: send_put chunk')
 
-    def test_send_put(self):
+    def _check_send_put(self, obj_name, meta_value):
         ts_iter = make_timestamp_iter()
         t1 = next(ts_iter)
         body = 'test'
-        extra_metadata = {'Some-Other-Header': 'value'}
-        df = self._make_open_diskfile(body=body, timestamp=t1,
+        extra_metadata = {'Some-Other-Header': 'value',
+                          u'Unicode-Meta-Name': meta_value}
+        df = self._make_open_diskfile(obj=obj_name, body=body,
+                                      timestamp=t1,
                                       extra_metadata=extra_metadata)
         expected = dict(df.get_metadata())
         expected['body'] = body
         expected['chunk_size'] = len(body)
+        expected['meta'] = meta_value
+        path = six.moves.urllib.parse.quote(expected['name'])
+        expected['path'] = path
+        expected['length'] = format(145 + len(path) + len(meta_value), 'x')
         # .meta file metadata is not included in expected for data only PUT
         t2 = next(ts_iter)
         metadata = {'X-Timestamp': t2.internal, 'X-Object-Meta-Fruit': 'kiwi'}
         df.write_metadata(metadata)
         df.open()
-        self.sender.connection = FakeConnection()
-        self.sender.send_put('/a/c/o', df)
+        connection = FakeConnection()
+        self.sender.send_put(connection, path, df)
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
-            '82\r\n'
-            'PUT /a/c/o\r\n'
+            ''.join(connection.sent),
+            '%(length)s\r\n'
+            'PUT %(path)s\r\n'
             'Content-Length: %(Content-Length)s\r\n'
             'ETag: %(ETag)s\r\n'
             'Some-Other-Header: value\r\n'
+            'Unicode-Meta-Name: %(meta)s\r\n'
             'X-Timestamp: %(X-Timestamp)s\r\n'
             '\r\n'
             '\r\n'
             '%(chunk_size)s\r\n'
             '%(body)s\r\n' % expected)
 
-    def test_send_post(self):
+    def test_send_put(self):
+        self._check_send_put('o', 'meta')
+
+    def test_send_put_unicode(self):
+        self._check_send_put(
+            'o_with_caract\xc3\xa8res_like_in_french', 'm\xc3\xa8ta')
+
+    def _check_send_post(self, obj_name, meta_value):
         ts_iter = make_timestamp_iter()
         # create .data file
         extra_metadata = {'X-Object-Meta-Foo': 'old_value',
                           'X-Object-Sysmeta-Test': 'test_sysmeta',
                           'Content-Type': 'test_content_type'}
         ts_0 = next(ts_iter)
-        df = self._make_open_diskfile(extra_metadata=extra_metadata,
+        df = self._make_open_diskfile(obj=obj_name,
+                                      extra_metadata=extra_metadata,
                                       timestamp=ts_0)
         # create .meta file
         ts_1 = next(ts_iter)
-        newer_metadata = {'X-Object-Meta-Foo': 'new_value',
+        newer_metadata = {u'X-Object-Meta-Foo': meta_value,
                           'X-Timestamp': ts_1.internal}
         df.write_metadata(newer_metadata)
+        path = six.moves.urllib.parse.quote(df.read_metadata()['name'])
+        length = format(61 + len(path) + len(meta_value), 'x')
 
-        self.sender.connection = FakeConnection()
+        connection = FakeConnection()
         with df.open():
-            self.sender.send_post('/a/c/o', df)
+            self.sender.send_post(connection, path, df)
         self.assertEqual(
-            ''.join(self.sender.connection.sent),
-            '4c\r\n'
-            'POST /a/c/o\r\n'
-            'X-Object-Meta-Foo: new_value\r\n'
+            ''.join(connection.sent),
+            '%s\r\n'
+            'POST %s\r\n'
+            'X-Object-Meta-Foo: %s\r\n'
             'X-Timestamp: %s\r\n'
             '\r\n'
-            '\r\n' % ts_1.internal)
+            '\r\n' % (length, path, meta_value, ts_1.internal))
+
+    def test_send_post(self):
+        self._check_send_post('o', 'meta')
+
+    def test_send_post_unicode(self):
+        self._check_send_post(
+            'o_with_caract\xc3\xa8res_like_in_french', 'm\xc3\xa8ta')
 
     def test_disconnect_timeout(self):
-        self.sender.connection = FakeConnection()
-        self.sender.connection.send = lambda d: eventlet.sleep(1)
+        connection = FakeConnection()
+        connection.send = lambda d: eventlet.sleep(1)
         self.sender.daemon.node_timeout = 0.01
-        self.sender.disconnect()
-        self.assertEqual(''.join(self.sender.connection.sent), '')
-        self.assertTrue(self.sender.connection.closed)
+        self.sender.disconnect(connection)
+        self.assertEqual(''.join(connection.sent), '')
+        self.assertTrue(connection.closed)
 
     def test_disconnect(self):
-        self.sender.connection = FakeConnection()
-        self.sender.disconnect()
-        self.assertEqual(''.join(self.sender.connection.sent), '0\r\n\r\n')
-        self.assertTrue(self.sender.connection.closed)
+        connection = FakeConnection()
+        self.sender.disconnect(connection)
+        self.assertEqual(''.join(connection.sent), '0\r\n\r\n')
+        self.assertTrue(connection.closed)
 
 
 class TestModuleMethods(unittest.TestCase):

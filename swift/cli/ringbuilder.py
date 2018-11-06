@@ -16,6 +16,7 @@
 from __future__ import print_function
 import logging
 
+from collections import defaultdict
 from errno import EEXIST
 from itertools import islice
 from operator import itemgetter
@@ -34,6 +35,7 @@ from six.moves import input
 from swift.common import exceptions
 from swift.common.ring import RingBuilder, Ring, RingData
 from swift.common.ring.builder import MAX_BALANCE
+from swift.common.ring.composite_builder import CompositeRingBuilder
 from swift.common.ring.utils import validate_args, \
     validate_and_normalize_ip, build_dev_from_opts, \
     parse_builder_ring_filename_args, parse_search_value, \
@@ -218,7 +220,6 @@ def _parse_set_weight_values(argvish):
     # --options format,
     # but not both. If both are specified, raise an error.
     try:
-        devs = []
         if not new_cmd_format:
             if len(args) % 2 != 0:
                 print(Commands.set_weight.__doc__.strip())
@@ -227,7 +228,7 @@ def _parse_set_weight_values(argvish):
             devs_and_weights = izip(islice(argvish, 0, len(argvish), 2),
                                     islice(argvish, 1, len(argvish), 2))
             for devstr, weightstr in devs_and_weights:
-                devs.extend(builder.search_devs(
+                devs = (builder.search_devs(
                     parse_search_value(devstr)) or [])
                 weight = float(weightstr)
                 _set_weight_values(devs, weight, opts)
@@ -236,7 +237,7 @@ def _parse_set_weight_values(argvish):
                 print(Commands.set_weight.__doc__.strip())
                 exit(EXIT_ERROR)
 
-            devs.extend(builder.search_devs(
+            devs = (builder.search_devs(
                 parse_search_values_from_opts(opts)) or [])
             weight = float(args[0])
             _set_weight_values(devs, weight, opts)
@@ -466,19 +467,24 @@ swift-ring-builder <builder_file>
         DEL - indicates that the device is marked for removal from
               ring and will be removed in next rebalance.
         """
-        print('%s, build version %d' % (builder_file, builder.version))
-        regions = 0
-        zones = 0
+        try:
+            builder_id = builder.id
+        except AttributeError:
+            builder_id = "(not assigned)"
+        print('%s, build version %d, id %s' %
+              (builder_file, builder.version, builder_id))
         balance = 0
-        dev_count = 0
-        if builder.devs:
-            regions = len(set(d['region'] for d in builder.devs
-                              if d is not None))
-            zones = len(set((d['region'], d['zone']) for d in builder.devs
-                            if d is not None))
-            dev_count = len([dev for dev in builder.devs
-                             if dev is not None])
+        ring_empty_error = None
+        regions = len(set(d['region'] for d in builder.devs
+                          if d is not None))
+        zones = len(set((d['region'], d['zone']) for d in builder.devs
+                        if d is not None))
+        dev_count = len([dev for dev in builder.devs
+                         if dev is not None])
+        try:
             balance = builder.get_balance()
+        except exceptions.EmptyRingError as e:
+            ring_empty_error = str(e)
         dispersion_trailer = '' if builder.dispersion is None else (
             ', %.02f dispersion' % (builder.dispersion))
         print('%d partitions, %.6f replicas, %d regions, %d zones, '
@@ -492,12 +498,14 @@ swift-ring-builder <builder_file>
         print('The overload factor is %0.2f%% (%.6f)' % (
             builder.overload * 100, builder.overload))
 
+        ring_dict = None
+        builder_dict = builder.get_ring().to_dict()
+
         # compare ring file against builder file
         if not exists(ring_file):
             print('Ring file %s not found, '
                   'probably it hasn\'t been written yet' % ring_file)
         else:
-            builder_dict = builder.get_ring().to_dict()
             try:
                 ring_dict = RingData.load(ring_file).to_dict()
             except Exception as exc:
@@ -508,13 +516,38 @@ swift-ring-builder <builder_file>
                 else:
                     print('Ring file %s is obsolete' % ring_file)
 
-        if builder.devs:
+        if ring_empty_error:
+            balance_per_dev = defaultdict(int)
+        else:
             balance_per_dev = builder._build_balance_per_dev()
-            header_line, print_dev_f = _make_display_device_table(builder)
-            print(header_line)
-            for dev in builder._iter_devs():
-                flags = 'DEL' if dev in builder._remove_devs else ''
-                print_dev_f(dev, balance_per_dev[dev['id']], flags)
+        header_line, print_dev_f = _make_display_device_table(builder)
+        print(header_line)
+        for dev in sorted(
+            builder._iter_devs(),
+            key=lambda x: (x['region'], x['zone'], x['ip'], x['device'])
+        ):
+            flags = 'DEL' if dev in builder._remove_devs else ''
+            print_dev_f(dev, balance_per_dev[dev['id']], flags)
+
+        # Print some helpful info if partition power increase in progress
+        if (builder.next_part_power and
+                builder.next_part_power == (builder.part_power + 1)):
+            print('\nPreparing increase of partition power (%d -> %d)' % (
+                  builder.part_power, builder.next_part_power))
+            print('Run "swift-object-relinker relink" on all nodes before '
+                  'moving on to increase_partition_power.')
+        if (builder.next_part_power and
+                builder.part_power == builder.next_part_power):
+            print('\nIncreased partition power (%d -> %d)' % (
+                  builder.part_power, builder.next_part_power))
+            if builder_dict != ring_dict:
+                print('First run "swift-ring-builder <builderfile> write_ring"'
+                      ' now and copy the updated .ring.gz file to all nodes.')
+            print('Run "swift-object-relinker cleanup" on all nodes before '
+                  'moving on to finish_increase_partition_power.')
+
+        if ring_empty_error:
+            print(ring_empty_error)
         exit(EXIT_SUCCESS)
 
     @staticmethod
@@ -645,6 +678,11 @@ swift-ring-builder <builder_file> add
             print(Commands.add.__doc__.strip())
             exit(EXIT_ERROR)
 
+        if builder.next_part_power:
+            print('Partition power increase in progress. You need ')
+            print('to finish the increase first before adding devices.')
+            exit(EXIT_WARNING)
+
         try:
             for new_dev in _parse_add_values(argv[3:]):
                 for dev in builder.devs:
@@ -672,8 +710,8 @@ swift-ring-builder <builder_file> add
     @staticmethod
     def set_weight():
         """
-swift-ring-builder <builder_file> set_weight <search-value> <weight>
-    [<search-value> <weight] ...
+swift-ring-builder <builder_file> set_weight <search-value> <new_weight>
+    [<search-value> <new_weight>] ...
     [--yes]
 
 or
@@ -681,11 +719,12 @@ or
 swift-ring-builder <builder_file> set_weight
     --region <region> --zone <zone> --ip <ip or hostname> --port <port>
     --replication-ip <r_ip or r_hostname> --replication-port <r_port>
-    --device <device_name> --meta <meta> --weight <weight>
+    --device <device_name> --meta <meta> --weight <weight> <new_weight>
     [--yes]
 
     Where <r_ip>, <r_hostname> and <r_port> are replication ip, hostname
-    and port.
+    and port. <weight> and <new_weight> are the search weight and new
+    weight values respectively.
     Any of the options are optional in both cases.
 
     Resets the devices' weights. No partitions will be reassigned to or from
@@ -789,6 +828,11 @@ swift-ring-builder <builder_file> remove
             print(parse_search_value.__doc__.strip())
             exit(EXIT_ERROR)
 
+        if builder.next_part_power:
+            print('Partition power increase in progress. You need ')
+            print('to finish the increase first before removing devices.')
+            exit(EXIT_WARNING)
+
         devs, opts = _parse_remove_values(argv[3:])
 
         input_question = 'Are you sure you want to remove these ' \
@@ -851,18 +895,18 @@ swift-ring-builder <builder_file> rebalance [options]
             handler.setFormatter(formatter)
             logger.addHandler(handler)
 
-        if builder.min_part_seconds_left > 0 and not options.force:
-            print('No partitions could be reassigned.')
-            print('The time between rebalances must be at least '
-                  'min_part_hours: %s hours (%s remaining)' % (
-                      builder.min_part_hours,
-                      timedelta(seconds=builder.min_part_seconds_left)))
+        if builder.next_part_power:
+            print('Partition power increase in progress.')
+            print('You need to finish the increase first before rebalancing.')
             exit(EXIT_WARNING)
 
         devs_changed = builder.devs_changed
+        min_part_seconds_left = builder.min_part_seconds_left
         try:
             last_balance = builder.get_balance()
+            last_dispersion = builder.dispersion
             parts, balance, removed_devs = builder.rebalance(seed=get_seed(3))
+            dispersion = builder.dispersion
         except exceptions.RingBuilderError as e:
             print('-' * 79)
             print("An error has occurred during ring validation. Common\n"
@@ -874,15 +918,38 @@ swift-ring-builder <builder_file> rebalance [options]
             exit(EXIT_ERROR)
         if not (parts or options.force or removed_devs):
             print('No partitions could be reassigned.')
-            print('There is no need to do so at this time')
+            if min_part_seconds_left > 0:
+                print('The time between rebalances must be at least '
+                      'min_part_hours: %s hours (%s remaining)' % (
+                          builder.min_part_hours,
+                          timedelta(seconds=builder.min_part_seconds_left)))
+            else:
+                print('There is no need to do so at this time')
             exit(EXIT_WARNING)
         # If we set device's weight to zero, currently balance will be set
         # special value(MAX_BALANCE) until zero weighted device return all
         # its partitions. So we cannot check balance has changed.
         # Thus we need to check balance or last_balance is special value.
-        if not options.force and \
-                not devs_changed and abs(last_balance - balance) < 1 and \
-                not (last_balance == MAX_BALANCE and balance == MAX_BALANCE):
+        be_cowardly = True
+        if options.force:
+            # User said save it, so we save it.
+            be_cowardly = False
+        elif devs_changed:
+            # We must save if a device changed; this could be something like
+            # a changed IP address.
+            be_cowardly = False
+        else:
+            # If balance or dispersion changed (presumably improved), then
+            # we should save to get the improvement.
+            balance_changed = (
+                abs(last_balance - balance) >= 1 or
+                (last_balance == MAX_BALANCE and balance == MAX_BALANCE))
+            dispersion_changed = last_dispersion is None or (
+                abs(last_dispersion - dispersion) >= 1)
+            if balance_changed or dispersion_changed:
+                be_cowardly = False
+
+        if be_cowardly:
             print('Cowardly refusing to save rebalance as it did not change '
                   'at least 1%.')
             exit(EXIT_WARNING)
@@ -937,6 +1004,7 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
 
     Output report on dispersion.
 
+    --recalculate option will rebuild cached dispersion info and save builder
     --verbose option will display dispersion graph broken down by tier
 
     You can filter which tiers are evaluated to drill down using a regex
@@ -975,6 +1043,8 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
             exit(EXIT_ERROR)
         usage = Commands.dispersion.__doc__.strip()
         parser = optparse.OptionParser(usage)
+        parser.add_option('--recalculate', action='store_true',
+                          help='Rebuild cached dispersion info and save')
         parser.add_option('-v', '--verbose', action='store_true',
                           help='Display dispersion report for tiers')
         options, args = parser.parse_args(argv)
@@ -982,8 +1052,13 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
             search_filter = args[3]
         else:
             search_filter = None
+        orig_version = builder.version
         report = dispersion_report(builder, search_filter=search_filter,
-                                   verbose=options.verbose)
+                                   verbose=options.verbose,
+                                   recalculate=options.recalculate)
+        if builder.version != orig_version:
+            # we've already done the work, better go ahead and save it!
+            builder.save(builder_file)
         print('Dispersion is %.06f, Balance is %.06f, Overload is %0.2f%%' % (
             builder.dispersion, builder.get_balance(), builder.overload * 100))
         print('Required overload is %.6f%%' % (
@@ -993,7 +1068,7 @@ swift-ring-builder <builder_file> dispersion <search_filter> [options]
             print('Worst tier is %.06f (%s)' % (report['max_dispersion'],
                                                 report['worst_tier']))
         if report['graph']:
-            replica_range = range(int(math.ceil(builder.replicas + 1)))
+            replica_range = list(range(int(math.ceil(builder.replicas + 1))))
             part_count_width = '%%%ds' % max(len(str(builder.parts)), 5)
             replica_counts_tmpl = ' '.join(part_count_width for i in
                                            replica_range)
@@ -1043,14 +1118,16 @@ swift-ring-builder <builder_file> write_ring
     'set_info' calls when no rebalance is needed but you want to send out the
     new device information.
         """
+        if not builder.devs:
+            print('Unable to write empty ring.')
+            exit(EXIT_ERROR)
+
         ring_data = builder.get_ring()
         if not ring_data._replica2part2dev_id:
             if ring_data.devs:
                 print('Warning: Writing a ring with no partition '
                       'assignments but with devices; did you forget to run '
                       '"rebalance"?')
-            else:
-                print('Warning: Writing an empty ring')
         ring_data.save(
             pathjoin(backup_dir, '%d.' % time() + basename(ring_file)))
         ring_data.save(ring_file)
@@ -1216,6 +1293,159 @@ swift-ring-builder <builder_file> set_overload <overload>[%]
         builder.save(builder_file)
         exit(status)
 
+    @staticmethod
+    def prepare_increase_partition_power():
+        """
+swift-ring-builder <builder_file> prepare_increase_partition_power
+    Prepare the ring to increase the partition power by one.
+
+    A write_ring command is needed to make the change take effect.
+
+    Once the updated rings have been deployed to all servers you need to run
+    the swift-object-relinker tool to relink existing data.
+
+    *****************************
+    USE THIS WITH EXTREME CAUTION
+    *****************************
+
+    If you increase the partition power and deploy changed rings, you may
+    introduce unavailability in your cluster. This has an end-user impact. Make
+    sure you execute required operations to increase the partition power
+    accurately.
+
+    """
+        if len(argv) < 3:
+            print(Commands.prepare_increase_partition_power.__doc__.strip())
+            exit(EXIT_ERROR)
+
+        if "object" not in basename(builder_file):
+            print(
+                'Partition power increase is only supported for object rings.')
+            exit(EXIT_ERROR)
+
+        if not builder.prepare_increase_partition_power():
+            print('Ring is already prepared for partition power increase.')
+            exit(EXIT_ERROR)
+
+        builder.save(builder_file)
+
+        print('The next partition power is now %d.' % builder.next_part_power)
+        print('The change will take effect after the next write_ring.')
+        print('Ensure your proxy-servers, object-replicators and ')
+        print('reconstructors are using the changed rings and relink ')
+        print('(using swift-object-relinker) your existing data')
+        print('before the partition power increase')
+        exit(EXIT_SUCCESS)
+
+    @staticmethod
+    def increase_partition_power():
+        """
+swift-ring-builder <builder_file> increase_partition_power
+    Increases the partition power by one. Needs to be run after
+    prepare_increase_partition_power has been run and all existing data has
+    been relinked using the swift-object-relinker tool.
+
+    A write_ring command is needed to make the change take effect.
+
+    Once the updated rings have been deployed to all servers you need to run
+    the swift-object-relinker tool to cleanup old data.
+
+    *****************************
+    USE THIS WITH EXTREME CAUTION
+    *****************************
+
+    If you increase the partition power and deploy changed rings, you may
+    introduce unavailability in your cluster. This has an end-user impact. Make
+    sure you execute required operations to increase the partition power
+    accurately.
+
+    """
+        if len(argv) < 3:
+            print(Commands.increase_partition_power.__doc__.strip())
+            exit(EXIT_ERROR)
+
+        if builder.increase_partition_power():
+            print('The partition power is now %d.' % builder.part_power)
+            print('The change will take effect after the next write_ring.')
+
+            builder._update_last_part_moves()
+            builder.save(builder_file)
+
+            exit(EXIT_SUCCESS)
+        else:
+            print('Ring partition power cannot be increased. Either the ring')
+            print('was not prepared yet, or this operation has already run.')
+            exit(EXIT_ERROR)
+
+    @staticmethod
+    def cancel_increase_partition_power():
+        """
+swift-ring-builder <builder_file> cancel_increase_partition_power
+    Cancel the increase of the partition power.
+
+    A write_ring command is needed to make the change take effect.
+
+    Once the updated rings have been deployed to all servers you need to run
+    the swift-object-relinker tool to cleanup unneeded links.
+
+    *****************************
+    USE THIS WITH EXTREME CAUTION
+    *****************************
+
+    If you increase the partition power and deploy changed rings, you may
+    introduce unavailability in your cluster. This has an end-user impact. Make
+    sure you execute required operations to increase the partition power
+    accurately.
+
+    """
+        if len(argv) < 3:
+            print(Commands.cancel_increase_partition_power.__doc__.strip())
+            exit(EXIT_ERROR)
+
+        if not builder.cancel_increase_partition_power():
+            print('Ring partition power increase cannot be canceled.')
+            exit(EXIT_ERROR)
+
+        builder.save(builder_file)
+
+        print('The next partition power is now %d.' % builder.next_part_power)
+        print('The change will take effect after the next write_ring.')
+        print('Ensure your object-servers are using the changed rings and')
+        print('cleanup (using swift-object-relinker) the hard links')
+        exit(EXIT_SUCCESS)
+
+    @staticmethod
+    def finish_increase_partition_power():
+        """
+swift-ring-builder <builder_file> finish_increase_partition_power
+    Finally removes the next_part_power flag. Has to be run after the
+    swift-object-relinker tool has been used to cleanup old existing data.
+
+    A write_ring command is needed to make the change take effect.
+
+    *****************************
+    USE THIS WITH EXTREME CAUTION
+    *****************************
+
+    If you increase the partition power and deploy changed rings, you may
+    introduce unavailability in your cluster. This has an end-user impact. Make
+    sure you execute required operations to increase the partition power
+    accurately.
+
+    """
+        if len(argv) < 3:
+            print(Commands.finish_increase_partition_power.__doc__.strip())
+            exit(EXIT_ERROR)
+
+        if not builder.finish_increase_partition_power():
+            print('Ring partition power increase cannot be finished.')
+            exit(EXIT_ERROR)
+
+        print('The change will take effect after the next write_ring.')
+        builder.save(builder_file)
+
+        exit(EXIT_SUCCESS)
+
 
 def main(arguments=None):
     global argv, backup_dir, builder, builder_file, ring_file
@@ -1254,7 +1484,13 @@ def main(arguments=None):
     try:
         builder = RingBuilder.load(builder_file)
     except exceptions.UnPicklingError as e:
-        print(e)
+        msg = str(e)
+        try:
+            CompositeRingBuilder.load(builder_file)
+            msg += ' (it appears to be a composite ring builder file?)'
+        except Exception:  # noqa
+            pass
+        print(msg)
         exit(EXIT_ERROR)
     except (exceptions.FileNotFoundError, exceptions.PermissionError) as e:
         if len(argv) < 3 or argv[2] not in('create', 'write_builder'):

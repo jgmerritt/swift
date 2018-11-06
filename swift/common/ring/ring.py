@@ -35,17 +35,30 @@ from swift.common.utils import hash_path, validate_configuration
 from swift.common.ring.utils import tiers_for_dev
 
 
+def calc_replica_count(replica2part2dev_id):
+    base = len(replica2part2dev_id) - 1
+    extra = 1.0 * len(replica2part2dev_id[-1]) / len(replica2part2dev_id[0])
+    return base + extra
+
+
 class RingData(object):
     """Partitioned consistent hashing ring data (used for serialization)."""
 
-    def __init__(self, replica2part2dev_id, devs, part_shift):
+    def __init__(self, replica2part2dev_id, devs, part_shift,
+                 next_part_power=None):
         self.devs = devs
         self._replica2part2dev_id = replica2part2dev_id
         self._part_shift = part_shift
+        self.next_part_power = next_part_power
 
         for dev in self.devs:
             if dev is not None:
                 dev.setdefault("region", 1)
+
+    @property
+    def replica_count(self):
+        """Number of replicas (full or partial) used in the ring."""
+        return calc_replica_count(self._replica2part2dev_id)
 
     @classmethod
     def deserialize_v1(cls, gz_file, metadata_only=False):
@@ -91,14 +104,11 @@ class RingData(object):
         :param bool metadata_only: If True, only load `devs` and `part_shift`.
         :returns: A RingData instance containing the loaded data.
         """
-        gz_file = GzipFile(filename, 'rb')
-        # Python 2.6 GzipFile doesn't support BufferedIO
-        if hasattr(gz_file, '_checkReadable'):
-            gz_file = BufferedReader(gz_file)
+        gz_file = BufferedReader(GzipFile(filename, 'rb'))
 
         # See if the file is in the new format
         magic = gz_file.read(4)
-        if magic == 'R1NG':
+        if magic == b'R1NG':
             format_version, = struct.unpack('!H', gz_file.read(2))
             if format_version == 1:
                 ring_data = cls.deserialize_v1(
@@ -113,18 +123,27 @@ class RingData(object):
 
         if not hasattr(ring_data, 'devs'):
             ring_data = RingData(ring_data['replica2part2dev_id'],
-                                 ring_data['devs'], ring_data['part_shift'])
+                                 ring_data['devs'], ring_data['part_shift'],
+                                 ring_data.get('next_part_power'))
         return ring_data
 
     def serialize_v1(self, file_obj):
         # Write out new-style serialization magic and version:
-        file_obj.write(struct.pack('!4sH', 'R1NG', 1))
+        file_obj.write(struct.pack('!4sH', b'R1NG', 1))
         ring = self.to_dict()
-        json_encoder = json.JSONEncoder(sort_keys=True)
-        json_text = json_encoder.encode(
-            {'devs': ring['devs'], 'part_shift': ring['part_shift'],
-             'replica_count': len(ring['replica2part2dev_id']),
-             'byteorder': sys.byteorder})
+
+        # Only include next_part_power if it is set in the
+        # builder, otherwise just ignore it
+        _text = {'devs': ring['devs'], 'part_shift': ring['part_shift'],
+                 'replica_count': len(ring['replica2part2dev_id']),
+                 'byteorder': sys.byteorder}
+
+        next_part_power = ring.get('next_part_power')
+        if next_part_power is not None:
+            _text['next_part_power'] = next_part_power
+
+        json_text = json.dumps(_text, sort_keys=True,
+                               ensure_ascii=True).encode('ascii')
         json_len = len(json_text)
         file_obj.write(struct.pack('!I', json_len))
         file_obj.write(json_text)
@@ -155,7 +174,8 @@ class RingData(object):
     def to_dict(self):
         return {'devs': self.devs,
                 'replica2part2dev_id': self._replica2part2dev_id,
-                'part_shift': self._part_shift}
+                'part_shift': self._part_shift,
+                'next_part_power': self.next_part_power}
 
 
 class Ring(object):
@@ -167,7 +187,7 @@ class Ring(object):
     :param ring_name: ring name string (basically specified from policy)
     :param validation_hook: hook point to validate ring configuration ontime
 
-    :raises: RingLoadError if the loaded ring data violates its constraint
+    :raises RingLoadError: if the loaded ring data violates its constraint
     """
 
     def __init__(self, serialized_path, reload_time=15, ring_name=None,
@@ -244,6 +264,15 @@ class Ring(object):
             self._num_regions = len(regions)
             self._num_zones = len(zones)
             self._num_ips = len(ips)
+            self._next_part_power = ring_data.next_part_power
+
+    @property
+    def next_part_power(self):
+        return self._next_part_power
+
+    @property
+    def part_power(self):
+        return 32 - self._part_shift
 
     def _rebuild_tier_data(self):
         self.tier2devs = defaultdict(list)
@@ -264,7 +293,7 @@ class Ring(object):
     @property
     def replica_count(self):
         """Number of replicas (full or partial) used in the ring."""
-        return len(self._replica2part2dev_id)
+        return calc_replica_count(self._replica2part2dev_id)
 
     @property
     def partition_count(self):
@@ -386,8 +415,8 @@ class Ring(object):
             (d['region'], d['zone'], d['ip']) for d in primary_nodes)
 
         parts = len(self._replica2part2dev_id[0])
-        start = struct.unpack_from(
-            '>I', md5(str(part)).digest())[0] >> self._part_shift
+        part_hash = md5(str(part).encode('ascii')).digest()
+        start = struct.unpack_from('>I', part_hash)[0] >> self._part_shift
         inc = int(parts / 65536) or 1
         # Multiple loops for execution speed; the checks and bookkeeping get
         # simpler as you go along

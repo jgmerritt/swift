@@ -57,6 +57,8 @@ IP address the container server should bind to. The default is 0.0.0.0 which wil
 it bind to all available addresses.
 .IP "\fBbind_port\fR"
 TCP port the container server should bind to. The default is 6201.
+.IP "\fBkeep_idle\fR"
+Value to set for socket TCP_KEEPIDLE. The default value is 600.
 .IP "\fBbind_timeout\fR"
 Timeout to bind socket. The default is 30.
 .IP \fBbacklog\fR
@@ -353,13 +355,15 @@ Logging address. The default is /dev/log.
 .IP \fBinterval\fR
 Minimum time for a pass to take. The default is 300 seconds.
 .IP \fBconcurrency\fR
-Number of reaper workers to spawn. The default is 4.
+Number of updater workers to spawn. The default is 4.
 .IP \fBnode_timeout\fR
 Request timeout to external services. The default is 3 seconds.
 .IP \fBconn_timeout\fR
 Connection timeout to external services. The default is 0.5 seconds.
+.IP \fBcontainers_per_second\fR
+Maximum containers updated per second. Should be tuned according to individual system specs. 0 is unlimited. The default is 50.
 .IP \fBslowdown\fR
-Slowdown will sleep that amount between containers. The default is 0.01 seconds.
+Slowdown will sleep that amount between containers. The default is 0.01 seconds. Deprecated in favor of containers_per_second
 .IP \fBaccount_suppression_time\fR
 Seconds to suppress updating an account that has generated an error. The default is 60 seconds.
 .IP \fBrecon_cache_path\fR
@@ -466,9 +470,9 @@ Ignored if IOPRIO_CLASS_IDLE is set.
 .LP
 More in depth documentation about the swift-container-server and
 also OpenStack Swift as a whole can be found at
-.BI http://swift.openstack.org/admin_guide.html
+.BI https://docs.openstack.org/swift/latest/admin_guide.html
 and
-.BI http://swift.openstack.org
+.BI https://docs.openstack.org/swift/latest/
 
 
 .SH "SEE ALSO"

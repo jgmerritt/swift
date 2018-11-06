@@ -17,8 +17,6 @@ import time
 import uuid
 import unittest
 
-from nose import SkipTest
-
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.manager import Manager
 from swift.common.utils import Timestamp
@@ -36,7 +34,7 @@ class TestObjectExpirer(ReplProbeTest):
         self.expirer.start()
         err = self.expirer.stop()
         if err:
-            raise SkipTest('Unable to verify object-expirer service')
+            raise unittest.SkipTest('Unable to verify object-expirer service')
 
         conf_files = []
         for server in self.expirer.servers:
@@ -59,10 +57,8 @@ class TestObjectExpirer(ReplProbeTest):
 
         return False
 
+    @unittest.skipIf(len(ENABLED_POLICIES) < 2, "Need more than one policy")
     def test_expirer_object_split_brain(self):
-        if len(ENABLED_POLICIES) < 2:
-            raise SkipTest('Need more than one policy')
-
         old_policy = random.choice(ENABLED_POLICIES)
         wrong_policy = random.choice([p for p in ENABLED_POLICIES
                                       if p != old_policy])
@@ -107,7 +103,7 @@ class TestObjectExpirer(ReplProbeTest):
 
         # clear proxy cache
         client.post_container(self.url, self.token, self.container_name, {})
-        # run the expirier again after replication
+        # run the expirer again after replication
         self.expirer.once()
 
         # object is not in the listing
@@ -129,6 +125,52 @@ class TestObjectExpirer(ReplProbeTest):
                 self.assertIn('x-backend-timestamp', metadata)
                 self.assertGreater(Timestamp(metadata['x-backend-timestamp']),
                                    create_timestamp)
+
+    def test_expirer_doesnt_make_async_pendings(self):
+        # The object expirer cleans up its own queue. The inner loop
+        # basically looks like this:
+        #
+        #    for obj in stuff_to_delete:
+        #        delete_the_object(obj)
+        #        remove_the_queue_entry(obj)
+        #
+        # By default, upon receipt of a DELETE request for an expiring
+        # object, the object servers will create async_pending records to
+        # clean the expirer queue. Since the expirer cleans its own queue,
+        # this is unnecessary. The expirer can make requests in such a way
+        # tha the object server does not write out any async pendings; this
+        # test asserts that this is the case.
+
+        # Make an expiring object in each policy
+        for policy in ENABLED_POLICIES:
+            container_name = "expirer-test-%d" % policy.idx
+            container_headers = {'X-Storage-Policy': policy.name}
+            client.put_container(self.url, self.token, container_name,
+                                 headers=container_headers)
+
+            now = time.time()
+            delete_at = int(now + 2.0)
+            client.put_object(
+                self.url, self.token, container_name, "some-object",
+                headers={'X-Delete-At': str(delete_at),
+                         'X-Timestamp': Timestamp(now).normal},
+                contents='dontcare')
+
+        time.sleep(2.0)
+        # make sure auto-created expirer-queue containers get in the account
+        # listing so the expirer can find them
+        Manager(['container-updater']).once()
+
+        # Make sure there's no async_pendings anywhere. Probe tests only run
+        # on single-node installs anyway, so this set should be small enough
+        # that an exhaustive check doesn't take too long.
+        all_obj_nodes = self.get_all_object_nodes()
+        pendings_before = self.gather_async_pendings(all_obj_nodes)
+
+        # expire the objects
+        Manager(['object-expirer']).once()
+        pendings_after = self.gather_async_pendings(all_obj_nodes)
+        self.assertEqual(pendings_after, pendings_before)
 
     def test_expirer_object_should_not_be_expired(self):
 
@@ -172,7 +214,7 @@ class TestObjectExpirer(ReplProbeTest):
         now = time.time()
         delete_at = int(now + 2.0)
         recreate_at = delete_at + 1.0
-        put_object(headers={'X-Delete-At': delete_at,
+        put_object(headers={'X-Delete-At': str(delete_at),
                             'X-Timestamp': Timestamp(now).normal})
 
         # some object servers stopped to make a situation that the
@@ -255,7 +297,7 @@ class TestObjectExpirer(ReplProbeTest):
         obj_brain.stop_primary_half()
         now = time.time()
         delete_at = int(now + 2.0)
-        obj_brain.put_object({'X-Delete-At': delete_at})
+        obj_brain.put_object({'X-Delete-At': str(delete_at)})
 
         # make sure auto-created containers get in the account listing
         Manager(['container-updater']).once()

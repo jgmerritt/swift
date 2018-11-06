@@ -52,7 +52,7 @@ from six.moves import urllib
 
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import reiterate, split_path, Timestamp, pairs, \
-    close_if_possible
+    close_if_possible, closing_if_possible
 from swift.common.exceptions import InvalidTimestamp
 
 
@@ -128,6 +128,8 @@ class _UTC(tzinfo):
 
     def tzname(self, dt):
         return 'UTC'
+
+
 UTC = _UTC()
 
 
@@ -219,7 +221,11 @@ def _header_int_property(header):
 
 
 def header_to_environ_key(header_name):
-    header_name = 'HTTP_' + header_name.replace('-', '_').upper()
+    # Why the to/from wsgi dance? Headers that include something like b'\xff'
+    # on the wire get translated to u'\u00ff' on py3, which gets upper()ed to
+    # u'\u0178', which is nonsense in a WSGI string.
+    real_header = wsgi_to_str(header_name)
+    header_name = 'HTTP_' + str_to_wsgi(real_header.upper()).replace('-', '_')
     if header_name == 'HTTP_CONTENT_LENGTH':
         return 'CONTENT_LENGTH'
     if header_name == 'HTTP_CONTENT_TYPE':
@@ -251,8 +257,10 @@ class HeaderEnvironProxy(MutableMapping):
     def __setitem__(self, key, value):
         if value is None:
             self.environ.pop(header_to_environ_key(key), None)
-        elif isinstance(value, six.text_type):
+        elif six.PY2 and isinstance(value, six.text_type):
             self.environ[header_to_environ_key(key)] = value.encode('utf-8')
+        elif not six.PY2 and isinstance(value, six.binary_type):
+            self.environ[header_to_environ_key(key)] = value.decode('latin1')
         else:
             self.environ[header_to_environ_key(key)] = str(value)
 
@@ -263,13 +271,38 @@ class HeaderEnvironProxy(MutableMapping):
         del self.environ[header_to_environ_key(key)]
 
     def keys(self):
-        keys = [key[5:].replace('_', '-').title()
+        # See the to/from WSGI comment in header_to_environ_key
+        keys = [str_to_wsgi(wsgi_to_str(key[5:]).replace('_', '-').title())
                 for key in self.environ if key.startswith('HTTP_')]
         if 'CONTENT_LENGTH' in self.environ:
             keys.append('Content-Length')
         if 'CONTENT_TYPE' in self.environ:
             keys.append('Content-Type')
         return keys
+
+
+def wsgi_to_bytes(wsgi_str):
+    if six.PY2:
+        return wsgi_str
+    return wsgi_str.encode('latin1')
+
+
+def wsgi_to_str(wsgi_str):
+    if six.PY2:
+        return wsgi_str
+    return wsgi_to_bytes(wsgi_str).decode('utf8', errors='surrogateescape')
+
+
+def bytes_to_wsgi(byte_str):
+    if six.PY2:
+        return byte_str
+    return byte_str.decode('latin1')
+
+
+def str_to_wsgi(native_str):
+    if six.PY2:
+        return native_str
+    return bytes_to_wsgi(native_str.encode('utf8', errors='surrogateescape'))
 
 
 def _resp_status_property():
@@ -288,8 +321,6 @@ def _resp_status_property():
             self.status_int = value
             self.explanation = self.title = RESPONSE_REASONS[value][0]
         else:
-            if isinstance(value, six.text_type):
-                value = value.encode('utf-8')
             self.status_int = int(value.split(' ', 1)[0])
             self.explanation = self.title = value.split(' ', 1)[1]
 
@@ -307,16 +338,18 @@ def _resp_body_property():
     def getter(self):
         if not self._body:
             if not self._app_iter:
-                return ''
-            self._body = ''.join(self._app_iter)
+                return b''
+            with closing_if_possible(self._app_iter):
+                self._body = b''.join(self._app_iter)
             self._app_iter = None
         return self._body
 
     def setter(self, value):
         if isinstance(value, six.text_type):
-            value = value.encode('utf-8')
-        if isinstance(value, str):
+            raise TypeError('WSGI responses must be bytes')
+        if isinstance(value, six.binary_type):
             self.content_length = len(value)
+            close_if_possible(self._app_iter)
             self._app_iter = None
         self._body = value
 
@@ -401,6 +434,7 @@ def _resp_app_iter_property():
         elif value is not None:
             self.content_length = None
             self._body = None
+        close_if_possible(self._app_iter)
         self._app_iter = value
 
     return property(getter, setter,
@@ -621,14 +655,23 @@ class Match(object):
     """
     def __init__(self, headerval):
         self.tags = set()
-        for tag in headerval.split(', '):
+        for tag in headerval.split(','):
+            tag = tag.strip()
+            if not tag:
+                continue
             if tag.startswith('"') and tag.endswith('"'):
                 self.tags.add(tag[1:-1])
             else:
                 self.tags.add(tag)
 
     def __contains__(self, val):
+        if val and val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
         return '*' in self.tags or val in self.tags
+
+    def __repr__(self):
+        return '%s(%r)' % (
+            self.__class__.__name__, ', '.join(sorted(self.tags)))
 
 
 class Accept(object):
@@ -690,11 +733,9 @@ class Accept(object):
         Returns None if no available options are acceptable to the client.
 
         :param options: a list of content-types the server can respond with
+        :raises ValueError: if the header is malformed
         """
-        try:
-            types = self._get_types()
-        except ValueError:
-            return None
+        types = self._get_types()
         if not types and options:
             return options[0]
         for pattern in types:
@@ -707,7 +748,7 @@ class Accept(object):
         return self.headerval
 
 
-def _req_environ_property(environ_field):
+def _req_environ_property(environ_field, is_wsgi_string_field=True):
     """
     Set and retrieve value of the environ_field entry in self.environ.
     (Used by both request and response)
@@ -716,9 +757,14 @@ def _req_environ_property(environ_field):
         return self.environ.get(environ_field, None)
 
     def setter(self, value):
-        if isinstance(value, six.text_type):
+        if six.PY2 and isinstance(value, six.text_type):
             self.environ[environ_field] = value.encode('utf-8')
+        elif not six.PY2 and isinstance(value, six.binary_type):
+            self.environ[environ_field] = value.decode('latin1')
         else:
+            if not six.PY2 and is_wsgi_string_field:
+                # Check that input is valid before setting
+                value.encode('latin1')
             self.environ[environ_field] = value
 
     return property(getter, setter, doc=("Get and set the %s property "
@@ -737,6 +783,8 @@ def _req_body_property():
         return body
 
     def setter(self, value):
+        if not isinstance(value, six.binary_type):
+            value = value.encode('utf8')
         self.environ['wsgi.input'] = WsgiBytesIO(value)
         self.environ['CONTENT_LENGTH'] = str(len(value))
 
@@ -803,7 +851,8 @@ class Request(object):
     user_agent = _req_environ_property('HTTP_USER_AGENT')
     query_string = _req_environ_property('QUERY_STRING')
     if_match = _req_fancy_property(Match, 'if-match')
-    body_file = _req_environ_property('wsgi.input')
+    body_file = _req_environ_property('wsgi.input',
+                                      is_wsgi_string_field=False)
     content_length = _header_int_property('content-length')
     if_modified_since = _datetime_property('if-modified-since')
     if_unmodified_since = _datetime_property('if-unmodified-since')
@@ -811,7 +860,7 @@ class Request(object):
     charset = None
     _params_cache = None
     _timestamp = None
-    acl = _req_environ_property('swob.ACL')
+    acl = _req_environ_property('swob.ACL', is_wsgi_string_field=False)
 
     def __init__(self, environ):
         self.environ = environ
@@ -831,8 +880,15 @@ class Request(object):
         """
         headers = headers or {}
         environ = environ or {}
-        if isinstance(path, six.text_type):
+        if six.PY2 and isinstance(path, six.text_type):
             path = path.encode('utf-8')
+        elif not six.PY2:
+            if isinstance(path, six.binary_type):
+                path = path.decode('latin1')
+            else:
+                # Check that the input is valid
+                path.encode('latin1')
+
         parsed_path = urllib.parse.urlparse(path)
         server_name = 'localhost'
         if parsed_path.netloc:
@@ -844,11 +900,16 @@ class Request(object):
                            'https': 443}.get(parsed_path.scheme, 80)
         if parsed_path.scheme and parsed_path.scheme not in ['http', 'https']:
             raise TypeError('Invalid scheme: %s' % parsed_path.scheme)
+        if six.PY2:
+            path_info = urllib.parse.unquote(parsed_path.path)
+        else:
+            path_info = urllib.parse.unquote(parsed_path.path,
+                                             encoding='latin-1')
         env = {
             'REQUEST_METHOD': 'GET',
             'SCRIPT_NAME': '',
             'QUERY_STRING': parsed_path.query,
-            'PATH_INFO': urllib.parse.unquote(parsed_path.path),
+            'PATH_INFO': path_info,
             'SERVER_NAME': server_name,
             'SERVER_PORT': str(server_port),
             'HTTP_HOST': '%s:%d' % (server_name, server_port),
@@ -861,6 +922,8 @@ class Request(object):
         }
         env.update(environ)
         if body is not None:
+            if not isinstance(body, six.binary_type):
+                body = body.encode('utf8')
             env['wsgi.input'] = WsgiBytesIO(body)
             env['CONTENT_LENGTH'] = str(len(body))
         elif 'wsgi.input' not in env:
@@ -924,8 +987,13 @@ class Request(object):
     @property
     def path(self):
         "Provides the full path of the request, excluding the QUERY_STRING"
-        return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
-                                  self.environ['PATH_INFO'])
+        if six.PY2:
+            return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
+                                      self.environ['PATH_INFO'])
+        else:
+            return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
+                                      self.environ['PATH_INFO'],
+                                      encoding='latin-1')
 
     @property
     def swift_entity_path(self):
@@ -998,6 +1066,8 @@ class Request(object):
             app_iter = output
         if not captured:
             app_iter = reiterate(app_iter)
+        if not captured:
+            raise RuntimeError('application never called start_response')
         return (captured[0], captured[1], app_iter)
 
     def get_response(self, application):
@@ -1029,7 +1099,7 @@ class Request(object):
                                trailing data, raises ValueError.
         :returns: list of segments with a length of maxsegs (non-existent
                   segments will return as None)
-        :raises: ValueError if given an invalid path
+        :raises ValueError: if given an invalid path
         """
         return split_path(
             self.environ.get('SCRIPT_NAME', '') + self.environ['PATH_INFO'],
@@ -1066,19 +1136,20 @@ def content_range_header_value(start, stop, size):
 
 
 def content_range_header(start, stop, size):
-    return "Content-Range: " + content_range_header_value(start, stop, size)
+    value = content_range_header_value(start, stop, size)
+    return b"Content-Range: " + value.encode('ascii')
 
 
 def multi_range_iterator(ranges, content_type, boundary, size, sub_iter_gen):
     for start, stop in ranges:
-        yield ''.join(['--', boundary, '\r\n',
-                       'Content-Type: ', content_type, '\r\n'])
-        yield content_range_header(start, stop, size) + '\r\n\r\n'
+        yield b''.join([b'--', boundary, b'\r\n',
+                       b'Content-Type: ', content_type, b'\r\n'])
+        yield content_range_header(start, stop, size) + b'\r\n\r\n'
         sub_iter = sub_iter_gen(start, stop)
         for chunk in sub_iter:
             yield chunk
-        yield '\r\n'
-    yield '--' + boundary + '--'
+        yield b'\r\n'
+    yield b'--' + boundary + b'--'
 
 
 class Response(object):
@@ -1107,11 +1178,15 @@ class Response(object):
         self.conditional_response = conditional_response
         self._conditional_etag = conditional_etag
         self.request = request
+        self._app_iter = None
+        # Allow error messages to come as natural strings on py3.
+        if isinstance(body, six.text_type):
+            body = body.encode('utf8')
         self.body = body
         self.app_iter = app_iter
         self.response_iter = None
         self.status = status
-        self.boundary = "%.32x" % random.randint(0, 256 ** 16)
+        self.boundary = b"%.32x" % random.randint(0, 256 ** 16)
         if request:
             self.environ = request.environ
         else:
@@ -1158,20 +1233,20 @@ class Response(object):
         """
 
         content_size = self.content_length
-        content_type = self.headers.get('content-type')
-        self.content_type = ''.join(['multipart/byteranges;',
-                                     'boundary=', self.boundary])
+        content_type = self.headers['content-type'].encode('utf8')
+        self.content_type = b''.join([b'multipart/byteranges;',
+                                      b'boundary=', self.boundary])
 
         # This section calculates the total size of the response.
-        section_header_fixed_len = (
+        section_header_fixed_len = sum([
             # --boundary\r\n
-            len(self.boundary) + 4
+            2, len(self.boundary), 2,
             # Content-Type: <type>\r\n
-            + len('Content-Type: ') + len(content_type) + 2
+            len('Content-Type: '), len(content_type), 2,
             # Content-Range: <value>\r\n; <value> accounted for later
-            + len('Content-Range: ') + 2
+            len('Content-Range: '), 2,
             # \r\n at end of headers
-            + 2)
+            2])
 
         body_size = 0
         for start, end in ranges:
@@ -1197,51 +1272,50 @@ class Response(object):
         self.content_range = None
         return content_size, content_type
 
+    def _get_conditional_response_status(self):
+        """Checks for a conditional response from an If-Match
+        or If-Modified. request. If so, returns the correct status code
+        (304 or 412).
+        :returns: conditional response status (304 or 412) or None
+        """
+        if self.conditional_etag and self.request.if_none_match and \
+                self.conditional_etag in self.request.if_none_match:
+            return 304
+
+        if self.conditional_etag and self.request.if_match and \
+                self.conditional_etag not in self.request.if_match:
+            return 412
+
+        if self.status_int == 404 and self.request.if_match \
+                and '*' in self.request.if_match:
+            # If none of the entity tags match, or if "*" is given and no
+            # current entity exists, the server MUST NOT perform the
+            # requested method, and MUST return a 412 (Precondition
+            # Failed) response. [RFC 2616 section 14.24]
+            return 412
+
+        if self.last_modified and self.request.if_modified_since \
+                and self.last_modified <= self.request.if_modified_since:
+            return 304
+
+        if self.last_modified and self.request.if_unmodified_since \
+                and self.last_modified > self.request.if_unmodified_since:
+            return 412
+
+        return None
+
     def _response_iter(self, app_iter, body):
-        etag = self.conditional_etag
         if self.conditional_response and self.request:
-            if etag and self.request.if_none_match and \
-                    etag in self.request.if_none_match:
-                self.status = 304
+            empty_resp = self._get_conditional_response_status()
+            if empty_resp is not None:
+                self.status = empty_resp
                 self.content_length = 0
                 close_if_possible(app_iter)
-                return ['']
-
-            if etag and self.request.if_match and \
-               etag not in self.request.if_match:
-                self.status = 412
-                self.content_length = 0
-                close_if_possible(app_iter)
-                return ['']
-
-            if self.status_int == 404 and self.request.if_match \
-               and '*' in self.request.if_match:
-                # If none of the entity tags match, or if "*" is given and no
-                # current entity exists, the server MUST NOT perform the
-                # requested method, and MUST return a 412 (Precondition
-                # Failed) response. [RFC 2616 section 14.24]
-                self.status = 412
-                self.content_length = 0
-                close_if_possible(app_iter)
-                return ['']
-
-            if self.last_modified and self.request.if_modified_since \
-               and self.last_modified <= self.request.if_modified_since:
-                self.status = 304
-                self.content_length = 0
-                close_if_possible(app_iter)
-                return ['']
-
-            if self.last_modified and self.request.if_unmodified_since \
-               and self.last_modified > self.request.if_unmodified_since:
-                self.status = 412
-                self.content_length = 0
-                close_if_possible(app_iter)
-                return ['']
+                return [b'']
 
         if self.request and self.request.method == 'HEAD':
             # We explicitly do NOT want to set self.content_length to 0 here
-            return ['']
+            return [b'']
 
         if self.conditional_response and self.request and \
                 self.request.range and self.request.range.ranges and \
@@ -1256,6 +1330,20 @@ class Response(object):
                 # body text from RESPONSE_REASONS.
                 body = None
                 app_iter = None
+            elif self.content_length == 0:
+                # If ranges_for_length found ranges but our content length
+                # is 0, then that means we got a suffix-byte-range request
+                # (e.g. "bytes=-512"). This is asking for *up to* the last N
+                # bytes of the file. If we had any bytes to send at all,
+                # we'd return a 206 with an appropriate Content-Range header,
+                # but we can't construct a Content-Range header because we
+                # have no byte indices because we have no bytes.
+                #
+                # The only reasonable thing to do is to return a 200 with
+                # the whole object (all zero bytes of it). This is also what
+                # Apache and Nginx do, so if we're wrong, at least we're in
+                # good company.
+                pass
             elif ranges:
                 range_size = len(ranges)
                 if range_size > 0:
@@ -1305,9 +1393,10 @@ class Response(object):
                 body = '<html><h1>%s</h1><p>%s</p></html>' % (
                     title,
                     exp % defaultdict(lambda: 'unknown', self.__dict__))
+                body = body.encode('utf8')
                 self.content_length = len(body)
                 return [body]
-        return ['']
+        return [b'']
 
     def fix_conditional_response(self):
         """
@@ -1377,7 +1466,7 @@ class Response(object):
         if 'location' in self.headers and \
                 not env.get('swift.leave_relative_location'):
             self.location = self.absolute_location()
-        start_response(self.status, self.headers.items())
+        start_response(self.status, list(self.headers.items()))
         return self.response_iter
 
 
@@ -1420,6 +1509,8 @@ class StatusMap(object):
     """
     def __getitem__(self, key):
         return partial(HTTPException, status=key)
+
+
 status_map = StatusMap()
 
 

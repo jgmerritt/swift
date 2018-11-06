@@ -17,26 +17,15 @@ import errno
 import json
 import os
 import time
-from swift import gettext_ as _
+from resource import getpagesize
 
 from swift import __version__ as swiftver
+from swift import gettext_ as _
+from swift.common.constraints import check_mount
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, Response
 from swift.common.utils import get_logger, config_true_value, \
-    SWIFT_CONF_FILE
-from swift.common.constraints import check_mount
-from resource import getpagesize
-from hashlib import md5
-
-
-MD5_BLOCK_READ_BYTES = 4096
-
-
-def _hash_for_ringfile(f):
-    md5sum = md5()
-    for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), ''):
-        md5sum.update(block)
-    return md5sum.hexdigest()
+    SWIFT_CONF_FILE, md5_hash_for_file
 
 
 class ReconMiddleware(object):
@@ -220,12 +209,14 @@ class ReconMiddleware(object):
                 continue
 
             try:
-                mounted = check_mount(self.devices, entry)
+                check_mount(self.devices, entry)
             except OSError as err:
                 mounted = str(err)
-            mpoint = {'device': entry, 'mounted': mounted}
-            if mpoint['mounted'] is not True:
-                mountlist.append(mpoint)
+            except ValueError:
+                mounted = False
+            else:
+                continue
+            mountlist.append({'device': entry, 'mounted': mounted})
         return mountlist
 
     def get_diskusage(self):
@@ -236,13 +227,14 @@ class ReconMiddleware(object):
                 continue
 
             try:
-                mounted = check_mount(self.devices, entry)
+                check_mount(self.devices, entry)
             except OSError as err:
                 devices.append({'device': entry, 'mounted': str(err),
                                 'size': '', 'used': '', 'avail': ''})
-                continue
-
-            if mounted:
+            except ValueError:
+                devices.append({'device': entry, 'mounted': False,
+                                'size': '', 'used': '', 'avail': ''})
+            else:
                 path = os.path.join(self.devices, entry)
                 disk = os.statvfs(path)
                 capacity = disk.f_bsize * disk.f_blocks
@@ -251,40 +243,29 @@ class ReconMiddleware(object):
                 devices.append({'device': entry, 'mounted': True,
                                 'size': capacity, 'used': used,
                                 'avail': available})
-            else:
-                devices.append({'device': entry, 'mounted': False,
-                                'size': '', 'used': '', 'avail': ''})
         return devices
 
-    def get_ring_md5(self, openr=open):
+    def get_ring_md5(self):
         """get all ring md5sum's"""
         sums = {}
         for ringfile in self.rings:
             if os.path.exists(ringfile):
                 try:
-                    with openr(ringfile, 'rb') as f:
-                        sums[ringfile] = _hash_for_ringfile(f)
+                    sums[ringfile] = md5_hash_for_file(ringfile)
                 except IOError as err:
                     sums[ringfile] = None
                     if err.errno != errno.ENOENT:
                         self.logger.exception(_('Error reading ringfile'))
         return sums
 
-    def get_swift_conf_md5(self, openr=open):
+    def get_swift_conf_md5(self):
         """get md5 of swift.conf"""
-        md5sum = md5()
+        hexsum = None
         try:
-            with openr(SWIFT_CONF_FILE, 'r') as fh:
-                chunk = fh.read(4096)
-                while chunk:
-                    md5sum.update(chunk)
-                    chunk = fh.read(4096)
+            hexsum = md5_hash_for_file(SWIFT_CONF_FILE)
         except IOError as err:
             if err.errno != errno.ENOENT:
                 self.logger.exception(_('Error reading swift.conf'))
-            hexsum = None
-        else:
-            hexsum = md5sum.hexdigest()
         return {SWIFT_CONF_FILE: hexsum}
 
     def get_quarantine_count(self):

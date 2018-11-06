@@ -21,10 +21,12 @@ Created on February 29, 2012
 @author: eamonn-otoole
 '''
 
+import numbers
 import unittest
 
 from swift.common.swob import Request, Response
 from swift.common.middleware import name_check
+from swift.common import utils
 
 MAX_LENGTH = 255
 FORBIDDEN_CHARS = '\'\"<>`'
@@ -64,12 +66,10 @@ class TestNameCheckMiddleware(unittest.TestCase):
 
     def test_maximum_length_from_config(self):
         # test invalid length
-        orig_test_check = self.test_check
-        conf = {'maximum_length': "500"}
-        self.test_check = name_check.filter_factory(conf)(FakeApp())
-        path = '/V1.0/a/c' + 'o' * (500 - 8)
+        app = name_check.filter_factory({'maximum_length': "500"})(FakeApp())
+        path = '/V1.0/a/c/' + 'o' * (500 - 9)
         resp = Request.blank(path, environ={'REQUEST_METHOD': 'PUT'}
-                             ).get_response(self.test_check)
+                             ).get_response(app)
         self.assertEqual(
             resp.body,
             ("Object/Container/Account name longer than the allowed "
@@ -77,12 +77,11 @@ class TestNameCheckMiddleware(unittest.TestCase):
         self.assertEqual(resp.status_int, 400)
 
         # test valid length
-        path = '/V1.0/a/c' + 'o' * (MAX_LENGTH - 10)
+        path = '/V1.0/a/c/' + 'o' * (500 - 10)
         resp = Request.blank(path, environ={'REQUEST_METHOD': 'PUT'}
-                             ).get_response(self.test_check)
+                             ).get_response(app)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.body, 'OK')
-        self.test_check = orig_test_check
 
     def test_invalid_length(self):
         path = '/V1.0/' + 'c' * (MAX_LENGTH - 5)
@@ -115,6 +114,38 @@ class TestNameCheckMiddleware(unittest.TestCase):
                     self.test_check)
             self.assertEqual(resp.body, 'OK')
 
+
+class TestSwiftInfo(unittest.TestCase):
+    def setUp(self):
+        utils._swift_info = {}
+        utils._swift_admin_info = {}
+
+    def test_registered_defaults(self):
+        name_check.filter_factory({})(FakeApp())
+        swift_info = utils.get_swift_info()
+        self.assertTrue('name_check' in swift_info)
+        self.assertTrue(isinstance(
+            swift_info['name_check'].get('maximum_length'),
+            numbers.Integral))
+        self.assertTrue(isinstance(
+            swift_info['name_check'].get('forbidden_chars'),
+            str))
+        self.assertTrue(isinstance(
+            swift_info['name_check'].get('forbidden_regexp'),
+            str))
+
+    def test_registered_configured_options(self):
+        conf = {'maximum_length': 512,
+                'forbidden_chars': '\'\"`',
+                'forbidden_regexp': "/\./|/\.\./|/\.$"}
+        name_check.filter_factory(conf)(FakeApp())
+        swift_info = utils.get_swift_info()
+        self.assertTrue('name_check' in swift_info)
+        self.assertEqual(swift_info['name_check'].get('maximum_length'), 512)
+        self.assertEqual(set(swift_info['name_check'].get('forbidden_chars')),
+                         set('\'\"`'))
+        self.assertEqual(swift_info['name_check'].get('forbidden_regexp'),
+                         "/\./|/\.\./|/\.$")
 
 if __name__ == '__main__':
     unittest.main()

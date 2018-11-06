@@ -19,6 +19,7 @@ import eventlet
 
 from swift.common.utils import cache_from_env, get_logger, register_swift_info
 from swift.proxy.controllers.base import get_account_info, get_container_info
+from swift.common.constraints import valid_api_version
 from swift.common.memcached import MemcacheConnectionError
 from swift.common.swob import Request, Response
 
@@ -109,9 +110,19 @@ class RateLimitMiddleware(object):
         self.ratelimit_whitelist = \
             [acc.strip() for acc in
                 conf.get('account_whitelist', '').split(',') if acc.strip()]
+        if self.ratelimit_whitelist:
+            self.logger.warning('Option account_whitelist is deprecated. Use '
+                                'an internal client to POST a `X-Account-'
+                                'Sysmeta-Global-Write-Ratelimit: WHITELIST` '
+                                'header to the specific accounts instead.')
         self.ratelimit_blacklist = \
             [acc.strip() for acc in
                 conf.get('account_blacklist', '').split(',') if acc.strip()]
+        if self.ratelimit_blacklist:
+            self.logger.warning('Option account_blacklist is deprecated. Use '
+                                'an internal client to POST a `X-Account-'
+                                'Sysmeta-Global-Write-Ratelimit: BLACKLIST` '
+                                'header to the specific accounts instead.')
         self.container_ratelimits = interpret_conf_limits(
             conf, 'container_ratelimit_')
         self.container_listing_ratelimits = interpret_conf_limits(
@@ -183,14 +194,14 @@ class RateLimitMiddleware(object):
         return keys
 
     def _get_sleep_time(self, key, max_rate):
-        '''
+        """
         Returns the amount of time (a float in seconds) that the app
         should sleep.
 
         :param key: a memcache key
         :param max_rate: maximum rate allowed in requests per second
-        :raises: MaxSleepTimeHitError if max sleep time is exceeded.
-        '''
+        :raises MaxSleepTimeHitError: if max sleep time is exceeded.
+        """
         try:
             now_m = int(round(time.time() * self.clock_accuracy))
             time_per_request_m = int(round(self.clock_accuracy / max_rate))
@@ -219,7 +230,7 @@ class RateLimitMiddleware(object):
             return 0
 
     def handle_ratelimit(self, req, account_name, container_name, obj_name):
-        '''
+        """
         Performs rate limiting and account white/black listing.  Sleeps
         if necessary. If self.memcache_client is not set, immediately returns
         None.
@@ -227,7 +238,7 @@ class RateLimitMiddleware(object):
         :param account_name: account name from path
         :param container_name: container name from path
         :param obj_name: object name from path
-        '''
+        """
         if not self.memcache_client:
             return None
 
@@ -295,6 +306,8 @@ class RateLimitMiddleware(object):
         try:
             version, account, container, obj = req.split_path(1, 4, True)
         except ValueError:
+            return self.app(env, start_response)
+        if not valid_api_version(version):
             return self.app(env, start_response)
         ratelimit_resp = self.handle_ratelimit(req, account, container, obj)
         if ratelimit_resp is None:

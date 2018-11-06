@@ -57,6 +57,8 @@ IP address the account server should bind to. The default is 0.0.0.0 which will 
 it bind to all available addresses.
 .IP "\fBbind_port\fR"
 TCP port the account server should bind to. The default is 6202.
+.IP "\fBkeep_idle\fR"
+Value to set for socket TCP_KEEPIDLE. The default value is 600.
 .IP "\fBbind_timeout\fR"
 Timeout to bind socket. The default is 30.
 .IP \fBbacklog\fR
@@ -386,7 +388,11 @@ Connection timeout to external services. The default is 0.5 seconds.
 .IP \fBdelay_reaping\fR
 Normally, the reaper begins deleting account information for deleted accounts
 immediately; you can set this to delay its work however. The value is in
-seconds. The default is 0.
+seconds. The default is 0.  The sum of this value and the
+container-updater interval should be less than the account-replicator
+reclaim_age. This ensures that once the account-reaper has deleted a
+container there is sufficient time for the container-updater to report to the
+account before the account DB is removed.
 .IP \fBreap_warn_after\fR
 If the account fails to be be reaped due to a persistent error, the
 account reaper will log a message such as:
@@ -419,9 +425,9 @@ Ignored if IOPRIO_CLASS_IDLE is set.
 .LP
 More in depth documentation about the swift-account-server and
 also OpenStack Swift as a whole can be found at
-.BI http://swift.openstack.org/admin_guide.html
+.BI https://docs.openstack.org/swift/latest/admin_guide.html
 and
-.BI http://swift.openstack.org
+.BI https://docs.openstack.org/swift/latest/
 
 
 .SH "SEE ALSO"

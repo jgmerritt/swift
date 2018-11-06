@@ -23,22 +23,41 @@ from contextlib import closing
 from gzip import GzipFile
 from tempfile import mkdtemp
 from shutil import rmtree
-from test.unit import FakeLogger
+from test import listen_zero
+from test.unit import (
+    make_timestamp_iter, debug_logger, patch_policies, mocked_http_conn,
+    FakeLogger)
 from time import time
 from distutils.dir_util import mkpath
 
-from eventlet import spawn, Timeout, listen
+from eventlet import spawn, Timeout
 
 from swift.obj import updater as object_updater
-from swift.obj.diskfile import (ASYNCDIR_BASE, get_async_dir, DiskFileManager,
-                                get_tmp_dir)
+from swift.obj.diskfile import (
+    ASYNCDIR_BASE, get_async_dir, DiskFileManager, get_tmp_dir)
 from swift.common.ring import RingData
 from swift.common import utils
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import hash_path, normalize_timestamp, mkdirs, \
-    write_pickle
-from test.unit import debug_logger, patch_policies, mocked_http_conn
+from swift.common.utils import (
+    hash_path, normalize_timestamp, mkdirs, write_pickle)
 from swift.common.storage_policy import StoragePolicy, POLICIES
+
+
+class MockPool(object):
+    def __init__(self, *a, **kw):
+        pass
+
+    def spawn(self, func, *args, **kwargs):
+        func(*args, **kwargs)
+
+    def waitall(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a, **kw):
+        pass
 
 
 _mocked_policies = [StoragePolicy(0, 'zero', False),
@@ -63,7 +82,9 @@ class TestObjectUpdater(unittest.TestCase):
                           {'id': 1, 'ip': '127.0.0.1', 'port': 1,
                            'device': 'sda1', 'zone': 2},
                           {'id': 2, 'ip': '127.0.0.1', 'port': 1,
-                           'device': 'sda1', 'zone': 4}], 30),
+                           'device': 'sda1', 'zone': 4},
+                          {'id': 3, 'ip': '127.0.0.1', 'port': 1,
+                           'device': 'sda1', 'zone': 6}], 30),
                 f)
         self.devices_dir = os.path.join(self.testdir, 'devices')
         os.mkdir(self.devices_dir)
@@ -72,6 +93,7 @@ class TestObjectUpdater(unittest.TestCase):
         for policy in POLICIES:
             os.mkdir(os.path.join(self.sda1, get_tmp_dir(policy)))
         self.logger = debug_logger()
+        self.ts_iter = make_timestamp_iter()
 
     def tearDown(self):
         rmtree(self.testdir, ignore_errors=1)
@@ -92,6 +114,52 @@ class TestObjectUpdater(unittest.TestCase):
         self.assertEqual(ou.node_timeout, 5.5)
         self.assertTrue(ou.get_container_ring() is not None)
 
+    def test_conf_params(self):
+        # defaults
+        daemon = object_updater.ObjectUpdater({}, logger=self.logger)
+        self.assertEqual(daemon.devices, '/srv/node')
+        self.assertEqual(daemon.mount_check, True)
+        self.assertEqual(daemon.swift_dir, '/etc/swift')
+        self.assertEqual(daemon.interval, 300)
+        self.assertEqual(daemon.concurrency, 8)
+        self.assertEqual(daemon.updater_workers, 1)
+        self.assertEqual(daemon.max_objects_per_second, 50.0)
+
+        # non-defaults
+        conf = {
+            'devices': '/some/where/else',
+            'mount_check': 'huh?',
+            'swift_dir': '/not/here',
+            'interval': '600',
+            'concurrency': '2',
+            'updater_workers': '3',
+            'objects_per_second': '10.5',
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        self.assertEqual(daemon.devices, '/some/where/else')
+        self.assertEqual(daemon.mount_check, False)
+        self.assertEqual(daemon.swift_dir, '/not/here')
+        self.assertEqual(daemon.interval, 600)
+        self.assertEqual(daemon.concurrency, 2)
+        self.assertEqual(daemon.updater_workers, 3)
+        self.assertEqual(daemon.max_objects_per_second, 10.5)
+
+        # check deprecated option
+        daemon = object_updater.ObjectUpdater({'slowdown': '0.04'},
+                                              logger=self.logger)
+        self.assertEqual(daemon.max_objects_per_second, 20.0)
+
+        def check_bad(conf):
+            with self.assertRaises(ValueError):
+                object_updater.ObjectUpdater(conf, logger=self.logger)
+
+        check_bad({'interval': 'foo'})
+        check_bad({'interval': '300.0'})
+        check_bad({'concurrency': 'bar'})
+        check_bad({'concurrency': '1.0'})
+        check_bad({'slowdown': 'baz'})
+        check_bad({'objects_per_second': 'quux'})
+
     @mock.patch('os.listdir')
     def test_listdir_with_exception(self, mock_listdir):
         e = OSError('permission_denied')
@@ -102,11 +170,10 @@ class TestObjectUpdater(unittest.TestCase):
             'mount_check': 'false',
             'swift_dir': self.testdir,
         }
-        daemon = object_updater.ObjectUpdater(conf)
-        daemon.logger = FakeLogger()
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
         paths = daemon._listdir('foo/bar')
         self.assertEqual([], paths)
-        log_lines = daemon.logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         msg = ('ERROR: Unable to access foo/bar: permission_denied')
         self.assertEqual(log_lines[0], msg)
 
@@ -118,10 +185,9 @@ class TestObjectUpdater(unittest.TestCase):
             'mount_check': 'false',
             'swift_dir': self.testdir,
         }
-        daemon = object_updater.ObjectUpdater(conf)
-        daemon.logger = FakeLogger()
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
         path = daemon._listdir('foo/bar/')
-        log_lines = daemon.logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(len(log_lines), 0)
         self.assertEqual(path, ['foo', 'bar'])
 
@@ -188,10 +254,8 @@ class TestObjectUpdater(unittest.TestCase):
             if should_skip:
                 # if we were supposed to skip over the dir, we didn't process
                 # anything at all
-                self.assertTrue(os.path.exists(prefix_dir))
                 self.assertEqual(set(), seen)
             else:
-                self.assertTrue(not os.path.exists(prefix_dir))
                 self.assertEqual(expected, seen)
 
             # test cleanup: the tempdir gets cleaned up between runs, but this
@@ -206,9 +270,128 @@ class TestObjectUpdater(unittest.TestCase):
         # a warning indicating that the '99' policy isn't valid
         check_with_idx('99', 1, should_skip=True)
 
-    @mock.patch.object(object_updater, 'ismount')
-    def test_run_once_with_disk_unmounted(self, mock_ismount):
-        mock_ismount.return_value = False
+    def test_sweep_logs(self):
+        asyncdir = os.path.join(self.sda1, ASYNCDIR_BASE)
+        prefix_dir = os.path.join(asyncdir, 'abc')
+        mkpath(prefix_dir)
+
+        for o, t in [('abc', 123), ('def', 234), ('ghi', 345),
+                     ('jkl', 456), ('mno', 567)]:
+            ohash = hash_path('account', 'container', o)
+            o_path = os.path.join(prefix_dir, ohash + '-' +
+                                  normalize_timestamp(t))
+            write_pickle({}, o_path)
+
+        class MockObjectUpdater(object_updater.ObjectUpdater):
+            def process_object_update(self, update_path, device, policy):
+                os.unlink(update_path)
+                self.stats.successes += 1
+                self.stats.unlinks += 1
+
+        logger = FakeLogger()
+        ou = MockObjectUpdater({
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+            'interval': '1',
+            'concurrency': '1',
+            'report_interval': '10.0',
+            'node_timeout': '5'}, logger=logger)
+
+        now = [time()]
+
+        def mock_time_function():
+            rv = now[0]
+            now[0] += 5
+            return rv
+
+        # With 10s between updates, time() advancing 5s every time we look,
+        # and 5 async_pendings on disk, we should get at least two progress
+        # lines.
+        with mock.patch('swift.obj.updater.time',
+                        mock.MagicMock(time=mock_time_function)), \
+                mock.patch.object(object_updater, 'ContextPool', MockPool):
+            ou.object_sweep(self.sda1)
+
+        info_lines = logger.get_lines_for_level('info')
+        self.assertEqual(4, len(info_lines))
+        self.assertIn("sweep starting", info_lines[0])
+        self.assertIn(self.sda1, info_lines[0])
+
+        self.assertIn("sweep progress", info_lines[1])
+        # the space ensures it's a positive number
+        self.assertIn(
+            "2 successes, 0 failures, 0 quarantines, 2 unlinks, 0 errors, "
+            "0 redirects",
+            info_lines[1])
+        self.assertIn(self.sda1, info_lines[1])
+
+        self.assertIn("sweep progress", info_lines[2])
+        self.assertIn(
+            "4 successes, 0 failures, 0 quarantines, 4 unlinks, 0 errors, "
+            "0 redirects",
+            info_lines[2])
+        self.assertIn(self.sda1, info_lines[2])
+
+        self.assertIn("sweep complete", info_lines[3])
+        self.assertIn(
+            "5 successes, 0 failures, 0 quarantines, 5 unlinks, 0 errors, "
+            "0 redirects",
+            info_lines[3])
+        self.assertIn(self.sda1, info_lines[3])
+
+    def test_sweep_logs_multiple_policies(self):
+        for policy in _mocked_policies:
+            asyncdir = os.path.join(self.sda1, get_async_dir(policy.idx))
+            prefix_dir = os.path.join(asyncdir, 'abc')
+            mkpath(prefix_dir)
+
+            for o, t in [('abc', 123), ('def', 234), ('ghi', 345)]:
+                ohash = hash_path('account', 'container%d' % policy.idx, o)
+                o_path = os.path.join(prefix_dir, ohash + '-' +
+                                      normalize_timestamp(t))
+                write_pickle({}, o_path)
+
+        class MockObjectUpdater(object_updater.ObjectUpdater):
+            def process_object_update(self, update_path, device, policy):
+                os.unlink(update_path)
+                self.stats.successes += 1
+                self.stats.unlinks += 1
+
+        logger = FakeLogger()
+        ou = MockObjectUpdater({
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+            'interval': '1',
+            'concurrency': '1',
+            'report_interval': '10.0',
+            'node_timeout': '5'}, logger=logger)
+
+        now = [time()]
+
+        def mock_time():
+            rv = now[0]
+            now[0] += 0.01
+            return rv
+
+        with mock.patch('swift.obj.updater.time',
+                        mock.MagicMock(time=mock_time)):
+            ou.object_sweep(self.sda1)
+
+        completion_lines = [l for l in logger.get_lines_for_level('info')
+                            if "sweep complete" in l]
+
+        self.assertEqual(len(completion_lines), 1)
+        self.assertIn("sweep complete", completion_lines[0])
+        self.assertIn(
+            "6 successes, 0 failures, 0 quarantines, 6 unlinks, 0 errors, "
+            "0 redirects",
+            completion_lines[0])
+
+    @mock.patch.object(object_updater, 'check_drive')
+    def test_run_once_with_disk_unmounted(self, mock_check_drive):
+        mock_check_drive.side_effect = ValueError
         ou = object_updater.ObjectUpdater({
             'devices': self.devices_dir,
             'mount_check': 'false',
@@ -221,8 +404,12 @@ class TestObjectUpdater(unittest.TestCase):
         os.mkdir(async_dir)
         ou.run_once()
         self.assertTrue(os.path.exists(async_dir))
-        # mount_check == False means no call to ismount
-        self.assertEqual([], mock_ismount.mock_calls)
+        # each run calls check_device
+        self.assertEqual([
+            mock.call(self.devices_dir, 'sda1', False),
+            mock.call(self.devices_dir, 'sda1', False),
+        ], mock_check_drive.mock_calls)
+        mock_check_drive.reset_mock()
 
         ou = object_updater.ObjectUpdater({
             'devices': self.devices_dir,
@@ -237,15 +424,14 @@ class TestObjectUpdater(unittest.TestCase):
         ou.run_once()
         self.assertTrue(os.path.exists(async_dir))
         self.assertTrue(os.path.exists(odd_dir))  # skipped - not mounted!
-        # mount_check == True means ismount was checked
         self.assertEqual([
-            mock.call(self.sda1),
-        ], mock_ismount.mock_calls)
-        self.assertEqual(ou.logger.get_increment_counts(), {'errors': 1})
+            mock.call(self.devices_dir, 'sda1', True),
+        ], mock_check_drive.mock_calls)
+        self.assertEqual(ou.logger.get_increment_counts(), {})
 
-    @mock.patch.object(object_updater, 'ismount')
-    def test_run_once(self, mock_ismount):
-        mock_ismount.return_value = True
+    @mock.patch.object(object_updater, 'check_drive')
+    def test_run_once(self, mock_check_drive):
+        mock_check_drive.side_effect = lambda r, d, mc: os.path.join(r, d)
         ou = object_updater.ObjectUpdater({
             'devices': self.devices_dir,
             'mount_check': 'false',
@@ -258,8 +444,12 @@ class TestObjectUpdater(unittest.TestCase):
         os.mkdir(async_dir)
         ou.run_once()
         self.assertTrue(os.path.exists(async_dir))
-        # mount_check == False means no call to ismount
-        self.assertEqual([], mock_ismount.mock_calls)
+        # each run calls check_device
+        self.assertEqual([
+            mock.call(self.devices_dir, 'sda1', False),
+            mock.call(self.devices_dir, 'sda1', False),
+        ], mock_check_drive.mock_calls)
+        mock_check_drive.reset_mock()
 
         ou = object_updater.ObjectUpdater({
             'devices': self.devices_dir,
@@ -273,11 +463,9 @@ class TestObjectUpdater(unittest.TestCase):
         os.mkdir(odd_dir)
         ou.run_once()
         self.assertTrue(os.path.exists(async_dir))
-        self.assertTrue(not os.path.exists(odd_dir))
-        # mount_check == True means ismount was checked
         self.assertEqual([
-            mock.call(self.sda1),
-        ], mock_ismount.mock_calls)
+            mock.call(self.devices_dir, 'sda1', True),
+        ], mock_check_drive.mock_calls)
 
         ohash = hash_path('a', 'c', 'o')
         odir = os.path.join(async_dir, ohash[-3:])
@@ -303,7 +491,7 @@ class TestObjectUpdater(unittest.TestCase):
                          {'failures': 1, 'unlinks': 1})
         self.assertIsNone(pickle.load(open(op_path)).get('successes'))
 
-        bindsock = listen(('127.0.0.1', 0))
+        bindsock = listen_zero()
 
         def accepter(sock, return_code):
             try:
@@ -378,7 +566,13 @@ class TestObjectUpdater(unittest.TestCase):
         err = event.wait()
         if err:
             raise err
-        self.assertTrue(not os.path.exists(op_path))
+
+        # we remove the async_pending and its containing suffix dir, but not
+        # anything above that
+        self.assertFalse(os.path.exists(op_path))
+        self.assertFalse(os.path.exists(os.path.dirname(op_path)))
+        self.assertTrue(os.path.exists(os.path.dirname(os.path.dirname(
+            op_path))))
         self.assertEqual(ou.logger.get_increment_counts(),
                          {'unlinks': 1, 'successes': 1})
 
@@ -432,10 +626,31 @@ class TestObjectUpdater(unittest.TestCase):
                              {'successes': 1, 'unlinks': 1,
                               'async_pendings': 1})
 
+    def _write_async_update(self, dfmanager, timestamp, policy,
+                            headers=None, container_path=None):
+        # write an async
+        account, container, obj = 'a', 'c', 'o'
+        op = 'PUT'
+        headers_out = headers or {
+            'x-size': 0,
+            'x-content-type': 'text/plain',
+            'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
+            'x-timestamp': timestamp.internal,
+            'X-Backend-Storage-Policy-Index': int(policy),
+            'User-Agent': 'object-server %s' % os.getpid()
+        }
+        data = {'op': op, 'account': account, 'container': container,
+                'obj': obj, 'headers': headers_out}
+        if container_path:
+            data['container_path'] = container_path
+        dfmanager.pickle_async_update(self.sda1, account, container, obj,
+                                      data, timestamp, policy)
+
     def test_obj_put_async_updates(self):
-        ts = (normalize_timestamp(t) for t in
-              itertools.count(int(time())))
-        policy = random.choice(list(POLICIES))
+        ts_iter = make_timestamp_iter()
+        policies = list(POLICIES)
+        random.shuffle(policies)
+
         # setup updater
         conf = {
             'devices': self.devices_dir,
@@ -443,46 +658,492 @@ class TestObjectUpdater(unittest.TestCase):
             'swift_dir': self.testdir,
         }
         daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
-        async_dir = os.path.join(self.sda1, get_async_dir(policy))
+        async_dir = os.path.join(self.sda1, get_async_dir(policies[0]))
         os.mkdir(async_dir)
 
-        # write an async
-        dfmanager = DiskFileManager(conf, daemon.logger)
-        account, container, obj = 'a', 'c', 'o'
-        op = 'PUT'
-        headers_out = HeaderKeyDict({
+        def do_test(headers_out, expected, container_path=None):
+            # write an async
+            dfmanager = DiskFileManager(conf, daemon.logger)
+            self._write_async_update(dfmanager, next(ts_iter), policies[0],
+                                     headers=headers_out,
+                                     container_path=container_path)
+            request_log = []
+
+            def capture(*args, **kwargs):
+                request_log.append((args, kwargs))
+
+            # run once
+            fake_status_codes = [
+                200,  # object update success
+                200,  # object update success
+                200,  # object update conflict
+            ]
+            with mocked_http_conn(*fake_status_codes, give_connect=capture):
+                daemon.run_once()
+            self.assertEqual(len(fake_status_codes), len(request_log))
+            for request_args, request_kwargs in request_log:
+                ip, part, method, path, headers, qs, ssl = request_args
+                self.assertEqual(method, 'PUT')
+                self.assertDictEqual(expected, headers)
+            self.assertEqual(
+                daemon.logger.get_increment_counts(),
+                {'successes': 1, 'unlinks': 1, 'async_pendings': 1})
+            self.assertFalse(os.listdir(async_dir))
+            daemon.logger.clear()
+
+        ts = next(ts_iter)
+        # use a dict rather than HeaderKeyDict so we can vary the case of the
+        # pickled headers
+        headers_out = {
             'x-size': 0,
             'x-content-type': 'text/plain',
             'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
-            'x-timestamp': next(ts),
-            'X-Backend-Storage-Policy-Index': int(policy),
-        })
-        data = {'op': op, 'account': account, 'container': container,
-                'obj': obj, 'headers': headers_out}
-        dfmanager.pickle_async_update(self.sda1, account, container, obj,
-                                      data, next(ts), policy)
+            'x-timestamp': ts.normal,
+            'X-Backend-Storage-Policy-Index': int(policies[0]),
+            'User-Agent': 'object-server %s' % os.getpid()
+        }
+        expected = {
+            'X-Size': '0',
+            'X-Content-Type': 'text/plain',
+            'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
+            'X-Timestamp': ts.normal,
+            'X-Backend-Storage-Policy-Index': str(int(policies[0])),
+            'User-Agent': 'object-updater %s' % os.getpid(),
+            'X-Backend-Accept-Redirect': 'true',
+        }
+        # always expect X-Backend-Accept-Redirect to be true
+        do_test(headers_out, expected, container_path='.shards_a/shard_c')
+        do_test(headers_out, expected)
 
-        request_log = []
+        # ...unless X-Backend-Accept-Redirect is already set
+        expected['X-Backend-Accept-Redirect'] = 'false'
+        headers_out_2 = dict(headers_out)
+        headers_out_2['X-Backend-Accept-Redirect'] = 'false'
+        do_test(headers_out_2, expected)
 
-        def capture(*args, **kwargs):
-            request_log.append((args, kwargs))
+        # updater should add policy header if missing
+        expected['X-Backend-Accept-Redirect'] = 'true'
+        headers_out['X-Backend-Storage-Policy-Index'] = None
+        do_test(headers_out, expected)
+
+        # updater should not overwrite a mismatched policy header
+        headers_out['X-Backend-Storage-Policy-Index'] = int(policies[1])
+        expected['X-Backend-Storage-Policy-Index'] = str(int(policies[1]))
+        do_test(headers_out, expected)
+
+        # check for case insensitivity
+        headers_out['user-agent'] = headers_out.pop('User-Agent')
+        headers_out['x-backend-storage-policy-index'] = headers_out.pop(
+            'X-Backend-Storage-Policy-Index')
+        do_test(headers_out, expected)
+
+    def _check_update_requests(self, requests, timestamp, policy):
+        # do some sanity checks on update request
+        expected_headers = {
+            'X-Size': '0',
+            'X-Content-Type': 'text/plain',
+            'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
+            'X-Timestamp': timestamp.internal,
+            'X-Backend-Storage-Policy-Index': str(int(policy)),
+            'User-Agent': 'object-updater %s' % os.getpid(),
+            'X-Backend-Accept-Redirect': 'true'}
+        for request in requests:
+            self.assertEqual('PUT', request['method'])
+            self.assertDictEqual(expected_headers, request['headers'])
+
+    def test_obj_put_async_root_update_redirected(self):
+        policies = list(POLICIES)
+        random.shuffle(policies)
+        # setup updater
+        conf = {
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        async_dir = os.path.join(self.sda1, get_async_dir(policies[0]))
+        os.mkdir(async_dir)
+        dfmanager = DiskFileManager(conf, daemon.logger)
+
+        ts_obj = next(self.ts_iter)
+        self._write_async_update(dfmanager, ts_obj, policies[0])
 
         # run once
-        fake_status_codes = [
-            200,  # object update success
-            200,  # object update success
-            200,  # object update conflict
+        ts_redirect_1 = next(self.ts_iter)
+        ts_redirect_2 = next(self.ts_iter)
+        fake_responses = [
+            # first round of update attempts, newest redirect should be chosen
+            (200, {}),
+            (301, {'Location': '/.shards_a/c_shard_new/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_2.internal}),
+            (301, {'Location': '/.shards_a/c_shard_old/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_1.internal}),
+            # second round of update attempts
+            (200, {}),
+            (200, {}),
+            (200, {}),
         ]
-        with mocked_http_conn(*fake_status_codes, give_connect=capture):
-            daemon.run_once()
-        self.assertEqual(len(fake_status_codes), len(request_log))
-        for request_args, request_kwargs in request_log:
-            ip, part, method, path, headers, qs, ssl = request_args
-            self.assertEqual(method, 'PUT')
-            self.assertEqual(headers['X-Backend-Storage-Policy-Index'],
-                             str(int(policy)))
-        self.assertEqual(daemon.logger.get_increment_counts(),
-                         {'successes': 1, 'unlinks': 1, 'async_pendings': 1})
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+
+        self._check_update_requests(conn.requests[:3], ts_obj, policies[0])
+        self._check_update_requests(conn.requests[3:], ts_obj, policies[0])
+        self.assertEqual(['/sda1/0/a/c/o'] * 3 +
+                         ['/sda1/0/.shards_a/c_shard_new/o'] * 3,
+                         [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 1, 'successes': 1,
+             'unlinks': 1, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        self.assertFalse(os.listdir(async_dir))  # no async file
+
+    def test_obj_put_async_root_update_redirected_previous_success(self):
+        policies = list(POLICIES)
+        random.shuffle(policies)
+        # setup updater
+        conf = {
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        async_dir = os.path.join(self.sda1, get_async_dir(policies[0]))
+        os.mkdir(async_dir)
+        dfmanager = DiskFileManager(conf, daemon.logger)
+
+        ts_obj = next(self.ts_iter)
+        self._write_async_update(dfmanager, ts_obj, policies[0])
+        orig_async_path, orig_async_data = self._check_async_file(async_dir)
+
+        # run once
+        with mocked_http_conn(
+                507, 200, 507) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+
+        self._check_update_requests(conn.requests, ts_obj, policies[0])
+        self.assertEqual(['/sda1/0/a/c/o'] * 3,
+                         [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'failures': 1, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        async_path, async_data = self._check_async_file(async_dir)
+        self.assertEqual(dict(orig_async_data, successes=[1]), async_data)
+
+        # run again - expect 3 redirected updates despite previous success
+        ts_redirect = next(self.ts_iter)
+        resp_headers_1 = {'Location': '/.shards_a/c_shard_1/o',
+                          'X-Backend-Redirect-Timestamp': ts_redirect.internal}
+        fake_responses = (
+            # 1st round of redirects, 2nd round of redirects
+            [(301, resp_headers_1)] * 2 + [(200, {})] * 3)
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+
+        self._check_update_requests(conn.requests[:2], ts_obj, policies[0])
+        self._check_update_requests(conn.requests[2:], ts_obj, policies[0])
+        root_part = daemon.container_ring.get_part('a/c')
+        shard_1_part = daemon.container_ring.get_part('.shards_a/c_shard_1')
+        self.assertEqual(
+            ['/sda1/%s/a/c/o' % root_part] * 2 +
+            ['/sda1/%s/.shards_a/c_shard_1/o' % shard_1_part] * 3,
+            [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 1, 'successes': 1, 'failures': 1, 'unlinks': 1,
+             'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        self.assertFalse(os.listdir(async_dir))  # no async file
+
+    def _check_async_file(self, async_dir):
+        async_subdirs = os.listdir(async_dir)
+        self.assertEqual([mock.ANY], async_subdirs)
+        async_files = os.listdir(os.path.join(async_dir, async_subdirs[0]))
+        self.assertEqual([mock.ANY], async_files)
+        async_path = os.path.join(
+            async_dir, async_subdirs[0], async_files[0])
+        with open(async_path) as fd:
+            async_data = pickle.load(fd)
+        return async_path, async_data
+
+    def _check_obj_put_async_update_bad_redirect_headers(self, headers):
+        policies = list(POLICIES)
+        random.shuffle(policies)
+        # setup updater
+        conf = {
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        async_dir = os.path.join(self.sda1, get_async_dir(policies[0]))
+        os.mkdir(async_dir)
+        dfmanager = DiskFileManager(conf, daemon.logger)
+
+        ts_obj = next(self.ts_iter)
+        self._write_async_update(dfmanager, ts_obj, policies[0])
+        orig_async_path, orig_async_data = self._check_async_file(async_dir)
+
+        fake_responses = [
+            (301, headers),
+            (301, headers),
+            (301, headers),
+        ]
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+
+        self._check_update_requests(conn.requests, ts_obj, policies[0])
+        self.assertEqual(['/sda1/0/a/c/o'] * 3,
+                         [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'failures': 1, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        # async file still intact
+        async_path, async_data = self._check_async_file(async_dir)
+        self.assertEqual(orig_async_path, async_path)
+        self.assertEqual(orig_async_data, async_data)
+        return daemon
+
+    def test_obj_put_async_root_update_missing_location_header(self):
+        headers = {
+            'X-Backend-Redirect-Timestamp': next(self.ts_iter).internal}
+        self._check_obj_put_async_update_bad_redirect_headers(headers)
+
+    def test_obj_put_async_root_update_bad_location_header(self):
+        headers = {
+            'Location': 'bad bad bad',
+            'X-Backend-Redirect-Timestamp': next(self.ts_iter).internal}
+        daemon = self._check_obj_put_async_update_bad_redirect_headers(headers)
+        error_lines = daemon.logger.get_lines_for_level('error')
+        self.assertIn('Container update failed', error_lines[0])
+        self.assertIn('Invalid path: bad%20bad%20bad', error_lines[0])
+
+    def test_obj_put_async_shard_update_redirected_twice(self):
+        policies = list(POLICIES)
+        random.shuffle(policies)
+        # setup updater
+        conf = {
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        async_dir = os.path.join(self.sda1, get_async_dir(policies[0]))
+        os.mkdir(async_dir)
+        dfmanager = DiskFileManager(conf, daemon.logger)
+
+        ts_obj = next(self.ts_iter)
+        self._write_async_update(dfmanager, ts_obj, policies[0],
+                                 container_path='.shards_a/c_shard_older')
+        orig_async_path, orig_async_data = self._check_async_file(async_dir)
+
+        # run once
+        ts_redirect_1 = next(self.ts_iter)
+        ts_redirect_2 = next(self.ts_iter)
+        ts_redirect_3 = next(self.ts_iter)
+        fake_responses = [
+            # 1st round of redirects, newest redirect should be chosen
+            (301, {'Location': '/.shards_a/c_shard_old/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_1.internal}),
+            (301, {'Location': '/.shards_a/c_shard_new/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_2.internal}),
+            (301, {'Location': '/.shards_a/c_shard_old/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_1.internal}),
+            # 2nd round of redirects
+            (301, {'Location': '/.shards_a/c_shard_newer/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_3.internal}),
+            (301, {'Location': '/.shards_a/c_shard_newer/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_3.internal}),
+            (301, {'Location': '/.shards_a/c_shard_newer/o',
+                   'X-Backend-Redirect-Timestamp': ts_redirect_3.internal}),
+        ]
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+
+        self._check_update_requests(conn.requests, ts_obj, policies[0])
+        # only *one* set of redirected requests is attempted per cycle
+        older_part = daemon.container_ring.get_part('.shards_a/c_shard_older')
+        new_part = daemon.container_ring.get_part('.shards_a/c_shard_new')
+        newer_part = daemon.container_ring.get_part('.shards_a/c_shard_newer')
+        self.assertEqual(
+            ['/sda1/%s/.shards_a/c_shard_older/o' % older_part] * 3 +
+            ['/sda1/%s/.shards_a/c_shard_new/o' % new_part] * 3,
+            [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 2, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        # update failed, we still have pending file with most recent redirect
+        # response Location header value added to data
+        async_path, async_data = self._check_async_file(async_dir)
+        self.assertEqual(orig_async_path, async_path)
+        self.assertEqual(
+            dict(orig_async_data, container_path='.shards_a/c_shard_newer',
+                 redirect_history=['.shards_a/c_shard_new',
+                                   '.shards_a/c_shard_newer']),
+            async_data)
+
+        # next cycle, should get latest redirect from pickled async update
+        fake_responses = [(200, {})] * 3
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+
+        self._check_update_requests(conn.requests, ts_obj, policies[0])
+        self.assertEqual(
+            ['/sda1/%s/.shards_a/c_shard_newer/o' % newer_part] * 3,
+            [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 2, 'successes': 1, 'unlinks': 1,
+             'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        self.assertFalse(os.listdir(async_dir))  # no async file
+
+    def test_obj_put_async_update_redirection_loop(self):
+        policies = list(POLICIES)
+        random.shuffle(policies)
+        # setup updater
+        conf = {
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+        }
+        daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
+        async_dir = os.path.join(self.sda1, get_async_dir(policies[0]))
+        os.mkdir(async_dir)
+        dfmanager = DiskFileManager(conf, daemon.logger)
+
+        ts_obj = next(self.ts_iter)
+        self._write_async_update(dfmanager, ts_obj, policies[0])
+        orig_async_path, orig_async_data = self._check_async_file(async_dir)
+
+        # run once
+        ts_redirect = next(self.ts_iter)
+
+        resp_headers_1 = {'Location': '/.shards_a/c_shard_1/o',
+                          'X-Backend-Redirect-Timestamp': ts_redirect.internal}
+        resp_headers_2 = {'Location': '/.shards_a/c_shard_2/o',
+                          'X-Backend-Redirect-Timestamp': ts_redirect.internal}
+        fake_responses = (
+            # 1st round of redirects, 2nd round of redirects
+            [(301, resp_headers_1)] * 3 + [(301, resp_headers_2)] * 3)
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+        self._check_update_requests(conn.requests[:3], ts_obj, policies[0])
+        self._check_update_requests(conn.requests[3:], ts_obj, policies[0])
+        # only *one* set of redirected requests is attempted per cycle
+        root_part = daemon.container_ring.get_part('a/c')
+        shard_1_part = daemon.container_ring.get_part('.shards_a/c_shard_1')
+        shard_2_part = daemon.container_ring.get_part('.shards_a/c_shard_2')
+        shard_3_part = daemon.container_ring.get_part('.shards_a/c_shard_3')
+        self.assertEqual(['/sda1/%s/a/c/o' % root_part] * 3 +
+                         ['/sda1/%s/.shards_a/c_shard_1/o' % shard_1_part] * 3,
+                         [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 2, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        # update failed, we still have pending file with most recent redirect
+        # response Location header value added to data
+        async_path, async_data = self._check_async_file(async_dir)
+        self.assertEqual(orig_async_path, async_path)
+        self.assertEqual(
+            dict(orig_async_data, container_path='.shards_a/c_shard_2',
+                 redirect_history=['.shards_a/c_shard_1',
+                                   '.shards_a/c_shard_2']),
+            async_data)
+
+        # next cycle, more redirects! first is to previously visited location
+        resp_headers_3 = {'Location': '/.shards_a/c_shard_3/o',
+                          'X-Backend-Redirect-Timestamp': ts_redirect.internal}
+        fake_responses = (
+            # 1st round of redirects, 2nd round of redirects
+            [(301, resp_headers_1)] * 3 + [(301, resp_headers_3)] * 3)
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+        self._check_update_requests(conn.requests[:3], ts_obj, policies[0])
+        self._check_update_requests(conn.requests[3:], ts_obj, policies[0])
+        # first try the previously persisted container path, response to that
+        # creates a loop so ignore and send to root
+        self.assertEqual(
+            ['/sda1/%s/.shards_a/c_shard_2/o' % shard_2_part] * 3 +
+            ['/sda1/%s/a/c/o' % root_part] * 3,
+            [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 4, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        # update failed, we still have pending file with most recent redirect
+        # response Location header value from root added to persisted data
+        async_path, async_data = self._check_async_file(async_dir)
+        self.assertEqual(orig_async_path, async_path)
+        # note: redirect_history was reset when falling back to root
+        self.assertEqual(
+            dict(orig_async_data, container_path='.shards_a/c_shard_3',
+                 redirect_history=['.shards_a/c_shard_3']),
+            async_data)
+
+        # next cycle, more redirects! first is to a location visited previously
+        # but not since last fall back to root, so that location IS tried;
+        # second is to a location visited since last fall back to root so that
+        # location is NOT tried
+        fake_responses = (
+            # 1st round of redirects, 2nd round of redirects
+            [(301, resp_headers_1)] * 3 + [(301, resp_headers_3)] * 3)
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+        self._check_update_requests(conn.requests, ts_obj, policies[0])
+        self.assertEqual(
+            ['/sda1/%s/.shards_a/c_shard_3/o' % shard_3_part] * 3 +
+            ['/sda1/%s/.shards_a/c_shard_1/o' % shard_1_part] * 3,
+            [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 6, 'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        # update failed, we still have pending file, but container_path is None
+        # because most recent redirect location was a repeat
+        async_path, async_data = self._check_async_file(async_dir)
+        self.assertEqual(orig_async_path, async_path)
+        self.assertEqual(
+            dict(orig_async_data, container_path=None,
+                 redirect_history=[]),
+            async_data)
+
+        # next cycle, persisted container path is None so update should go to
+        # root, this time it succeeds
+        fake_responses = [(200, {})] * 3
+        fake_status_codes, fake_headers = zip(*fake_responses)
+        with mocked_http_conn(
+                *fake_status_codes, headers=fake_headers) as conn:
+            with mock.patch('swift.obj.updater.dump_recon_cache'):
+                daemon.run_once()
+        self._check_update_requests(conn.requests, ts_obj, policies[0])
+        self.assertEqual(['/sda1/%s/a/c/o' % root_part] * 3,
+                         [req['path'] for req in conn.requests])
+        self.assertEqual(
+            {'redirects': 6, 'successes': 1, 'unlinks': 1,
+             'async_pendings': 1},
+            daemon.logger.get_increment_counts())
+        self.assertFalse(os.listdir(async_dir))  # no async file
 
 
 if __name__ == '__main__':

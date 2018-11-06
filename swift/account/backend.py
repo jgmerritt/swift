@@ -17,13 +17,13 @@ Pluggable Back-end for Account Server
 """
 
 from uuid import uuid4
-import time
-import six.moves.cPickle as pickle
 
 import sqlite3
 
+import six
+
 from swift.common.utils import Timestamp
-from swift.common.db import DatabaseBroker, utf8encode
+from swift.common.db import DatabaseBroker, utf8encode, zero_like
 
 DATADIR = 'accounts'
 
@@ -154,7 +154,7 @@ class AccountBroker(DatabaseBroker):
         conn.execute('''
             UPDATE account_stat SET account = ?, created_at = ?, id = ?,
                    put_timestamp = ?, status_changed_at = ?
-            ''', (self.account, Timestamp(time.time()).internal, str(uuid4()),
+            ''', (self.account, Timestamp.now().internal, str(uuid4()),
                   put_timestamp, put_timestamp))
 
     def create_policy_stat_table(self, conn):
@@ -205,12 +205,11 @@ class AccountBroker(DatabaseBroker):
 
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
-        loaded = pickle.loads(entry.decode('base64'))
         # check to see if the update includes policy_index or not
         (name, put_timestamp, delete_timestamp, object_count, bytes_used,
-         deleted) = loaded[:6]
-        if len(loaded) > 6:
-            storage_policy_index = loaded[6]
+         deleted) = entry[:6]
+        if len(entry) > 6:
+            storage_policy_index = entry[6]
         else:
             # legacy support during upgrade until first non legacy storage
             # policy is defined
@@ -234,7 +233,7 @@ class AccountBroker(DatabaseBroker):
         with self.get() as conn:
             row = conn.execute(
                 'SELECT container_count from account_stat').fetchone()
-            return (row[0] == 0)
+            return zero_like(row[0])
 
     def make_tuple_for_pickle(self, record):
         return (record['name'], record['put_timestamp'],
@@ -247,7 +246,7 @@ class AccountBroker(DatabaseBroker):
         """
         Create a container with the given attributes.
 
-        :param name: name of the container to create
+        :param name: name of the container to create (a native string)
         :param put_timestamp: put_timestamp of the container to create
         :param delete_timestamp: delete_timestamp of the container to create
         :param object_count: number of objects in the container
@@ -255,7 +254,7 @@ class AccountBroker(DatabaseBroker):
         :param storage_policy_index:  the storage policy for this container
         """
         if Timestamp(delete_timestamp) > Timestamp(put_timestamp) and \
-                object_count in (None, '', 0, '0'):
+                zero_like(object_count):
             deleted = 1
         else:
             deleted = 0
@@ -274,8 +273,7 @@ class AccountBroker(DatabaseBroker):
 
         :returns: True if the DB is considered to be deleted, False otherwise
         """
-        return status == 'DELETED' or (
-            container_count in (None, '', 0, '0') and
+        return status == 'DELETED' or zero_like(container_count) and (
             Timestamp(delete_timestamp) > Timestamp(put_timestamp))
 
     def _is_deleted(self, conn):
@@ -338,7 +336,12 @@ class AccountBroker(DatabaseBroker):
                     else:
                         columns.remove('container_count')
                     info = run_query()
-                elif "no such table: policy_stat" not in str(err):
+                elif "no such table: policy_stat" in str(err):
+                    if do_migrations:
+                        self.create_policy_stat_table(conn)
+                        info = run_query()
+                    # else, pass and let the results be empty
+                else:
                     raise
 
         policy_stats = {}
@@ -379,11 +382,13 @@ class AccountBroker(DatabaseBroker):
         :param delimiter: delimiter for query
         :param reverse: reverse the result order.
 
-        :returns: list of tuples of (name, object_count, bytes_used, 0)
+        :returns: list of tuples of (name, object_count, bytes_used,
+                  put_timestamp, 0)
         """
         delim_force_gte = False
-        (marker, end_marker, prefix, delimiter) = utf8encode(
-            marker, end_marker, prefix, delimiter)
+        if six.PY2:
+            (marker, end_marker, prefix, delimiter) = utf8encode(
+                marker, end_marker, prefix, delimiter)
         if reverse:
             # Reverse the markers if we are reversing the listing.
             marker, end_marker = end_marker, marker
@@ -397,7 +402,7 @@ class AccountBroker(DatabaseBroker):
             results = []
             while len(results) < limit:
                 query = """
-                    SELECT name, object_count, bytes_used, 0
+                    SELECT name, object_count, bytes_used, put_timestamp, 0
                     FROM container
                     WHERE """
                 query_args = []
@@ -413,7 +418,7 @@ class AccountBroker(DatabaseBroker):
                     query_args.append(marker)
                     # Always set back to False
                     delim_force_gte = False
-                elif marker and marker >= prefix:
+                elif marker and (not prefix or marker >= prefix):
                     query += ' name > ? AND'
                     query_args.append(marker)
                 elif prefix:
@@ -459,7 +464,7 @@ class AccountBroker(DatabaseBroker):
                             delim_force_gte = True
                         dir_name = name[:end + 1]
                         if dir_name != orig_marker:
-                            results.append([dir_name, 0, 0, 1])
+                            results.append([dir_name, 0, 0, '0', 1])
                         curs.close()
                         break
                     results.append(row)
@@ -509,7 +514,7 @@ class AccountBroker(DatabaseBroker):
                         record[2] = row[2]
                     # If deleted, mark as such
                     if Timestamp(record[2]) > Timestamp(record[1]) and \
-                            record[3] in (None, '', 0, '0'):
+                            zero_like(record[3]):
                         record[5] = 1
                     else:
                         record[5] = 0

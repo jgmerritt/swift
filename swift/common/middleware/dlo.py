@@ -119,10 +119,8 @@ Here's an example using ``curl`` with tiny 1-byte segments::
 """
 
 import json
-import os
 
 import six
-from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
 from six.moves.urllib.parse import unquote
 
 from hashlib import md5
@@ -132,10 +130,9 @@ from swift.common.http import is_success
 from swift.common.swob import Request, Response, \
     HTTPRequestedRangeNotSatisfiable, HTTPBadRequest, HTTPConflict
 from swift.common.utils import get_logger, \
-    RateLimitedIterator, read_conf_dir, quote, close_if_possible, \
-    closing_if_possible
+    RateLimitedIterator, quote, close_if_possible, closing_if_possible
 from swift.common.request_helpers import SegmentedIterable
-from swift.common.wsgi import WSGIContext, make_subrequest
+from swift.common.wsgi import WSGIContext, make_subrequest, load_app_config
 
 
 class GetContext(WSGIContext):
@@ -151,12 +148,14 @@ class GetContext(WSGIContext):
             method='GET',
             headers={'x-auth-token': req.headers.get('x-auth-token')},
             agent=('%(orig)s ' + 'DLO MultipartGET'), swift_source='DLO')
-        con_req.query_string = 'format=json&prefix=%s' % quote(prefix)
+        con_req.query_string = 'prefix=%s' % quote(prefix)
         if marker:
             con_req.query_string += '&marker=%s' % quote(marker)
 
         con_resp = con_req.get_response(self.dlo.app)
         if not is_success(con_resp.status_int):
+            if req.method == 'HEAD':
+                con_resp.body = ''
             return con_resp, None
         with closing_if_possible(con_resp.app_iter):
             return None, json.loads(''.join(con_resp.app_iter))
@@ -191,16 +190,20 @@ class GetContext(WSGIContext):
                 if isinstance(seg_name, six.text_type):
                     seg_name = seg_name.encode("utf-8")
 
-                # (obj path, etag, size, first byte, last byte)
-                yield ("/" + "/".join((version, account, container,
-                                       seg_name)),
-                       # We deliberately omit the etag and size here;
-                       # SegmentedIterable will check size and etag if
-                       # specified, but we don't want it to. DLOs only care
-                       # that the objects' names match the specified prefix.
-                       None, None,
-                       (None if first_byte <= 0 else first_byte),
-                       (None if last_byte >= seg_length - 1 else last_byte))
+                # We deliberately omit the etag and size here;
+                # SegmentedIterable will check size and etag if
+                # specified, but we don't want it to. DLOs only care
+                # that the objects' names match the specified prefix.
+                # SegmentedIterable will instead check that the data read
+                # from each segment matches the response headers.
+                _path = "/".join(["", version, account, container, seg_name])
+                _first = None if first_byte <= 0 else first_byte
+                _last = None if last_byte >= seg_length - 1 else last_byte
+                yield {
+                    'path': _path,
+                    'first_byte': _first,
+                    'last_byte': _last
+                }
 
                 first_byte = max(first_byte - seg_length, -1)
                 last_byte = max(last_byte - seg_length, -1)
@@ -232,8 +235,6 @@ class GetContext(WSGIContext):
         container = unquote(container)
         obj_prefix = unquote(obj_prefix)
 
-        # manifest might point to a different container
-        req.acl = None
         version, account, _junk = req.split_path(2, 3, True)
         error_response, segments = self._get_container_listing(
             req, version, account, container, obj_prefix)
@@ -383,26 +384,12 @@ class DynamicLargeObject(object):
                 '__file__' not in conf):
             return
 
-        cp = ConfigParser()
-        if os.path.isdir(conf['__file__']):
-            read_conf_dir(cp, conf['__file__'])
-        else:
-            cp.read(conf['__file__'])
-
-        try:
-            pipe = cp.get("pipeline:main", "pipeline")
-        except (NoSectionError, NoOptionError):
-            return
-
-        proxy_name = pipe.rsplit(None, 1)[-1]
-        proxy_section = "app:" + proxy_name
+        proxy_conf = load_app_config(conf['__file__'])
         for setting in ('rate_limit_after_segment',
                         'rate_limit_segments_per_sec',
                         'max_get_time'):
-            try:
-                conf[setting] = cp.get(proxy_section, setting)
-            except (NoSectionError, NoOptionError):
-                pass
+            if setting in proxy_conf:
+                conf[setting] = proxy_conf[setting]
 
     def __call__(self, env, start_response):
         """

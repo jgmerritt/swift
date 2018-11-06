@@ -18,11 +18,13 @@
 from __future__ import print_function
 
 from eventlet.green import socket
+from six import string_types
 from six.moves.urllib.parse import urlparse
-from swift.common.utils import SWIFT_CONF_FILE
+
+from swift.common.utils import (
+    SWIFT_CONF_FILE, md5_hash_for_file, set_swift_dir)
 from swift.common.ring import Ring
-from swift.common.storage_policy import POLICIES
-from hashlib import md5
+from swift.common.storage_policy import POLICIES, reload_storage_policies
 import eventlet
 import json
 import optparse
@@ -75,7 +77,7 @@ class Scout(object):
 
     def scout_host(self, base_url, recon_type):
         """
-        Perform the actual HTTP request to obtain swift recon telemtry.
+        Perform the actual HTTP request to obtain swift recon telemetry.
 
         :param base_url: the base url of the host you wish to check. str of the
                         format 'http://127.0.0.1:6200/recon/'
@@ -85,6 +87,8 @@ class Scout(object):
         url = base_url + recon_type
         try:
             body = urllib2.urlopen(url, timeout=self.timeout).read()
+            if six.PY3 and isinstance(body, six.binary_type):
+                body = body.decode('utf8')
             content = json.loads(body)
             if self.verbose:
                 print("-> %s: %s" % (url, content))
@@ -127,7 +131,7 @@ class Scout(object):
             req = urllib2.Request(url)
             req.get_method = lambda: 'OPTIONS'
             conn = urllib2.urlopen(req)
-            header = conn.info().getheader('Server')
+            header = conn.info().get('Server')
             server_header = header.split('/')
             content = server_header[0]
             status = 200
@@ -194,21 +198,6 @@ class SwiftRecon(object):
         else:
             return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-    def _md5_file(self, path):
-        """
-        Get the MD5 checksum of a file.
-
-        :param path: path to file
-        :returns: MD5 checksum, hex encoded
-        """
-        md5sum = md5()
-        with open(path, 'rb') as f:
-            block = f.read(4096)
-            while block:
-                md5sum.update(block)
-                block = f.read(4096)
-        return md5sum.hexdigest()
-
     def get_hosts(self, region_filter, zone_filter, swift_dir, ring_names):
         """
         Get a list of hosts in the rings.
@@ -242,21 +231,15 @@ class SwiftRecon(object):
         if self.server_type == 'object':
             for ring_name in os.listdir(swift_dir):
                 if ring_name.startswith('object') and \
-                        ring_name.endswith('ring.gz'):
+                        ring_name.endswith('.ring.gz'):
                     ring_names.add(ring_name)
         else:
             ring_name = '%s.ring.gz' % self.server_type
             ring_names.add(ring_name)
         rings = {}
         for ring_name in ring_names:
-            md5sum = md5()
-            with open(os.path.join(swift_dir, ring_name), 'rb') as f:
-                block = f.read(4096)
-                while block:
-                    md5sum.update(block)
-                    block = f.read(4096)
-            ring_sum = md5sum.hexdigest()
-            rings[ring_name] = ring_sum
+            rings[ring_name] = md5_hash_for_file(
+                os.path.join(swift_dir, ring_name))
         recon = Scout("ringmd5", self.verbose, self.suppress_errors,
                       self.timeout)
         print("[%s] Checking ring md5sums" % self._ptime())
@@ -298,7 +281,7 @@ class SwiftRecon(object):
         """
         matches = 0
         errors = 0
-        conf_sum = self._md5_file(SWIFT_CONF_FILE)
+        conf_sum = md5_hash_for_file(SWIFT_CONF_FILE)
         recon = Scout("swiftconfmd5", self.verbose, self.suppress_errors,
                       self.timeout)
         printfn("[%s] Checking swift.conf md5sum" % self._ptime())
@@ -886,14 +869,16 @@ class SwiftRecon(object):
                     host = urlparse(url).netloc.split(':')[0]
                     print('%.02f%%  %s' % (used, '%-15s %s' % (host, device)))
 
-    def time_check(self, hosts):
+    def time_check(self, hosts, jitter=0.0):
         """
         Check a time synchronization of hosts with current time
 
         :param hosts: set of hosts to check. in the format of:
             set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+        :param jitter: Maximal allowed time jitter
         """
 
+        jitter = abs(jitter)
         matches = 0
         errors = 0
         recon = Scout("time", self.verbose, self.suppress_errors,
@@ -904,13 +889,13 @@ class SwiftRecon(object):
             if status != 200:
                 errors = errors + 1
                 continue
-            if (ts_remote < ts_start or ts_remote > ts_end):
+            if (ts_remote + jitter < ts_start or ts_remote - jitter > ts_end):
                 diff = abs(ts_end - ts_remote)
                 ts_end_f = self._ptime(ts_end)
                 ts_remote_f = self._ptime(ts_remote)
 
                 print("!! %s current time is %s, but remote is %s, "
-                      "differs by %.2f sec" % (
+                      "differs by %.4f sec" % (
                           url,
                           ts_end_f,
                           ts_remote_f,
@@ -923,8 +908,43 @@ class SwiftRecon(object):
             matches, len(hosts), errors))
         print("=" * 79)
 
+    def version_check(self, hosts):
+        """
+        Check OS Swift version of hosts. Inform if differs.
+
+        :param hosts: set of hosts to check. in the format of:
+            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+        """
+        versions = set()
+        errors = 0
+        print("[%s] Checking versions" % self._ptime())
+        recon = Scout("version", self.verbose, self.suppress_errors,
+                      self.timeout)
+        for url, response, status, ts_start, ts_end in self.pool.imap(
+                recon.scout, hosts):
+            if status != 200:
+                errors = errors + 1
+                continue
+            versions.add(response['version'])
+            if self.verbose:
+                print("-> %s installed version %s" % (
+                    url, response['version']))
+
+        if not len(versions):
+            print("No hosts returned valid data.")
+        elif len(versions) == 1:
+            print("Versions matched (%s), "
+                  "%s error[s] while checking hosts." % (
+                      versions.pop(), errors))
+        else:
+            print("Versions not matched (%s), "
+                  "%s error[s] while checking hosts." % (
+                      ", ".join(sorted(versions)), errors))
+
+        print("=" * 79)
+
     def _get_ring_names(self, policy=None):
-        '''
+        """
         Retrieve name of ring files.
 
         If no policy is passed and the server type is object,
@@ -933,11 +953,13 @@ class SwiftRecon(object):
         :param policy: name or index of storage policy, only applicable
          with server_type==object.
          :returns: list of ring names.
-        '''
+        """
         if self.server_type == 'object':
             ring_names = [p.ring_name for p in POLICIES if (
                 p.name == policy or not policy or (
-                    policy.isdigit() and int(policy) == int(p)))]
+                    policy.isdigit() and int(policy) == int(p) or
+                    (isinstance(policy, string_types)
+                     and policy in p.aliases)))]
         else:
             ring_names = [self.server_type]
 
@@ -995,6 +1017,10 @@ class SwiftRecon(object):
                         help="Get drive audit error stats")
         args.add_option('--time', '-T', action="store_true",
                         help="Check time synchronization")
+        args.add_option('--jitter', type="float", default=0.0,
+                        help="Maximal allowed time jitter")
+        args.add_option('--swift-versions', action="store_true",
+                        help="Check swift versions")
         args.add_option('--top', type='int', metavar='COUNT', default=0,
                         help='Also show the top COUNT entries in rank order.')
         args.add_option('--lowest', type='int', metavar='COUNT', default=0,
@@ -1003,7 +1029,7 @@ class SwiftRecon(object):
         args.add_option('--all', action="store_true",
                         help="Perform all checks. Equal to \t\t\t-arudlqT "
                         "--md5 --sockstat --auditor --updater --expirer "
-                        "--driveaudit --validate-servers")
+                        "--driveaudit --validate-servers --swift-versions")
         args.add_option('--region', type="int",
                         help="Only query servers in specified region")
         args.add_option('--zone', '-z', type="int",
@@ -1034,6 +1060,9 @@ class SwiftRecon(object):
             server_types = ['object']
 
         swift_dir = options.swiftdir
+        if set_swift_dir(swift_dir):
+            reload_storage_policies()
+
         self.verbose = options.verbose
         self.suppress_errors = options.suppress
         self.timeout = options.timeout
@@ -1072,7 +1101,8 @@ class SwiftRecon(object):
                 self.socket_usage(hosts)
                 self.server_type_check(hosts)
                 self.driveaudit_check(hosts)
-                self.time_check(hosts)
+                self.time_check(hosts, options.jitter)
+                self.version_check(hosts)
             else:
                 if options.async:
                     if self.server_type == 'object':
@@ -1121,7 +1151,9 @@ class SwiftRecon(object):
                 if options.driveaudit:
                     self.driveaudit_check(hosts)
                 if options.time:
-                    self.time_check(hosts)
+                    self.time_check(hosts, options.jitter)
+                if options.swift_versions:
+                    self.version_check(hosts)
 
 
 def main():

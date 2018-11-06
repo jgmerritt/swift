@@ -12,15 +12,18 @@
 # limitations under the License.
 
 
+import logging
 import os
 import string
+import sys
 import textwrap
 import six
 from six.moves.configparser import ConfigParser
 from swift.common.utils import (
-    config_true_value, SWIFT_CONF_FILE, whataremyips, list_from_csv)
+    config_true_value, quorum_size, whataremyips, list_from_csv,
+    config_positive_int_value, get_zero_indexed_base_string, load_pkg_resource)
 from swift.common.ring import Ring, RingData
-from swift.common.utils import quorum_size
+from swift.common import utils
 from swift.common.exceptions import RingLoadError
 from pyeclib.ec_iface import ECDriver, ECDriverError, VALID_EC_TYPES
 
@@ -89,11 +92,7 @@ class PolicyError(ValueError):
 
 
 def _get_policy_string(base, policy_index):
-    if policy_index == 0 or policy_index is None:
-        return_string = base
-    else:
-        return_string = base + "-%d" % int(policy_index)
-    return return_string
+    return get_zero_indexed_base_string(base, policy_index)
 
 
 def get_policy_string(base, policy_or_index):
@@ -108,7 +107,7 @@ def get_policy_string(base, policy_or_index):
                             storage Policy-0 is assumed.
 
     :returns: base name with policy index added
-    :raises: PolicyError if no policy exists with the given policy_index
+    :raises PolicyError: if no policy exists with the given policy_index
     """
     if isinstance(policy_or_index, BaseStoragePolicy):
         policy = policy_or_index
@@ -127,7 +126,7 @@ def split_policy_string(policy_string):
 
     :param policy_string: base name with policy index added
 
-    :raises: PolicyError if given index does not map to a valid policy
+    :raises PolicyError: if given index does not map to a valid policy
     :returns: a tuple, in the form (base, policy) where base is the base
               string and policy is the StoragePolicy instance for the
               index encoded in the policy_string.
@@ -158,7 +157,8 @@ class BaseStoragePolicy(object):
     policy_type_to_policy_cls = {}
 
     def __init__(self, idx, name='', is_default=False, is_deprecated=False,
-                 object_ring=None, aliases=''):
+                 object_ring=None, aliases='',
+                 diskfile_module='egg:swift#replication.fs'):
         # do not allow BaseStoragePolicy class to be instantiated directly
         if type(self) == BaseStoragePolicy:
             raise TypeError("Can't instantiate BaseStoragePolicy directly")
@@ -188,6 +188,8 @@ class BaseStoragePolicy(object):
         self.ring_name = _get_policy_string('object', self.idx)
         self.object_ring = object_ring
 
+        self.diskfile_module = diskfile_module
+
     @property
     def name(self):
         return self.alias_list[0]
@@ -204,8 +206,17 @@ class BaseStoragePolicy(object):
     def __int__(self):
         return self.idx
 
-    def __cmp__(self, other):
-        return cmp(self.idx, int(other))
+    def __eq__(self, other):
+        return self.idx == int(other)
+
+    def __ne__(self, other):
+        return self.idx != int(other)
+
+    def __lt__(self, other):
+        return self.idx < int(other)
+
+    def __gt__(self, other):
+        return self.idx > int(other)
 
     def __repr__(self):
         return ("%s(%d, %r, is_default=%s, "
@@ -244,6 +255,7 @@ class BaseStoragePolicy(object):
             'policy_type': 'policy_type',
             'default': 'is_default',
             'deprecated': 'is_deprecated',
+            'diskfile_module': 'diskfile_module'
         }
 
     @classmethod
@@ -277,6 +289,7 @@ class BaseStoragePolicy(object):
             if not self.is_deprecated:
                 info.pop('deprecated')
             info.pop('policy_type')
+            info.pop('diskfile_module')
         return info
 
     def _validate_policy_name(self, name):
@@ -285,7 +298,7 @@ class BaseStoragePolicy(object):
         to check policy names before setting them.
 
         :param name: a name string for a single policy name.
-        :raises: PolicyError if the policy name is invalid.
+        :raises PolicyError: if the policy name is invalid.
         """
         if not name:
             raise PolicyError('Invalid name %r' % name, self.idx)
@@ -368,6 +381,32 @@ class BaseStoragePolicy(object):
         """
         raise NotImplementedError()
 
+    def get_diskfile_manager(self, *args, **kwargs):
+        """
+        Return an instance of the diskfile manager class configured for this
+        storage policy.
+
+        :param args: positional args to pass to the diskfile manager
+            constructor.
+        :param kwargs: keyword args to pass to the diskfile manager
+            constructor.
+        :return: A disk file manager instance.
+        """
+        try:
+            dfm_cls = load_pkg_resource('swift.diskfile', self.diskfile_module)
+        except ImportError as err:
+            raise PolicyError(
+                'Unable to load diskfile_module %s for policy %s: %s' %
+                (self.diskfile_module, self.name, err))
+        try:
+            dfm_cls.check_policy(self)
+        except ValueError as err:
+            raise PolicyError(
+                'Invalid diskfile_module %s for policy %s:%s (%s)' %
+                (self.diskfile_module, int(self), self.name, self.policy_type))
+
+        return dfm_cls(*args, **kwargs)
+
 
 @BaseStoragePolicy.register(REPL_POLICY)
 class StoragePolicy(BaseStoragePolicy):
@@ -403,12 +442,15 @@ class ECStoragePolicy(BaseStoragePolicy):
 
     def __init__(self, idx, name='', aliases='', is_default=False,
                  is_deprecated=False, object_ring=None,
+                 diskfile_module='egg:swift#erasure_coding.fs',
                  ec_segment_size=DEFAULT_EC_OBJECT_SEGMENT_SIZE,
-                 ec_type=None, ec_ndata=None, ec_nparity=None):
+                 ec_type=None, ec_ndata=None, ec_nparity=None,
+                 ec_duplication_factor=1):
 
         super(ECStoragePolicy, self).__init__(
             idx=idx, name=name, aliases=aliases, is_default=is_default,
-            is_deprecated=is_deprecated, object_ring=object_ring)
+            is_deprecated=is_deprecated, object_ring=object_ring,
+            diskfile_module=diskfile_module)
 
         # Validate erasure_coding policy specific members
         # ec_type is one of the EC implementations supported by PyEClib
@@ -453,6 +495,22 @@ class ECStoragePolicy(BaseStoragePolicy):
             raise PolicyError('Invalid ec_object_segment_size %r' %
                               ec_segment_size, index=self.idx)
 
+        if self._ec_type == 'isa_l_rs_vand' and self._ec_nparity >= 5:
+            logger = logging.getLogger("swift.common.storage_policy")
+            if not logger.handlers:
+                # If nothing else, log to stderr
+                logger.addHandler(logging.StreamHandler(sys.__stderr__))
+            logger.warning(
+                'Storage policy %s uses an EC configuration known to harm '
+                'data durability. Any data in this policy should be migrated. '
+                'See https://bugs.launchpad.net/swift/+bug/1639691 for '
+                'more information.' % self.name)
+            if not is_deprecated:
+                raise PolicyError(
+                    'Storage policy %s uses an EC configuration known to harm '
+                    'data durability. This policy MUST be deprecated.'
+                    % self.name)
+
         # Initialize PyECLib EC backend
         try:
             self.pyeclib_driver = \
@@ -467,6 +525,9 @@ class ECStoragePolicy(BaseStoragePolicy):
             self._ec_ndata + self.pyeclib_driver.min_parity_fragments_needed()
         self._fragment_size = None
 
+        self._ec_duplication_factor = \
+            config_positive_int_value(ec_duplication_factor)
+
     @property
     def ec_type(self):
         return self._ec_type
@@ -478,6 +539,10 @@ class ECStoragePolicy(BaseStoragePolicy):
     @property
     def ec_nparity(self):
         return self._ec_nparity
+
+    @property
+    def ec_n_unique_fragments(self):
+        return self._ec_ndata + self._ec_nparity
 
     @property
     def ec_segment_size(self):
@@ -516,11 +581,20 @@ class ECStoragePolicy(BaseStoragePolicy):
         """
         return "%s %d+%d" % (self._ec_type, self._ec_ndata, self._ec_nparity)
 
+    @property
+    def ec_duplication_factor(self):
+        return self._ec_duplication_factor
+
     def __repr__(self):
+        extra_info = ''
+        if self.ec_duplication_factor != 1:
+            extra_info = ', ec_duplication_factor=%d' % \
+                self.ec_duplication_factor
         return ("%s, EC config(ec_type=%s, ec_segment_size=%d, "
-                "ec_ndata=%d, ec_nparity=%d)") % \
+                "ec_ndata=%d, ec_nparity=%d%s)") % \
                (super(ECStoragePolicy, self).__repr__(), self.ec_type,
-                self.ec_segment_size, self.ec_ndata, self.ec_nparity)
+                self.ec_segment_size, self.ec_ndata, self.ec_nparity,
+                extra_info)
 
     @classmethod
     def _config_options_map(cls):
@@ -530,6 +604,7 @@ class ECStoragePolicy(BaseStoragePolicy):
             'ec_object_segment_size': 'ec_segment_size',
             'ec_num_data_fragments': 'ec_ndata',
             'ec_num_parity_fragments': 'ec_nparity',
+            'ec_duplication_factor': 'ec_duplication_factor',
         })
         return options
 
@@ -540,13 +615,14 @@ class ECStoragePolicy(BaseStoragePolicy):
             info.pop('ec_num_data_fragments')
             info.pop('ec_num_parity_fragments')
             info.pop('ec_type')
+            info.pop('ec_duplication_factor')
         return info
 
     @property
     def quorum(self):
         """
         Number of successful backend requests needed for the proxy to consider
-        the client request successful.
+        the client PUT request successful.
 
         The quorum size for EC policies defines the minimum number
         of data + parity elements required to be able to guarantee
@@ -562,7 +638,7 @@ class ECStoragePolicy(BaseStoragePolicy):
         for every erasure coding scheme, consult PyECLib for
         min_parity_fragments_needed()
         """
-        return self._ec_quorum_size
+        return self._ec_quorum_size * self.ec_duplication_factor
 
     def load_ring(self, swift_dir):
         """
@@ -583,17 +659,34 @@ class ECStoragePolicy(BaseStoragePolicy):
             considering the number of nodes in the primary list from the ring.
             """
 
-            nodes_configured = len(ring_data._replica2part2dev_id)
-            if nodes_configured != (self.ec_ndata + self.ec_nparity):
+            configured_fragment_count = ring_data.replica_count
+            required_fragment_count = \
+                (self.ec_n_unique_fragments) * self.ec_duplication_factor
+            if configured_fragment_count != required_fragment_count:
                 raise RingLoadError(
                     'EC ring for policy %s needs to be configured with '
-                    'exactly %d replicas. Got %d.' % (
-                        self.name, self.ec_ndata + self.ec_nparity,
-                        nodes_configured))
+                    'exactly %d replicas. Got %s.' % (
+                        self.name, required_fragment_count,
+                        configured_fragment_count))
 
         self.object_ring = Ring(
             swift_dir, ring_name=self.ring_name,
             validation_hook=validate_ring_data)
+
+    def get_backend_index(self, node_index):
+        """
+        Backend index for PyECLib
+
+        :param node_index: integer of node index
+        :return: integer of actual fragment index. if param is not an integer,
+                 return None instead
+        """
+        try:
+            node_index = int(node_index)
+        except ValueError:
+            return None
+
+        return node_index % self.ec_n_unique_fragments
 
 
 class StoragePolicyCollection(object):
@@ -872,13 +965,18 @@ def reload_storage_policies():
     Reload POLICIES from ``swift.conf``.
     """
     global _POLICIES
-    policy_conf = ConfigParser()
-    policy_conf.read(SWIFT_CONF_FILE)
+    if six.PY2:
+        policy_conf = ConfigParser()
+    else:
+        # Python 3.2 disallows section or option duplicates by default
+        # strict=False allows us to preserve the older behavior
+        policy_conf = ConfigParser(strict=False)
+    policy_conf.read(utils.SWIFT_CONF_FILE)
     try:
         _POLICIES = parse_storage_policies(policy_conf)
     except PolicyError as e:
         raise SystemExit('ERROR: Invalid Storage Policy Configuration '
-                         'in %s (%s)' % (SWIFT_CONF_FILE, e))
+                         'in %s (%s)' % (utils.SWIFT_CONF_FILE, e))
 
 
 # parse configuration and setup singleton

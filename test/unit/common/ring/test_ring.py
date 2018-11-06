@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+import collections
 import six.moves.cPickle as pickle
 import os
 import unittest
@@ -23,7 +24,6 @@ from gzip import GzipFile
 from tempfile import mkdtemp
 from shutil import rmtree
 from time import sleep, time
-import random
 import sys
 import copy
 import mock
@@ -35,12 +35,13 @@ from swift.common.ring import utils as ring_utils
 
 
 class TestRingBase(unittest.TestCase):
+    longMessage = True
 
     def setUp(self):
         self._orig_hash_suffix = utils.HASH_PATH_SUFFIX
         self._orig_hash_prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b''
 
     def tearDown(self):
         utils.HASH_PATH_SUFFIX = self._orig_hash_suffix
@@ -149,8 +150,8 @@ class TestRingData(unittest.TestCase):
             [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
         rd.save(ring_fname1)
         rd.save(ring_fname2)
-        with open(ring_fname1) as ring1:
-            with open(ring_fname2) as ring2:
+        with open(ring_fname1, 'rb') as ring1:
+            with open(ring_fname2, 'rb') as ring2:
                 self.assertEqual(ring1.read(), ring2.read())
 
     def test_permissions(self):
@@ -159,8 +160,27 @@ class TestRingData(unittest.TestCase):
             [array.array('H', [0, 1, 0, 1]), array.array('H', [0, 1, 0, 1])],
             [{'id': 0, 'zone': 0}, {'id': 1, 'zone': 1}], 30)
         rd.save(ring_fname)
-        self.assertEqual(oct(stat.S_IMODE(os.stat(ring_fname).st_mode)),
-                         '0644')
+        ring_mode = stat.S_IMODE(os.stat(ring_fname).st_mode)
+        expected_mode = (stat.S_IRUSR | stat.S_IWUSR |
+                         stat.S_IRGRP | stat.S_IROTH)
+        self.assertEqual(
+            ring_mode, expected_mode,
+            'Ring has mode 0%o, expected 0%o' % (ring_mode, expected_mode))
+
+    def test_replica_count(self):
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0, 1]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+        self.assertEqual(rd.replica_count, 2)
+
+        rd = ring.RingData(
+            [[0, 1, 0, 1], [0, 1, 0]],
+            [{'id': 0, 'zone': 0, 'ip': '10.1.1.0', 'port': 7000},
+             {'id': 1, 'zone': 1, 'ip': '10.1.1.1', 'port': 7000}],
+            30)
+        self.assertEqual(rd.replica_count, 1.75)
 
 
 class TestRing(TestRingBase):
@@ -211,18 +231,15 @@ class TestRing(TestRingBase):
         self.assertEqual(self.ring.reload_time, self.intended_reload_time)
         self.assertEqual(self.ring.serialized_path, self.testgz)
         # test invalid endcap
-        _orig_hash_path_suffix = utils.HASH_PATH_SUFFIX
-        _orig_hash_path_prefix = utils.HASH_PATH_PREFIX
-        _orig_swift_conf_file = utils.SWIFT_CONF_FILE
-        try:
-            utils.HASH_PATH_SUFFIX = ''
-            utils.HASH_PATH_PREFIX = ''
-            utils.SWIFT_CONF_FILE = ''
+        with mock.patch.object(utils, 'HASH_PATH_SUFFIX', b''), \
+                mock.patch.object(utils, 'HASH_PATH_PREFIX', b''), \
+                mock.patch.object(utils, 'SWIFT_CONF_FILE', ''):
             self.assertRaises(SystemExit, ring.Ring, self.testdir, 'whatever')
-        finally:
-            utils.HASH_PATH_SUFFIX = _orig_hash_path_suffix
-            utils.HASH_PATH_PREFIX = _orig_hash_path_prefix
-            utils.SWIFT_CONF_FILE = _orig_swift_conf_file
+
+    def test_replica_count(self):
+        self.assertEqual(self.ring.replica_count, 3)
+        self.ring._replica2part2dev_id.append([0])
+        self.assertEqual(self.ring.replica_count, 3.25)
 
     def test_has_changed(self):
         self.assertFalse(self.ring.has_changed())
@@ -477,6 +494,8 @@ class TestRing(TestRingBase):
         self.ring.devs.append(new_dev)
         self.ring._rebuild_tier_data()
 
+    @unittest.skipIf(sys.version_info >= (3,),
+                     "Seed-specific tests don't work well on py3")
     def test_get_more_nodes(self):
         # Yes, these tests are deliberately very fragile. We want to make sure
         # that if someone changes the results the ring produces, they know it.
@@ -874,7 +893,7 @@ class TestRing(TestRingBase):
             else:
                 dev['weight'] = 1.0
             rb.add_dev(dev)
-        rb.rebalance(seed=1)
+        rb.rebalance()
         rb.get_ring().save(self.testgz)
         r = ring.Ring(self.testdir, ring_name='whatever')
 
@@ -898,16 +917,43 @@ class TestRing(TestRingBase):
             def __getitem__(self, key):
                 return self.table[key]
 
-        counting_table = CountingRingTable(r._replica2part2dev_id)
-        r._replica2part2dev_id = counting_table
+        histogram = collections.defaultdict(int)
+        for part in range(r.partition_count):
+            counting_table = CountingRingTable(r._replica2part2dev_id)
+            with mock.patch.object(r, '_replica2part2dev_id', counting_table):
+                node_iter = r.get_more_nodes(part)
+                next(node_iter)
+            histogram[counting_table.count] += 1
+        # Don't let our summing muddy our histogram
+        histogram = dict(histogram)
 
-        part = random.randint(0, r.partition_count)
-        node_iter = r.get_more_nodes(part)
-        next(node_iter)
-        self.assertEqual(5, counting_table.count)
         # sanity
         self.assertEqual(1, r._num_regions)
         self.assertEqual(2, r._num_zones)
+        self.assertEqual(256, r.partition_count)
+
+        # We always do one loop (including the StopIteration) while getting
+        # primaries, so every part should hit next() at least 5 times
+        self.assertEqual(sum(histogram.get(x, 0) for x in range(5)), 0,
+                         histogram)
+
+        # Most of the parts should find a handoff device in the next partition,
+        # but because some of the primary devices may *also* be used for that
+        # partition, that means 5, 6, or 7 calls to next().
+        self.assertGreater(sum(histogram.get(x, 0) for x in range(8)), 160,
+                           histogram)
+
+        # Want 90% confidence that it'll happen within two partitions
+        self.assertGreater(sum(histogram.get(x, 0) for x in range(12)), 230,
+                           histogram)
+
+        # Tail should fall off fairly quickly
+        self.assertLess(sum(histogram.get(x, 0) for x in range(20, 100)), 5,
+                        histogram)
+
+        # Hard limit at 50 (we've seen as bad as 41, 45)
+        self.assertEqual(sum(histogram.get(x, 0) for x in range(50, 100)), 0,
+                         histogram)
 
 
 if __name__ == '__main__':

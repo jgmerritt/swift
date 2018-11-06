@@ -56,6 +56,8 @@ IP address the proxy server should bind to. The default is 0.0.0.0 which will ma
 it bind to all available addresses.
 .IP "\fBbind_port\fR"
 TCP port the proxy server should bind to. The default is 80.
+.IP "\fBkeep_idle\fR"
+Value to set for socket TCP_KEEPIDLE. The default value is 600.
 .IP "\fBbind_timeout\fR"
 Timeout to bind socket. The default is 30.
 .IP \fBbacklog\fR
@@ -140,9 +142,14 @@ This optional suffix (default is empty) that would be appended to the swift tran
 id allows one to easily figure out from which cluster that X-Trans-Id belongs to.
 This is very useful when one is managing more than one swift cluster.
 .IP \fBcors_allow_origin\fR
-Use a comma separated list of full URL (http://foo.bar:1234,https://foo.bar)
+List of origin hosts that are allowed for CORS requests in addition to what
+the container has set. Use a comma separated list of full URL (http://foo.bar:1234,https://foo.bar)
 .IP \fBstrict_cors_mode\fR
-The default is true.
+If True (default) then CORS requests are only allowed if their Origin header
+matches an allowed origin. Otherwise, any Origin is allowed.
+.IP \fBcors_expose_headers\fR
+Comma separated list of headers to expose through Access-Control-Expose-Headers,
+in addition to the defaults and any headers set in container metadata.
 .IP \fBnice_priority\fR
 Modify scheduling priority of server processes. Niceness values range from -20
 (most favorable to the process) to 19 (least favorable to the process).
@@ -291,13 +298,13 @@ The auth credentials ("project_domain_name", "user_domain_name", "username",
 service. The example values shown here assume a user named "swift" with admin
 role on a project named "service", both being in the Keystone domain with id
 "default". Refer to the KeystoneMiddleware documentation at
-.BI  http://docs.openstack.org/developer/keystonemiddleware/middlewarearchitecture.html#configuration
+.BI https://docs.openstack.org/keystonemiddleware/latest/middlewarearchitecture.html#configuration
 for other examples.
 
 .PD 0
 .RS 10
 .IP "paste.filter_factory = keystonemiddleware.auth_token:filter_factory"
-.IP "auth_uri = http://keystonehost:5000"
+.IP "www_authenticate_uri = http://keystonehost:5000"
 .IP "auth_url = http://keystonehost:35357"
 .IP "auth_plugin = password"
 .IP "project_domain_id = default"
@@ -497,7 +504,7 @@ Logging address. The default is /dev/log.
 .IP "\fBset log_headers\fR "
 Enables the ability to log request headers. The default is False.
 .IP \fBstorage_domain\fR
-The domain to be used by the middleware.
+The domain to be used by the middleware. Multiple domains can be specified separated by a comma.
 .IP \fBpath_root\fR
 The path root value for the storage URL. The default is v1.
 .IP \fBreseller_prefixes\fR
@@ -562,6 +569,10 @@ The domain to be used by the middleware.
 .IP \fBlookup_depth\fR
 How deep in the CNAME chain to look for something that matches the storage domain.
 The default is 1.
+.IP \fBnameservers\fR
+Specify the nameservers to use to do the CNAME resolution. If unset, the system
+configuration is used. Multiple nameservers can be specified separated by a comma.
+Default is unset.
 .RE
 .PD
 
@@ -990,10 +1001,6 @@ Error count to consider a node error limited. The default is 10.
 Whether account PUTs and DELETEs are even callable. If set to 'true' any authorized
 user may create and delete accounts; if 'false' no one, even authorized, can. The default
 is false.
-.IP \fBobject_post_as_copy\fR
-Set object_post_as_copy = false to turn on fast posts where only the metadata changes
-are stored as new and the original data file is kept in place. This makes for quicker
-posts. The default is True.
 .IP \fBaccount_autocreate\fR
 If set to 'true' authorized accounts that do not yet exist within the Swift cluster
 will be automatically created. The default is set to false.
@@ -1021,31 +1028,56 @@ The valid values for sorting_method are "affinity", "shuffle", and "timing".
 .IP \fBtiming_expiry\fR
 If the "timing" sorting_method is used, the timings will only be valid for
 the number of seconds configured by timing_expiry. The default is 300.
+.IP \fBconcurrent_gets\fR
+If "on" then use replica count number of threads concurrently during a GET/HEAD
+and return with the first successful response. In the EC case, this parameter
+only affects an EC HEAD as an EC GET behaves differently. Default is "off".
+.IP \fBconcurrency_timeout\fR
+This parameter controls how long to wait before firing off the next
+concurrent_get thread. A value of 0 would we fully concurrent, any other number
+will stagger the firing of the threads. This number should be between 0 and
+node_timeout. The default is the value of conn_timeout (0.5).
 .IP \fBrequest_node_count\fR
 Set to the number of nodes to contact for a normal request. You can use '* replicas'
 at the end to have it use the number given times the number of
 replicas for the ring being used for the request. The default is '2 * replicas'.
 .IP \fBread_affinity\fR
-Which backend servers to prefer on reads. Format is r<N> for region
-N or r<N>z<M> for region N, zone M. The value after the equals is
-the priority; lower numbers are higher priority.
-Default is empty, meaning no preference.
-Example: first read from region 1 zone 1, then region 1 zone 2, then anything in region 2, then everything else:
-read_affinity = r1z1=100, r1z2=200, r2=300
+Specifies which backend servers to prefer on reads. Format is a comma
+separated list of affinity descriptors of the form <selection>=<priority>.
+The <selection> may be r<N> for selecting nodes in region N or r<N>z<M> for
+selecting nodes in region N, zone M. The <priority> value should be a whole
+number that represents the priority to be given to the selection; lower numbers
+are higher priority. Default is empty, meaning no preference.
+
+Example: first read from region 1 zone 1, then region 1 zone 2, then anything
+in region 2, then everything else:
+
+.PD 0
+.RS 10
+.IP "read_affinity = r1z1=100, r1z2=200, r2=300"
+.RE
+.PD
 .IP \fBwrite_affinity\fR
-Which backend servers to prefer on writes. Format is r<N> for region
-N or r<N>z<M> for region N, zone M. If this is set, then when
-handling an object PUT request, some number (see setting
-write_affinity_node_count) of local backend servers will be tried
-before any nonlocal ones. Default is empty, meaning no preference.
+Specifies which backend servers to prefer on writes. Format is a comma
+separated list of affinity descriptors of the form r<N> for region N or
+r<N>z<M> for region N, zone M. If this is set, then when handling an object
+PUT request, some number (see setting write_affinity_node_count) of local
+backend servers will be tried before any nonlocal ones. Default is empty,
+meaning no preference.
+
 Example: try to write to regions 1 and 2 before writing to any other
 nodes:
+
+.PD 0
+.RS 10
 write_affinity = r1, r2
+.RE
+.PD
 .IP \fBwrite_affinity_node_count\fR
-The number of local (as governed by the write_affinity setting)
-nodes to attempt to contact first, before any non-local ones. You
-can use '* replicas' at the end to have it use the number given
-times the number of replicas for the ring being used for the
+The number of local (as governed by the write_affinity setting) nodes to
+attempt to contact first on writes, before any non-local ones. The value
+should be an integer number, or use '* replicas' at the end to have it use
+the number given times the number of replicas for the ring being used for the
 request. The default is '2 * replicas'.
 .IP \fBswift_owner_headers\fR
 These are the headers whose values will only be shown to swift_owners. The
@@ -1079,9 +1111,9 @@ Ignored if IOPRIO_CLASS_IDLE is set.
 .LP
 More in depth documentation about the swift-proxy-server and
 also OpenStack Swift as a whole can be found at
-.BI http://swift.openstack.org/admin_guide.html
+.BI https://docs.openstack.org/swift/latest/admin_guide.html
 and
-.BI http://swift.openstack.org
+.BI https://docs.openstack.org/swift/latest/
 
 .SH "SEE ALSO"
 .BR swift-proxy-server(1)

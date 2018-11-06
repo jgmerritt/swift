@@ -31,7 +31,6 @@ from contextlib import closing
 from gzip import GzipFile
 from shutil import rmtree
 from tempfile import mkdtemp
-from unittest2 import SkipTest
 
 from six.moves.configparser import ConfigParser, NoSectionError
 from six.moves import http_client
@@ -39,18 +38,23 @@ from six.moves.http_client import HTTPException
 
 from swift.common.middleware.memcache import MemcacheMiddleware
 from swift.common.storage_policy import parse_storage_policies, PolicyError
+from swift.common.utils import set_swift_dir
 
-from test import get_config
+from test import get_config, listen_zero
 from test.functional.swift_test_client import Account, Connection, Container, \
     ResponseError
-# This has the side effect of mocking out the xattr module so that unit tests
-# (and in this case, when in-process functional tests are called for) can run
-# on file systems that don't support extended attributes.
+
 from test.unit import debug_logger, FakeMemcache
+# importing skip_if_no_xattrs so that functional tests can grab it from the
+# test.functional namespace. Importing SkipTest so this works under both
+# nose and testr test runners.
+from test.unit import skip_if_no_xattrs as real_skip_if_no_xattrs
+from test.unit import SkipTest
 
 from swift.common import constraints, utils, ring, storage_policy
 from swift.common.ring import Ring
-from swift.common.wsgi import monkey_patch_mimetools, loadapp
+from swift.common.wsgi import (
+    monkey_patch_mimetools, loadapp, SwiftHttpProtocol)
 from swift.common.utils import config_true_value, split_path
 from swift.account import server as account_server
 from swift.container import server as container_server
@@ -100,18 +104,16 @@ swift_test_domain = ['', '', '', '', '', '']
 swift_test_user_id = ['', '', '', '', '', '']
 swift_test_tenant_id = ['', '', '', '', '', '']
 
-skip, skip2, skip3, skip_service_tokens, skip_if_no_reseller_admin = \
-    False, False, False, False, False
+skip, skip2, skip3, skip_if_not_v3, skip_service_tokens, \
+    skip_if_no_reseller_admin = False, False, False, False, False, False
 
 orig_collate = ''
 insecure = False
 
-orig_hash_path_suff_pref = ('', '')
-orig_swift_conf_name = None
-
 in_process = False
 _testdir = _test_servers = _test_coros = _test_socks = None
 policy_specified = None
+skip_if_no_xattrs = None
 
 
 class FakeMemcacheMiddleware(MemcacheMiddleware):
@@ -259,7 +261,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
             device = 'sd%c1' % chr(len(obj_sockets) + ord('a'))
             utils.mkdirs(os.path.join(_testdir, 'sda1'))
             utils.mkdirs(os.path.join(_testdir, 'sda1', 'tmp'))
-            obj_socket = eventlet.listen(('localhost', 0))
+            obj_socket = listen_zero()
             obj_sockets.append(obj_socket)
             dev['port'] = obj_socket.getsockname()[1]
             dev['ip'] = '127.0.0.1'
@@ -268,16 +270,20 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
             dev['replication_ip'] = dev['ip']
         ring_data.save(ring_file_test)
     else:
-        # make default test ring, 2 replicas, 4 partitions, 2 devices
-        _info('No source object ring file, creating 2rep/4part/2dev ring')
-        obj_sockets = [eventlet.listen(('localhost', 0)) for _ in (0, 1)]
-        ring_data = ring.RingData(
-            [[0, 1, 0, 1], [1, 0, 1, 0]],
-            [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
-              'port': obj_sockets[0].getsockname()[1]},
-             {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
-              'port': obj_sockets[1].getsockname()[1]}],
-            30)
+        # make default test ring, 3 replicas, 4 partitions, 3 devices
+        # which will work for a replication policy or a 2+1 EC policy
+        _info('No source object ring file, creating 3rep/4part/3dev ring')
+        obj_sockets = [listen_zero() for _ in (0, 1, 2)]
+        replica2part2dev_id = [[0, 1, 2, 0],
+                               [1, 2, 0, 1],
+                               [2, 0, 1, 2]]
+        devs = [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
+                 'port': obj_sockets[0].getsockname()[1]},
+                {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
+                 'port': obj_sockets[1].getsockname()[1]},
+                {'id': 2, 'zone': 2, 'device': 'sdc1', 'ip': '127.0.0.1',
+                 'port': obj_sockets[2].getsockname()[1]}]
+        ring_data = ring.RingData(replica2part2dev_id, devs, 30)
         with closing(GzipFile(ring_file_test, 'wb')) as f:
             pickle.dump(ring_data, f)
 
@@ -287,12 +293,13 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
     return obj_sockets
 
 
-def _load_encryption(proxy_conf_file, **kwargs):
+def _load_encryption(proxy_conf_file, swift_conf_file, **kwargs):
     """
     Load encryption configuration and override proxy-server.conf contents.
 
     :param proxy_conf_file: Source proxy conf filename
-    :returns: Path to the test proxy conf file to use
+    :param swift_conf_file: Source swift conf filename
+    :returns: Tuple of paths to the proxy conf file and swift conf file to use
     :raises InProcessException: raised if proxy conf contents are invalid
     """
     _debug('Setting configuration for encryption')
@@ -324,7 +331,133 @@ def _load_encryption(proxy_conf_file, **kwargs):
     with open(test_conf_file, 'w') as fp:
         conf.write(fp)
 
-    return test_conf_file
+    return test_conf_file, swift_conf_file
+
+
+def _load_ec_as_default_policy(proxy_conf_file, swift_conf_file, **kwargs):
+    """
+    Override swift.conf [storage-policy:0] section to use a 2+1 EC policy.
+
+    :param proxy_conf_file: Source proxy conf filename
+    :param swift_conf_file: Source swift conf filename
+    :returns: Tuple of paths to the proxy conf file and swift conf file to use
+    """
+    _debug('Setting configuration for default EC policy')
+
+    conf = ConfigParser()
+    conf.read(swift_conf_file)
+    # remove existing policy sections that came with swift.conf-sample
+    for section in list(conf.sections()):
+        if section.startswith('storage-policy'):
+            conf.remove_section(section)
+    # add new policy 0 section for an EC policy
+    conf.add_section('storage-policy:0')
+    ec_policy_spec = {
+        'name': 'ec-test',
+        'policy_type': 'erasure_coding',
+        'ec_type': 'liberasurecode_rs_vand',
+        'ec_num_data_fragments': 2,
+        'ec_num_parity_fragments': 1,
+        'ec_object_segment_size': 1048576,
+        'default': True
+    }
+
+    for k, v in ec_policy_spec.items():
+        conf.set('storage-policy:0', k, str(v))
+
+    with open(swift_conf_file, 'w') as fp:
+        conf.write(fp)
+    return proxy_conf_file, swift_conf_file
+
+
+def _load_domain_remap_staticweb(proxy_conf_file, swift_conf_file, **kwargs):
+    """
+    Load domain_remap and staticweb into proxy server pipeline.
+
+    :param proxy_conf_file: Source proxy conf filename
+    :param swift_conf_file: Source swift conf filename
+    :returns: Tuple of paths to the proxy conf file and swift conf file to use
+    :raises InProcessException: raised if proxy conf contents are invalid
+    """
+    _debug('Setting configuration for domain_remap')
+
+    # add a domain_remap storage_domain to the test configuration
+    storage_domain = 'example.net'
+    global config
+    config['storage_domain'] = storage_domain
+
+    # The global conf dict cannot be used to modify the pipeline.
+    # The pipeline loader requires the pipeline to be set in the local_conf.
+    # If pipeline is set in the global conf dict (which in turn populates the
+    # DEFAULTS options) then it prevents pipeline being loaded into the local
+    # conf during wsgi load_app.
+    # Therefore we must modify the [pipeline:main] section.
+    conf = ConfigParser()
+    conf.read(proxy_conf_file)
+    try:
+        section = 'pipeline:main'
+        old_pipeline = conf.get(section, 'pipeline')
+        pipeline = old_pipeline.replace(
+            " tempauth ",
+            " domain_remap tempauth staticweb ")
+        if pipeline == old_pipeline:
+            raise InProcessException(
+                "Failed to insert domain_remap and staticweb into pipeline: %s"
+                % old_pipeline)
+        conf.set(section, 'pipeline', pipeline)
+        # set storage_domain in domain_remap middleware to match test config
+        section = 'filter:domain_remap'
+        conf.set(section, 'storage_domain', storage_domain)
+    except NoSectionError as err:
+        msg = 'Error problem with proxy conf file %s: %s' % \
+              (proxy_conf_file, err)
+        raise InProcessException(msg)
+
+    test_conf_file = os.path.join(_testdir, 'proxy-server.conf')
+    with open(test_conf_file, 'w') as fp:
+        conf.write(fp)
+
+    return test_conf_file, swift_conf_file
+
+
+def _load_s3api(proxy_conf_file, swift_conf_file, **kwargs):
+    """
+    Load s3api configuration and override proxy-server.conf contents.
+
+    :param proxy_conf_file: Source proxy conf filename
+    :param swift_conf_file: Source swift conf filename
+    :returns: Tuple of paths to the proxy conf file and swift conf file to use
+    :raises InProcessException: raised if proxy conf contents are invalid
+    """
+    _debug('Setting configuration for s3api')
+
+    # The global conf dict cannot be used to modify the pipeline.
+    # The pipeline loader requires the pipeline to be set in the local_conf.
+    # If pipeline is set in the global conf dict (which in turn populates the
+    # DEFAULTS options) then it prevents pipeline being loaded into the local
+    # conf during wsgi load_app.
+    # Therefore we must modify the [pipeline:main] section.
+
+    conf = ConfigParser()
+    conf.read(proxy_conf_file)
+    try:
+        section = 'pipeline:main'
+        pipeline = conf.get(section, 'pipeline')
+        pipeline = pipeline.replace(
+            "tempauth",
+            "s3api tempauth")
+        conf.set(section, 'pipeline', pipeline)
+        conf.set('filter:s3api', 's3_acl', 'true')
+    except NoSectionError as err:
+        msg = 'Error problem with proxy conf file %s: %s' % \
+              (proxy_conf_file, err)
+        raise InProcessException(msg)
+
+    test_conf_file = os.path.join(_testdir, 'proxy-server.conf')
+    with open(test_conf_file, 'w') as fp:
+        conf.write(fp)
+
+    return test_conf_file, swift_conf_file
 
 
 # Mapping from possible values of the variable
@@ -333,7 +466,10 @@ def _load_encryption(proxy_conf_file, **kwargs):
 # The expected signature for these methods is:
 # conf_filename_to_use loader(input_conf_filename, **kwargs)
 conf_loaders = {
-    'encryption': _load_encryption
+    'encryption': _load_encryption,
+    'ec': _load_ec_as_default_policy,
+    'domain_remap_staticweb': _load_domain_remap_staticweb,
+    's3api': _load_s3api,
 }
 
 
@@ -367,6 +503,11 @@ def in_process_setup(the_object_server=object_server):
     utils.mkdirs(os.path.join(_testdir, 'sda1', 'tmp'))
     utils.mkdirs(os.path.join(_testdir, 'sdb1'))
     utils.mkdirs(os.path.join(_testdir, 'sdb1', 'tmp'))
+    utils.mkdirs(os.path.join(_testdir, 'sdc1'))
+    utils.mkdirs(os.path.join(_testdir, 'sdc1', 'tmp'))
+
+    swift_conf = _in_process_setup_swift_conf(swift_conf_src, _testdir)
+    _info('prepared swift.conf: %s' % swift_conf)
 
     # Call the associated method for the value of
     # 'SWIFT_TEST_IN_PROCESS_CONF_LOADER', if one exists
@@ -382,22 +523,22 @@ def in_process_setup(the_object_server=object_server):
                                      missing_key)
 
         try:
-            # Pass-in proxy_conf
-            proxy_conf = conf_loader(proxy_conf)
+            # Pass-in proxy_conf, swift_conf files
+            proxy_conf, swift_conf = conf_loader(proxy_conf, swift_conf)
             _debug('Now using proxy conf %s' % proxy_conf)
+            _debug('Now using swift conf %s' % swift_conf)
         except Exception as err:  # noqa
             raise InProcessException(err)
 
-    swift_conf = _in_process_setup_swift_conf(swift_conf_src, _testdir)
     obj_sockets = _in_process_setup_ring(swift_conf, conf_src_dir, _testdir)
 
-    global orig_swift_conf_name
-    orig_swift_conf_name = utils.SWIFT_CONF_FILE
-    utils.SWIFT_CONF_FILE = swift_conf
-    constraints.reload_constraints()
-    storage_policy.SWIFT_CONF_FILE = swift_conf
-    storage_policy.reload_storage_policies()
+    # load new swift.conf file
+    if set_swift_dir(os.path.dirname(swift_conf)):
+        constraints.reload_constraints()
+        storage_policy.reload_storage_policies()
+
     global config
+    config['__file__'] = 'in_process_setup()'
     if constraints.SWIFT_CONSTRAINTS_LOADED:
         # Use the swift constraints that are loaded for the test framework
         # configuration
@@ -407,16 +548,13 @@ def in_process_setup(the_object_server=object_server):
     else:
         # In-process swift constraints were not loaded, somethings wrong
         raise SkipTest
-    global orig_hash_path_suff_pref
-    orig_hash_path_suff_pref = utils.HASH_PATH_PREFIX, utils.HASH_PATH_SUFFIX
-    utils.validate_hash_conf()
 
     global _test_socks
     _test_socks = []
     # We create the proxy server listening socket to get its port number so
     # that we can add it as the "auth_port" value for the functional test
     # clients.
-    prolis = eventlet.listen(('localhost', 0))
+    prolis = listen_zero()
     _test_socks.append(prolis)
 
     # The following set of configuration values is used both for the
@@ -432,6 +570,12 @@ def in_process_setup(the_object_server=object_server):
         'account_autocreate': 'true',
         'allow_versions': 'True',
         'allow_versioned_writes': 'True',
+        # TODO: move this into s3api config loader because they are
+        #       required by only s3api
+        'allowed_headers':
+            "Content-Disposition, Content-Encoding, X-Delete-At, "
+            "X-Object-Manifest, X-Static-Large-Object, Cache-Control, "
+            "Content-Language, Expires, X-Robots-Tag",
         # Below are values used by the functional test framework, as well as
         # by the various in-process swift servers
         'auth_host': '127.0.0.1',
@@ -443,6 +587,12 @@ def in_process_setup(the_object_server=object_server):
         'account': 'test',
         'username': 'tester',
         'password': 'testing',
+        's3_access_key': 'test:tester',
+        's3_secret_key': 'testing',
+        # Secondary user of the primary test account (needs admin access
+        # to the account) for s3api
+        's3_access_key2': 'test:tester2',
+        's3_secret_key2': 'testing2',
         # User on a second account (needs admin access to the account)
         'account2': 'test2',
         'username2': 'tester2',
@@ -450,6 +600,8 @@ def in_process_setup(the_object_server=object_server):
         # User on same account as first, but without admin access
         'username3': 'tester3',
         'password3': 'testing3',
+        's3_access_key3': 'test:tester3',
+        's3_secret_key3': 'testing3',
         # Service user and prefix (emulates glance, cinder, etc. user)
         'account5': 'test5',
         'username5': 'tester5',
@@ -464,19 +616,10 @@ def in_process_setup(the_object_server=object_server):
         'password6': 'testing6'
     })
 
-    # If an env var explicitly specifies the proxy-server object_post_as_copy
-    # option then use its value, otherwise leave default config unchanged.
-    object_post_as_copy = os.environ.get(
-        'SWIFT_TEST_IN_PROCESS_OBJECT_POST_AS_COPY')
-    if object_post_as_copy is not None:
-        object_post_as_copy = config_true_value(object_post_as_copy)
-        config['object_post_as_copy'] = str(object_post_as_copy)
-        _debug('Setting object_post_as_copy to %r' % object_post_as_copy)
-
-    acc1lis = eventlet.listen(('localhost', 0))
-    acc2lis = eventlet.listen(('localhost', 0))
-    con1lis = eventlet.listen(('localhost', 0))
-    con2lis = eventlet.listen(('localhost', 0))
+    acc1lis = listen_zero()
+    acc2lis = listen_zero()
+    con1lis = listen_zero()
+    con2lis = listen_zero()
     _test_socks += [acc1lis, acc2lis, con1lis, con2lis] + obj_sockets
 
     account_ring_path = os.path.join(_testdir, 'account.ring.gz')
@@ -496,13 +639,6 @@ def in_process_setup(the_object_server=object_server):
                       'port': con2lis.getsockname()[1]}], 30),
                     f)
 
-    eventlet.wsgi.HttpProtocol.default_request_version = "HTTP/1.0"
-    # Turn off logging requests by the underlying WSGI software.
-    eventlet.wsgi.HttpProtocol.log_request = lambda *a: None
-    logger = utils.get_logger(config, 'wsgi-server', log_route='wsgi')
-    # Redirect logging other messages by the underlying WSGI software.
-    eventlet.wsgi.HttpProtocol.log_message = \
-        lambda s, f, *a: logger.error('ERROR WSGI: ' + f % a)
     # Default to only 4 seconds for in-process functional test runs
     eventlet.wsgi.WRITE_TIMEOUT = 4
 
@@ -529,7 +665,9 @@ def in_process_setup(the_object_server=object_server):
     ]
 
     if show_debug_logs:
-        logger = debug_logger('proxy')
+        logger = get_logger_name('proxy')
+    else:
+        logger = utils.get_logger(config, 'wsgi-server', log_route='wsgi')
 
     def get_logger(name, *args, **kwargs):
         return logger
@@ -545,13 +683,19 @@ def in_process_setup(the_object_server=object_server):
     nl = utils.NullLogger()
     global proxy_srv
     proxy_srv = prolis
-    prospa = eventlet.spawn(eventlet.wsgi.server, prolis, app, nl)
-    acc1spa = eventlet.spawn(eventlet.wsgi.server, acc1lis, acc1srv, nl)
-    acc2spa = eventlet.spawn(eventlet.wsgi.server, acc2lis, acc2srv, nl)
-    con1spa = eventlet.spawn(eventlet.wsgi.server, con1lis, con1srv, nl)
-    con2spa = eventlet.spawn(eventlet.wsgi.server, con2lis, con2srv, nl)
+    prospa = eventlet.spawn(eventlet.wsgi.server, prolis, app, nl,
+                            protocol=SwiftHttpProtocol)
+    acc1spa = eventlet.spawn(eventlet.wsgi.server, acc1lis, acc1srv, nl,
+                             protocol=SwiftHttpProtocol)
+    acc2spa = eventlet.spawn(eventlet.wsgi.server, acc2lis, acc2srv, nl,
+                             protocol=SwiftHttpProtocol)
+    con1spa = eventlet.spawn(eventlet.wsgi.server, con1lis, con1srv, nl,
+                             protocol=SwiftHttpProtocol)
+    con2spa = eventlet.spawn(eventlet.wsgi.server, con2lis, con2srv, nl,
+                             protocol=SwiftHttpProtocol)
 
-    objspa = [eventlet.spawn(eventlet.wsgi.server, objsrv[0], objsrv[1], nl)
+    objspa = [eventlet.spawn(eventlet.wsgi.server, objsrv[0], objsrv[1], nl,
+                             protocol=SwiftHttpProtocol)
               for objsrv in objsrvs]
 
     global _test_coros
@@ -570,7 +714,8 @@ def in_process_setup(the_object_server=object_server):
                 node['ip'], node['port'], node['device'], partition, 'PUT',
                 '/' + act, {'X-Timestamp': ts, 'x-trans-id': act})
             resp = conn.getresponse()
-            assert(resp.status == 201)
+            assert resp.status == 201, 'Unable to create account: %s\n%s' % (
+                resp.status, resp.body)
 
     create_account('AUTH_test')
     create_account('AUTH_test2')
@@ -627,6 +772,7 @@ def get_cluster_info():
 def setup_package():
 
     global policy_specified
+    global skip_if_no_xattrs
     policy_specified = os.environ.get('SWIFT_TEST_POLICY')
     in_process_env = os.environ.get('SWIFT_TEST_IN_PROCESS')
     if in_process_env is not None:
@@ -665,6 +811,7 @@ def setup_package():
     if in_process:
         in_mem_obj_env = os.environ.get('SWIFT_TEST_IN_MEMORY_OBJ')
         in_mem_obj = utils.config_true_value(in_mem_obj_env)
+        skip_if_no_xattrs = real_skip_if_no_xattrs
         try:
             in_process_setup(the_object_server=(
                 mem_object_server if in_mem_obj else object_server))
@@ -672,6 +819,8 @@ def setup_package():
             print(('Exception during in-process setup: %s'
                    % str(exc)), file=sys.stderr)
             raise
+    else:
+        skip_if_no_xattrs = lambda: None
 
     global web_front_end
     web_front_end = config.get('web_front_end', 'integral')
@@ -871,10 +1020,7 @@ def teardown_package():
             rmtree(os.path.dirname(_testdir))
         except Exception:
             pass
-        utils.HASH_PATH_PREFIX, utils.HASH_PATH_SUFFIX = \
-            orig_hash_path_suff_pref
-        utils.SWIFT_CONF_FILE = orig_swift_conf_name
-        constraints.reload_constraints()
+
         reset_globals()
 
 

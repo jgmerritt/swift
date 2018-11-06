@@ -11,6 +11,95 @@ Account Quotas
     :members:
     :show-inheritance:
 
+.. _s3api:
+
+AWS S3 Api
+==========
+
+.. automodule:: swift.common.middleware.s3api.s3api
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.s3token
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.s3request
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.s3response
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.exception
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.etree
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.utils
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.subresource
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.acl_handlers
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.acl_utils
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.base
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.service
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.bucket
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.obj
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.acl
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.s3_acl
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.multi_upload
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.multi_delete
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.versioning
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.location
+    :members:
+    :show-inheritance:
+
+.. automodule:: swift.common.middleware.s3api.controllers.logging
+    :members:
+    :show-inheritance:
+
 .. _bulk:
 
 Bulk Operations (Delete and Archive Auto Extraction)
@@ -80,7 +169,7 @@ There may be administrator-only information available via ``/info``. To
 retrieve it, one must use an HMAC-signed request, similar to TempURL.
 The signature may be produced like so::
 
-    swift-temp-url GET 3600 /info secret 2>/dev/null | sed s/temp_url/swiftinfo/g
+    swift tempurl GET 3600 /info secret 2>/dev/null | sed s/temp_url/swiftinfo/g
 
 Domain Remap
 ============
@@ -210,10 +299,19 @@ Ratelimit
     :members:
     :show-inheritance:
 
+.. _read_only:
+
+Read Only
+=========
+
+.. automodule:: swift.common.middleware.read_only
+    :members:
+    :show-inheritance:
+
 .. _recon:
 
 Recon
-===========
+=====
 
 .. automodule:: swift.common.middleware.recon
     :members:
@@ -241,6 +339,15 @@ StaticWeb
 =========
 
 .. automodule:: swift.common.middleware.staticweb
+    :members:
+    :show-inheritance:
+
+.. _symlink:
+
+Symlink
+=======
+
+.. automodule:: swift.common.middleware.symlink
     :members:
     :show-inheritance:
 

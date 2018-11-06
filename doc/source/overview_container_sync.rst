@@ -36,8 +36,14 @@ synchronization key.
 .. note::
 
     If you are using encryption middleware in the cluster from which objects
-    are being synced, then you should follow the instructions to configure
+    are being synced, then you should follow the instructions for
     :ref:`container_sync_client_config` to be compatible with encryption.
+
+.. note::
+
+    If you are using symlink middleware in the cluster from which objects
+    are being synced, then you should follow the instructions for
+    :ref:`symlink_container_sync_client_config` to be compatible with symlinks.
 
 --------------------------
 Configuring Container Sync
@@ -98,6 +104,12 @@ container_sync section only needs the "use" item. For example::
     [filter:container_sync]
     use = egg:swift#container_sync
 
+The container sync daemon will use an internal client to sync objects. Even if
+you don't configure the internal client, the container sync daemon will work
+with default configuration. The default configuration is as same as
+``internal-client.conf-sample``. If you want to configure the internal client,
+please update ``internal_client_conf_path`` of container-server.conf. The
+configuration file at the path will be used for the internal client.
 
 -------------------------------------------------------
 Old-Style: Configuring a Cluster's Allowable Sync Hosts
@@ -434,7 +446,7 @@ then a symlink to the container database is created in a sync-containers
 sub-directory on the same device.
 
 Similarly, when the container sync metadata keys are deleted, the container
-server and container-replicator would take care of deleting the symlinks 
+server and container-replicator would take care of deleting the symlinks
 from ``sync-containers``.
 
 .. note::

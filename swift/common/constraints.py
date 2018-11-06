@@ -15,7 +15,7 @@
 
 import functools
 import os
-import time
+from os.path import isdir  # tighter scoped import for mocking
 
 import six
 from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
@@ -24,7 +24,7 @@ from six.moves import urllib
 from swift.common import utils, exceptions
 from swift.common.swob import HTTPBadRequest, HTTPLengthRequired, \
     HTTPRequestEntityTooLarge, HTTPPreconditionFailed, HTTPNotImplemented, \
-    HTTPException
+    HTTPException, wsgi_to_str, wsgi_to_bytes
 
 MAX_FILE_SIZE = 5368709122
 MAX_META_NAME_LENGTH = 128
@@ -104,11 +104,6 @@ reload_constraints()
 MAX_BUFFERED_SLO_SEGMENTS = 10000
 
 
-#: Query string format= values to their corresponding content-type values
-FORMAT2CONTENT_TYPE = {'plain': 'text/plain', 'json': 'application/json',
-                       'xml': 'application/xml'}
-
-
 # By default the maximum number of allowed headers depends on the number of max
 # allowed metadata settings plus a default value of 36 for swift internally
 # generated headers and regular http headers.  If for some reason this is not
@@ -137,8 +132,8 @@ def check_metadata(req, target_type):
         if (isinstance(value, six.string_types)
            and len(value) > MAX_HEADER_SIZE):
 
-            return HTTPBadRequest(body='Header value too long: %s' %
-                                  key[:MAX_META_NAME_LENGTH],
+            return HTTPBadRequest(body=b'Header value too long: %s' %
+                                  wsgi_to_bytes(key[:MAX_META_NAME_LENGTH]),
                                   request=req, content_type='text/plain')
         if not key.lower().startswith(prefix):
             continue
@@ -146,8 +141,8 @@ def check_metadata(req, target_type):
         if not key:
             return HTTPBadRequest(body='Metadata name cannot be empty',
                                   request=req, content_type='text/plain')
-        bad_key = not check_utf8(key)
-        bad_value = value and not check_utf8(value)
+        bad_key = not check_utf8(wsgi_to_str(key))
+        bad_value = value and not check_utf8(wsgi_to_str(value))
         if target_type in ('account', 'container') and (bad_key or bad_value):
             return HTTPBadRequest(body='Metadata must be valid UTF-8',
                                   request=req, content_type='text/plain')
@@ -155,12 +150,13 @@ def check_metadata(req, target_type):
         meta_size += len(key) + len(value)
         if len(key) > MAX_META_NAME_LENGTH:
             return HTTPBadRequest(
-                body='Metadata name too long: %s%s' % (prefix, key),
+                body=wsgi_to_bytes('Metadata name too long: %s%s' % (
+                    prefix, key)),
                 request=req, content_type='text/plain')
         if len(value) > MAX_META_VALUE_LENGTH:
             return HTTPBadRequest(
-                body='Metadata value longer than %d: %s%s' % (
-                    MAX_META_VALUE_LENGTH, prefix, key),
+                body=wsgi_to_bytes('Metadata value longer than %d: %s%s' % (
+                    MAX_META_VALUE_LENGTH, prefix, key)),
                 request=req, content_type='text/plain')
         if meta_count > MAX_META_COUNT:
             return HTTPBadRequest(
@@ -212,7 +208,7 @@ def check_object_creation(req, object_name):
 
     if 'Content-Type' not in req.headers:
         return HTTPBadRequest(request=req, content_type='text/plain',
-                              body='No content type')
+                              body=b'No content type')
 
     try:
         req = check_delete_headers(req)
@@ -220,7 +216,7 @@ def check_object_creation(req, object_name):
         return HTTPBadRequest(request=req, body=e.body,
                               content_type='text/plain')
 
-    if not check_utf8(req.headers['Content-Type']):
+    if not check_utf8(wsgi_to_str(req.headers['Content-Type'])):
         return HTTPBadRequest(request=req, body='Invalid Content-Type',
                               content_type='text/plain')
     return check_metadata(req, 'object')
@@ -234,9 +230,10 @@ def check_dir(root, drive):
 
     :param root:  base path where the dir is
     :param drive: drive name to be checked
-    :returns: True if it is a valid directoy, False otherwise
+    :returns: full path to the device
+    :raises ValueError: if drive fails to validate
     """
-    return os.path.isdir(os.path.join(root, drive))
+    return check_drive(root, drive, False)
 
 
 def check_mount(root, drive):
@@ -248,12 +245,33 @@ def check_mount(root, drive):
 
     :param root:  base path where the devices are mounted
     :param drive: drive name to be checked
-    :returns: True if it is a valid mounted device, False otherwise
+    :returns: full path to the device
+    :raises ValueError: if drive fails to validate
+    """
+    return check_drive(root, drive, True)
+
+
+def check_drive(root, drive, mount_check):
+    """
+    Validate the path given by root and drive is a valid existing directory.
+
+    :param root:  base path where the devices are mounted
+    :param drive: drive name to be checked
+    :param mount_check: additionally require path is mounted
+
+    :returns: full path to the device
+    :raises ValueError: if drive fails to validate
     """
     if not (urllib.parse.quote_plus(drive) == drive):
-        return False
+        raise ValueError('%s is not a valid drive name' % drive)
     path = os.path.join(root, drive)
-    return utils.ismount(path)
+    if mount_check:
+        if not utils.ismount(path):
+            raise ValueError('%s is not mounted' % path)
+    else:
+        if not isdir(path):
+            raise ValueError('%s is not a directory' % path)
+    return path
 
 
 def check_float(string):
@@ -277,7 +295,7 @@ def valid_timestamp(request):
     :param request: the swob request object
 
     :returns: a valid Timestamp instance
-    :raises: HTTPBadRequest on missing or invalid X-Timestamp
+    :raises HTTPBadRequest: on missing or invalid X-Timestamp
     """
     try:
         return request.timestamp
@@ -288,15 +306,19 @@ def valid_timestamp(request):
 
 def check_delete_headers(request):
     """
-    Validate if 'x-delete' headers are have correct values
-    values should be positive integers and correspond to
-    a time in the future.
+    Check that 'x-delete-after' and 'x-delete-at' headers have valid values.
+    Values should be positive integers and correspond to a time greater than
+    the request timestamp.
+
+    If the 'x-delete-after' header is found then its value is used to compute
+    an 'x-delete-at' value which takes precedence over any existing
+    'x-delete-at' header.
 
     :param request: the swob request object
-
-    :returns: HTTPBadRequest in case of invalid values
-              or None if values are ok
+    :raises: HTTPBadRequest in case of invalid values
+    :returns: the swob request object
     """
+    now = float(valid_timestamp(request))
     if 'x-delete-after' in request.headers:
         try:
             x_delete_after = int(request.headers['x-delete-after'])
@@ -304,13 +326,14 @@ def check_delete_headers(request):
             raise HTTPBadRequest(request=request,
                                  content_type='text/plain',
                                  body='Non-integer X-Delete-After')
-        actual_del_time = time.time() + x_delete_after
-        if actual_del_time < time.time():
+        actual_del_time = utils.normalize_delete_at_timestamp(
+            now + x_delete_after)
+        if int(actual_del_time) <= now:
             raise HTTPBadRequest(request=request,
                                  content_type='text/plain',
                                  body='X-Delete-After in past')
-        request.headers['x-delete-at'] = utils.normalize_delete_at_timestamp(
-            actual_del_time)
+        request.headers['x-delete-at'] = actual_del_time
+        del request.headers['x-delete-after']
 
     if 'x-delete-at' in request.headers:
         try:
@@ -320,7 +343,8 @@ def check_delete_headers(request):
             raise HTTPBadRequest(request=request, content_type='text/plain',
                                  body='Non-integer X-Delete-At')
 
-        if x_delete_at < time.time():
+        if x_delete_at <= now and not utils.config_true_value(
+                request.headers.get('x-backend-replication', 'f')):
             raise HTTPBadRequest(request=request, content_type='text/plain',
                                  body='X-Delete-At in past')
     return request
@@ -339,16 +363,30 @@ def check_utf8(string):
         return False
     try:
         if isinstance(string, six.text_type):
-            string.encode('utf-8')
+            encoded = string.encode('utf-8')
+            decoded = string
         else:
+            encoded = string
             decoded = string.decode('UTF-8')
-            if decoded.encode('UTF-8') != string:
+            if decoded.encode('UTF-8') != encoded:
                 return False
-            # A UTF-8 string with surrogates in it is invalid.
-            if any(0xD800 <= ord(codepoint) <= 0xDFFF
-                   for codepoint in decoded):
-                return False
-        return '\x00' not in string
+        # A UTF-8 string with surrogates in it is invalid.
+        #
+        # Note: this check is only useful on Python 2. On Python 3, a
+        # bytestring with a UTF-8-encoded surrogate codepoint is (correctly)
+        # treated as invalid, so the decode() call above will fail.
+        #
+        # Note 2: this check requires us to use a wide build of Python 2. On
+        # narrow builds of Python 2, potato = u"\U0001F954" will have length
+        # 2, potato[0] == u"\ud83e" (surrogate), and potato[1] == u"\udda0"
+        # (also a surrogate), so even if it is correctly UTF-8 encoded as
+        # b'\xf0\x9f\xa6\xa0', it will not pass this check. Fortunately,
+        # most Linux distributions build Python 2 wide, and Python 3.3+
+        # removed the wide/narrow distinction entirely.
+        if any(0xD800 <= ord(codepoint) <= 0xDFFF
+               for codepoint in decoded):
+            return False
+        return b'\x00' not in encoded
     # If string is unicode, decode() will raise UnicodeEncodeError
     # So, we should catch both UnicodeDecodeError & UnicodeEncodeError
     except UnicodeError:
@@ -363,7 +401,7 @@ def check_name_format(req, name, target_type):
     :param name: header value to validate
     :param target_type: which header is being validated (Account or Container)
     :returns: A properly encoded account name or container name
-    :raise: HTTPPreconditionFailed if account header
+    :raise HTTPPreconditionFailed: if account header
             is not well formatted.
     """
     if not name:
@@ -372,7 +410,7 @@ def check_name_format(req, name, target_type):
             body='%s name cannot be empty' % target_type)
     if isinstance(name, six.text_type):
         name = name.encode('utf-8')
-    if '/' in name:
+    if b'/' in name:
         raise HTTPPreconditionFailed(
             request=req,
             body='%s name cannot contain slashes' % target_type)
@@ -385,9 +423,11 @@ check_container_format = functools.partial(check_name_format,
 
 
 def valid_api_version(version):
-    """ Checks if the requested version is valid.
+    """
+    Checks if the requested version is valid.
 
-    Currently Swift only supports "v1" and "v1.0". """
+    Currently Swift only supports "v1" and "v1.0".
+    """
     global VALID_API_VERSIONS
     if not isinstance(VALID_API_VERSIONS, list):
         VALID_API_VERSIONS = [str(VALID_API_VERSIONS)]

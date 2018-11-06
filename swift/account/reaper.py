@@ -28,13 +28,14 @@ import six
 
 import swift.common.db
 from swift.account.backend import AccountBroker, DATADIR
+from swift.common.constraints import check_drive
 from swift.common.direct_client import direct_delete_container, \
     direct_delete_object, direct_get_container
 from swift.common.exceptions import ClientException
 from swift.common.ring import Ring
 from swift.common.ring.utils import is_local_device
-from swift.common.utils import get_logger, whataremyips, ismount, \
-    config_true_value, Timestamp
+from swift.common.utils import get_logger, whataremyips, config_true_value, \
+    Timestamp
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import POLICIES, PolicyError
 
@@ -133,11 +134,11 @@ class AccountReaper(Daemon):
         begin = time()
         try:
             for device in os.listdir(self.devices):
-                if self.mount_check and not ismount(
-                        os.path.join(self.devices, device)):
+                try:
+                    check_drive(self.devices, device, self.mount_check)
+                except ValueError as err:
                     self.logger.increment('errors')
-                    self.logger.debug(
-                        _('Skipping %s as it is not mounted'), device)
+                    self.logger.debug('Skipping: %s', err)
                     continue
                 self.reap_device(device)
         except (Exception, Timeout):
@@ -268,8 +269,12 @@ class AccountReaper(Daemon):
                 if not containers:
                     break
                 try:
-                    for (container, _junk, _junk, _junk) in containers:
-                        this_shard = int(md5(container).hexdigest(), 16) % \
+                    for (container, _junk, _junk, _junk, _junk) in containers:
+                        if six.PY3:
+                            container_ = container.encode('utf-8')
+                        else:
+                            container_ = container
+                        this_shard = int(md5(container_).hexdigest(), 16) % \
                             len(nodes)
                         if container_shard not in (this_shard, None):
                             continue
@@ -392,10 +397,11 @@ class AccountReaper(Daemon):
                     self.logger.error('ERROR: invalid storage policy index: %r'
                                       % policy_index)
                 for obj in objects:
-                    if isinstance(obj['name'], six.text_type):
-                        obj['name'] = obj['name'].encode('utf8')
+                    obj_name = obj['name']
+                    if isinstance(obj_name, six.text_type):
+                        obj_name = obj_name.encode('utf8')
                     pool.spawn(self.reap_object, account, container, part,
-                               nodes, obj['name'], policy_index)
+                               nodes, obj_name, policy_index)
                 pool.waitall()
             except (Exception, Timeout):
                 self.logger.exception(_('Exception with objects for container '
@@ -408,7 +414,7 @@ class AccountReaper(Daemon):
                 break
         successes = 0
         failures = 0
-        timestamp = Timestamp(time())
+        timestamp = Timestamp.now()
         for node in nodes:
             anode = account_nodes.pop()
             try:
@@ -483,7 +489,7 @@ class AccountReaper(Daemon):
         part, nodes = ring.get_nodes(account, container, obj)
         successes = 0
         failures = 0
-        timestamp = Timestamp(time())
+        timestamp = Timestamp.now()
 
         for node in nodes:
             cnode = next(cnodes)

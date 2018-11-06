@@ -28,7 +28,7 @@ swift\-account\-audit \- manually audit OpenStack Swift accounts
 The swift-account-audit cli tool can be used to audit the data for an account.
 It crawls the account, checking that all containers and objects can be found.
 
-You can also feed a list of urls to the script through stdin.
+You can also feed a list of URLs to the script through stdin.
 
 .SH OPTIONS
 .TP
@@ -39,25 +39,25 @@ Set the concurrency, default 50
 Ring locations, default \fI/etc/swift\fR
 .TP
 \fB\-e\fR \fIfilename\fR
-File for writing a list of inconsistent urls
+File for writing a list of inconsistent URLs
 .TP
 \fB\-d\fR
 Also download files and verify md5
 
 .SH EXAMPLES
 .nf
-/usr/bin/swift\-account\-audit\/ SOSO_88ad0b83\-b2c5\-4fa1\-b2d6\-60c597202076
-/usr/bin/swift\-account\-audit\/ SOSO_88ad0b83\-b2c5\-4fa1\-b2d6\-60c597202076/container/object
-/usr/bin/swift\-account\-audit\/ \fB\-e\fR errors.txt SOSO_88ad0b83\-b2c5\-4fa1\-b2d6\-60c597202076/container
+/usr/bin/swift\-account\-audit\/ AUTH_88ad0b83\-b2c5\-4fa1\-b2d6\-60c597202076
+/usr/bin/swift\-account\-audit\/ AUTH_88ad0b83\-b2c5\-4fa1\-b2d6\-60c597202076/container/object
+/usr/bin/swift\-account\-audit\/ \fB\-e\fR errors.txt AUTH_88ad0b83\-b2c5\-4fa1\-b2d6\-60c597202076/container
 /usr/bin/swift\-account\-audit\/ < errors.txt
 /usr/bin/swift\-account\-audit\/ \fB\-c\fR 25 \fB\-d\fR < errors.txt
 .fi
 
 .SH DOCUMENTATION
 .LP
-More in depth documentation in regards to 
+More in depth documentation in regards to
 .BI swift\-account\-audit
-and also about OpenStack Swift as a whole can be found at 
-.BI http://swift.openstack.org/index.html
-and 
-.BI http://docs.openstack.org
+and also about OpenStack Swift as a whole can be found at
+.BI https://docs.openstack.org/swift/latest/
+and
+.BI https://docs.openstack.org

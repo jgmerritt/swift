@@ -199,7 +199,7 @@ class _StaticWebContext(WSGIContext):
         self._error, self._listings, self._listings_css and self._dir_type.
 
         :param env: The WSGI environment dict.
-        :return container_info: The container_info dict.
+        :return: The container_info dict.
         """
         self._index = self._error = self._listings = self._listings_css = \
             self._dir_type = None
@@ -260,7 +260,7 @@ class _StaticWebContext(WSGIContext):
             env, 'GET', '/%s/%s/%s' % (
                 self.version, self.account, self.container),
             self.agent, swift_source='SW')
-        tmp_env['QUERY_STRING'] = 'delimiter=/&format=json'
+        tmp_env['QUERY_STRING'] = 'delimiter=/'
         if prefix:
             tmp_env['QUERY_STRING'] += '&prefix=%s' % quote(prefix)
         else:
@@ -465,8 +465,8 @@ class _StaticWebContext(WSGIContext):
                     env, 'GET', '/%s/%s/%s' % (
                         self.version, self.account, self.container),
                     self.agent, swift_source='SW')
-                tmp_env['QUERY_STRING'] = 'limit=1&format=json&delimiter' \
-                    '=/&limit=1&prefix=%s' % quote(self.obj + '/')
+                tmp_env['QUERY_STRING'] = 'limit=1&delimiter=/&prefix=%s' % (
+                    quote(self.obj + '/'), )
                 resp = self._app_call(tmp_env)
                 body = ''.join(resp)
                 if not is_success(self._get_status_int()) or not body or \

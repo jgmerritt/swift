@@ -151,7 +151,7 @@ class ListEndpointsMiddleware(object):
 
         :returns: parsed path parts as a tuple with version filled in as
                   configured default response version if not specified.
-        :raises: ValueError if path is invalid, message will say why.
+        :raises ValueError: if path is invalid, message will say why.
         """
         clean_path = request.path[len(self.endpoints_path) - 1:]
         # try to peel off version
@@ -163,7 +163,7 @@ class ListEndpointsMiddleware(object):
             version = self._parse_version(raw_version)
         except ValueError:
             if raw_version.startswith('v') and '_' not in raw_version:
-                # looks more like a invalid version than an account
+                # looks more like an invalid version than an account
                 raise
             # probably no version specified, but if the client really
             # said /endpoints/v_3/account they'll probably be sorta

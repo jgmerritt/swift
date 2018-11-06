@@ -93,7 +93,8 @@ class TestReconstructorRevert(ECProbeTest):
                           headers=headers)
         client.post_object(self.url, self.token, self.container_name,
                            self.object_name, headers=headers_post)
-        del headers_post['X-Auth-Token']  # WTF, where did this come from?
+        # (Some versions of?) swiftclient will mutate the headers dict on post
+        headers_post.pop('X-Auth-Token', None)
 
         # these primaries can't serve the data any more, we expect 507
         # here and not 404 because we're using mount_check to kill nodes
@@ -173,7 +174,7 @@ class TestReconstructorRevert(ECProbeTest):
         client.put_object(self.url, self.token, self.container_name,
                           self.object_name, contents=contents)
 
-        # now lets shut down a couple primaries
+        # now lets shut down a couple of primaries
         failed_nodes = random.sample(onodes, 2)
         for node in failed_nodes:
             self.kill_drive(self.device_dir('object', node))
@@ -197,13 +198,43 @@ class TestReconstructorRevert(ECProbeTest):
                 self.fail('Node data on %r was not fully destroyed!' %
                           (node,))
 
-        # repair the first primary
-        self.revive_drive(self.device_dir('object', failed_nodes[0]))
+        # run the reconstructor on the handoff node multiple times until
+        # tombstone is pushed out - each handoff node syncs to a few
+        # primaries each time
+        iterations = 0
+        while iterations < 52:
+            self.reconstructor.once(number=self.config_number(hnodes[0]))
+            iterations += 1
+            # see if the tombstone is reverted
+            try:
+                self.direct_get(hnodes[0], opart)
+            except direct_client.DirectClientException as err:
+                self.assertEqual(err.http_status, 404)
+                if 'X-Backend-Timestamp' not in err.http_headers:
+                    # this means the tombstone is *gone* so it's reverted
+                    break
+        else:
+            self.fail('Still found tombstone on %r after %s iterations' % (
+                hnodes[0], iterations))
 
-        # run the reconstructor on the *second* handoff node
+        # tombstone is still on the *second* handoff
+        try:
+            self.direct_get(hnodes[1], opart)
+        except direct_client.DirectClientException as err:
+            self.assertEqual(err.http_status, 404)
+            self.assertEqual(err.http_headers['X-Backend-Timestamp'],
+                             delete_timestamp)
+        else:
+            self.fail('Found obj data on %r' % hnodes[1])
+
+        # repair the primaries
+        self.revive_drive(self.device_dir('object', failed_nodes[0]))
+        self.revive_drive(self.device_dir('object', failed_nodes[1]))
+
+        # run reconstructor on second handoff
         self.reconstructor.once(number=self.config_number(hnodes[1]))
 
-        # make sure it's tombstone was pushed out
+        # verify tombstone is reverted on the first pass
         try:
             self.direct_get(hnodes[1], opart)
         except direct_client.DirectClientException as err:
@@ -211,41 +242,6 @@ class TestReconstructorRevert(ECProbeTest):
             self.assertNotIn('X-Backend-Timestamp', err.http_headers)
         else:
             self.fail('Found obj data on %r' % hnodes[1])
-
-        # ... and it's on the first failed (now repaired) primary
-        try:
-            self.direct_get(failed_nodes[0], opart)
-        except direct_client.DirectClientException as err:
-            self.assertEqual(err.http_status, 404)
-            self.assertEqual(err.http_headers['X-Backend-Timestamp'],
-                             delete_timestamp)
-        else:
-            self.fail('Found obj data on %r' % failed_nodes[0])
-
-        # repair the second primary
-        self.revive_drive(self.device_dir('object', failed_nodes[1]))
-
-        # run the reconstructor on the *first* handoff node
-        self.reconstructor.once(number=self.config_number(hnodes[0]))
-
-        # make sure it's tombstone was pushed out
-        try:
-            self.direct_get(hnodes[0], opart)
-        except direct_client.DirectClientException as err:
-            self.assertEqual(err.http_status, 404)
-            self.assertNotIn('X-Backend-Timestamp', err.http_headers)
-        else:
-            self.fail('Found obj data on %r' % hnodes[0])
-
-        # ... and now it's on the second failed primary too!
-        try:
-            self.direct_get(failed_nodes[1], opart)
-        except direct_client.DirectClientException as err:
-            self.assertEqual(err.http_status, 404)
-            self.assertEqual(err.http_headers['X-Backend-Timestamp'],
-                             delete_timestamp)
-        else:
-            self.fail('Found obj data on %r' % failed_nodes[1])
 
         # sanity make sure proxy get can't find it
         try:

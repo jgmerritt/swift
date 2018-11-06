@@ -23,6 +23,7 @@ from shutil import rmtree, copy
 from uuid import uuid4
 import six.moves.cPickle as pickle
 
+import base64
 import json
 import sqlite3
 import itertools
@@ -33,12 +34,14 @@ from mock import patch, MagicMock
 from eventlet.timeout import Timeout
 from six.moves import range
 
+import six
+
 import swift.common.db
 from swift.common.constraints import \
     MAX_META_VALUE_LENGTH, MAX_META_COUNT, MAX_META_OVERALL_SIZE
 from swift.common.db import chexor, dict_factory, get_db_connection, \
     DatabaseBroker, DatabaseConnectionError, DatabaseAlreadyExists, \
-    GreenDBConnection, PICKLE_PROTOCOL
+    GreenDBConnection, PICKLE_PROTOCOL, zero_like
 from swift.common.utils import normalize_timestamp, mkdirs, Timestamp
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPException
@@ -46,19 +49,43 @@ from swift.common.swob import HTTPException
 from test.unit import with_tempdir
 
 
+class TestHelperFunctions(unittest.TestCase):
+
+    def test_zero_like(self):
+        expectations = {
+            # value => expected
+            None: True,
+            True: False,
+            '': True,
+            'asdf': False,
+            0: True,
+            1: False,
+            '0': True,
+            '1': False,
+        }
+        errors = []
+        for value, expected in expectations.items():
+            rv = zero_like(value)
+            if rv != expected:
+                errors.append('zero_like(%r) => %r expected %r' % (
+                    value, rv, expected))
+        if errors:
+            self.fail('Some unexpected return values:\n' + '\n'.join(errors))
+
+
 class TestDatabaseConnectionError(unittest.TestCase):
 
     def test_str(self):
         err = \
             DatabaseConnectionError(':memory:', 'No valid database connection')
-        self.assertTrue(':memory:' in str(err))
-        self.assertTrue('No valid database connection' in str(err))
+        self.assertIn(':memory:', str(err))
+        self.assertIn('No valid database connection', str(err))
         err = DatabaseConnectionError(':memory:',
                                       'No valid database connection',
                                       timeout=1357)
-        self.assertTrue(':memory:' in str(err))
-        self.assertTrue('No valid database connection' in str(err))
-        self.assertTrue('1357' in str(err))
+        self.assertIn(':memory:', str(err))
+        self.assertIn('No valid database connection', str(err))
+        self.assertIn('1357', str(err))
 
 
 class TestDictFactory(unittest.TestCase):
@@ -228,7 +255,7 @@ class ExampleBroker(DatabaseBroker):
         INSERT INTO test_stat (
             account, created_at, id, put_timestamp, status_changed_at)
         VALUES (?, ?, ?, ?, ?);
-        """, (self.account, Timestamp(time.time()).internal, str(uuid4()),
+        """, (self.account, Timestamp.now().internal, str(uuid4()),
               put_timestamp, put_timestamp))
 
     def merge_items(self, item_list):
@@ -247,7 +274,7 @@ class ExampleBroker(DatabaseBroker):
             conn.commit()
 
     def _commit_puts_load(self, item_list, entry):
-        (name, timestamp, deleted) = pickle.loads(entry.decode('base64'))
+        (name, timestamp, deleted) = entry
         item_list.append({
             'name': name,
             'created_at': timestamp,
@@ -264,10 +291,10 @@ class ExampleBroker(DatabaseBroker):
             self.merge_items([record])
             return
         with open(self.pending_file, 'a+b') as fp:
-            fp.write(':')
-            fp.write(pickle.dumps(
+            fp.write(b':')
+            fp.write(base64.b64encode(pickle.dumps(
                 (name, timestamp, deleted),
-                protocol=PICKLE_PROTOCOL).encode('base64'))
+                protocol=PICKLE_PROTOCOL)))
             fp.flush()
 
     def put_test(self, name, timestamp):
@@ -493,7 +520,15 @@ class TestExampleBroker(unittest.TestCase):
                           storage_policy_index=int(self.policy))
         self.assertEqual(broker.metadata, {})
         self.assertEqual(broker.get_raw_metadata(), '')
-        key = u'test\u062a'.encode('utf-8')
+        # This is not obvious. The actual JSON in the database is the same:
+        #  '{"test\\u062a": ["value\\u062a", "0000000001.00000"]}'
+        # The only difference is what reading it produces on py2 and py3.
+        # We use native strings for metadata keys (see native_str_keys()),
+        # so keys are different.
+        if six.PY2:
+            key = u'test\u062a'.encode('utf-8')
+        else:
+            key = u'test\u062a'
         value = u'value\u062a'
         metadata = {
             key: [value, Timestamp(1).internal]
@@ -552,7 +587,7 @@ class TestExampleBroker(unittest.TestCase):
 
     def test_get_syncs(self):
         broker = self.broker_class(':memory:', account='a', container='c')
-        broker.initialize(Timestamp(time.time()).internal,
+        broker.initialize(Timestamp.now().internal,
                           storage_policy_index=int(self.policy))
         self.assertEqual([], broker.get_syncs())
         broker.merge_syncs([{'sync_point': 1, 'remote_id': 'remote1'}])
@@ -579,6 +614,25 @@ class TestExampleBroker(unittest.TestCase):
         self.assertEqual(0, info[count_key])
         broker.get_info()
         self.assertEqual(1, broker.get_info()[count_key])
+
+    @with_tempdir
+    def test_maybe_get(self, tempdir):
+        broker = self.broker_class(os.path.join(tempdir, 'test.db'),
+                                   account='a', container='c')
+        broker.initialize(next(self.ts),
+                          storage_policy_index=int(self.policy))
+        qry = 'select account from %s_stat' % broker.db_type
+        with broker.maybe_get(None) as conn:
+            rows = [dict(x) for x in conn.execute(qry)]
+        self.assertEqual([{'account': 'a'}], rows)
+        self.assertEqual(conn, broker.conn)
+        with broker.get() as other_conn:
+            self.assertEqual(broker.conn, None)
+            with broker.maybe_get(other_conn) as identity_conn:
+                self.assertIs(other_conn, identity_conn)
+                self.assertEqual(broker.conn, None)
+            self.assertEqual(broker.conn, None)
+        self.assertEqual(broker.conn, conn)
 
 
 class TestDatabaseBroker(unittest.TestCase):
@@ -607,7 +661,7 @@ class TestDatabaseBroker(unittest.TestCase):
         db_file = os.path.join(self.testdir, '1.db')
         broker = DatabaseBroker(db_file)
         self.assertEqual(broker.db_file, db_file)
-        self.assertTrue(broker.conn is None)
+        self.assertIsNone(broker.conn)
 
     def test_disk_preallocate(self):
         test_size = [-1]
@@ -633,11 +687,9 @@ class TestDatabaseBroker(unittest.TestCase):
         stub_dict = {}
 
         def stub(*args, **kwargs):
-            for key in stub_dict.keys():
-                del stub_dict[key]
+            stub_dict.clear()
             stub_dict['args'] = args
-            for key, value in kwargs.items():
-                stub_dict[key] = value
+            stub_dict.update(kwargs)
         broker = DatabaseBroker(':memory:')
         broker._initialize = stub
         broker.initialize(normalize_timestamp('1'))
@@ -676,7 +728,7 @@ class TestDatabaseBroker(unittest.TestCase):
         broker._initialize = init_stub
         # Initializes a good broker for us
         broker.initialize(normalize_timestamp('1'))
-        self.assertTrue(broker.conn is not None)
+        self.assertIsNotNone(broker.conn)
         broker._delete_db = delete_stub
         stub_called[0] = False
         broker.delete_db('2')
@@ -697,20 +749,20 @@ class TestDatabaseBroker(unittest.TestCase):
 
     def test_get(self):
         broker = DatabaseBroker(':memory:')
-        got_exc = False
-        try:
-            with broker.get() as conn:
-                conn.execute('SELECT 1')
-        except Exception:
-            got_exc = True
+        with self.assertRaises(DatabaseConnectionError) as raised, \
+                broker.get() as conn:
+            conn.execute('SELECT 1')
+        self.assertEqual(
+            str(raised.exception),
+            "DB connection error (:memory:, 0):\nDB doesn't exist")
+
         broker = DatabaseBroker(os.path.join(self.testdir, '1.db'))
-        got_exc = False
-        try:
-            with broker.get() as conn:
-                conn.execute('SELECT 1')
-        except Exception:
-            got_exc = True
-        self.assertTrue(got_exc)
+        with self.assertRaises(DatabaseConnectionError) as raised, \
+                broker.get() as conn:
+            conn.execute('SELECT 1')
+        self.assertEqual(
+            str(raised.exception),
+            "DB connection error (%s, 0):\nDB doesn't exist" % broker.db_file)
 
         def stub(*args, **kwargs):
             pass
@@ -748,14 +800,11 @@ class TestDatabaseBroker(unittest.TestCase):
                  os.path.join(dbpath, '1.db'))
             broker = DatabaseBroker(os.path.join(dbpath, '1.db'))
             broker.db_type = 'test'
-            exc = None
-            try:
-                with broker.get() as conn:
-                    conn.execute('SELECT * FROM test')
-            except Exception as err:
-                exc = err
+            with self.assertRaises(sqlite3.DatabaseError) as raised, \
+                    broker.get() as conn:
+                conn.execute('SELECT * FROM test')
             self.assertEqual(
-                str(exc),
+                str(raised.exception),
                 'Quarantined %s to %s due to malformed database' %
                 (dbpath, qpath))
             # Test malformed schema database
@@ -764,14 +813,11 @@ class TestDatabaseBroker(unittest.TestCase):
                  os.path.join(dbpath, '1.db'))
             broker = DatabaseBroker(os.path.join(dbpath, '1.db'))
             broker.db_type = 'test'
-            exc = None
-            try:
-                with broker.get() as conn:
-                    conn.execute('SELECT * FROM test')
-            except Exception as err:
-                exc = err
+            with self.assertRaises(sqlite3.DatabaseError) as raised, \
+                    broker.get() as conn:
+                conn.execute('SELECT * FROM test')
             self.assertEqual(
-                str(exc),
+                str(raised.exception),
                 'Quarantined %s to %s due to malformed database' %
                 (dbpath, qpath))
             # Test corrupted database
@@ -780,26 +826,42 @@ class TestDatabaseBroker(unittest.TestCase):
                  os.path.join(dbpath, '1.db'))
             broker = DatabaseBroker(os.path.join(dbpath, '1.db'))
             broker.db_type = 'test'
-            exc = None
-            try:
-                with broker.get() as conn:
-                    conn.execute('SELECT * FROM test')
-            except Exception as err:
-                exc = err
+            with self.assertRaises(sqlite3.DatabaseError) as raised, \
+                    broker.get() as conn:
+                conn.execute('SELECT * FROM test')
             self.assertEqual(
-                str(exc),
+                str(raised.exception),
                 'Quarantined %s to %s due to corrupted database' %
                 (dbpath, qpath))
 
+    def test_get_raw_metadata_missing_container_info(self):
+        # Test missing container_info/container_stat row
+        dbpath = os.path.join(self.testdir, 'dev', 'dbs', 'par', 'pre', 'db')
+        mkdirs(dbpath)
+        qpath = os.path.join(self.testdir, 'dev', 'quarantined', 'containers',
+                             'db')
+        copy(os.path.join(os.path.dirname(__file__),
+                          'missing_container_info.db'),
+             os.path.join(dbpath, '1.db'))
+
+        broker = DatabaseBroker(os.path.join(dbpath, '1.db'))
+        broker.db_type = 'container'
+
+        with self.assertRaises(sqlite3.DatabaseError) as raised:
+            broker.get_raw_metadata()
+        self.assertEqual(
+            str(raised.exception),
+            'Quarantined %s to %s due to missing row in container_stat table' %
+            (dbpath, qpath))
+
     def test_lock(self):
         broker = DatabaseBroker(os.path.join(self.testdir, '1.db'), timeout=.1)
-        got_exc = False
-        try:
-            with broker.lock():
-                pass
-        except Exception:
-            got_exc = True
-        self.assertTrue(got_exc)
+        with self.assertRaises(DatabaseConnectionError) as raised, \
+                broker.lock():
+            pass
+        self.assertEqual(
+            str(raised.exception),
+            "DB connection error (%s, 0):\nDB doesn't exist" % broker.db_file)
 
         def stub(*args, **kwargs):
             pass
@@ -813,13 +875,12 @@ class TestDatabaseBroker(unittest.TestCase):
                                  timeout=.1)
         broker2._initialize = stub
         with broker.lock():
-            got_exc = False
-            try:
-                with broker2.lock():
-                    pass
-            except LockTimeout:
-                got_exc = True
-            self.assertTrue(got_exc)
+            with self.assertRaises(LockTimeout) as raised, \
+                    broker2.lock():
+                pass
+        self.assertEqual(str(raised.exception),
+                         '0.1 seconds: %s' % broker.db_file)
+
         try:
             with broker.lock():
                 raise Exception('test')
@@ -966,6 +1027,19 @@ class TestDatabaseBroker(unittest.TestCase):
         self.assertEqual(broker.get_sync(uuid3), 2)
         broker.merge_syncs([{'sync_point': 5, 'remote_id': uuid2}])
         self.assertEqual(broker.get_sync(uuid2), 5)
+        # max sync point sticks
+        broker.merge_syncs([{'sync_point': 5, 'remote_id': uuid2}])
+        self.assertEqual(broker.get_sync(uuid2), 5)
+        self.assertEqual(broker.get_sync(uuid3), 2)
+        broker.merge_syncs([{'sync_point': 4, 'remote_id': uuid2}])
+        self.assertEqual(broker.get_sync(uuid2), 5)
+        self.assertEqual(broker.get_sync(uuid3), 2)
+        broker.merge_syncs([{'sync_point': -1, 'remote_id': uuid2},
+                            {'sync_point': 3, 'remote_id': uuid3}])
+        self.assertEqual(broker.get_sync(uuid2), 5)
+        self.assertEqual(broker.get_sync(uuid3), 3)
+        self.assertEqual(broker.get_sync(uuid2, incoming=False), 3)
+        self.assertEqual(broker.get_sync(uuid3, incoming=False), 4)
 
     def test_get_replication_info(self):
         self.get_replication_info_tester(metadata=False)
@@ -1066,72 +1140,118 @@ class TestDatabaseBroker(unittest.TestCase):
             'max_row': 1, 'id': broker_uuid, 'metadata': broker_metadata})
         return broker
 
-    def test_metadata(self):
-        def reclaim(broker, timestamp):
-            with broker.get() as conn:
-                broker._reclaim(conn, timestamp)
-                conn.commit()
+    # only testing _reclaim_metadata here
+    @patch.object(DatabaseBroker, '_reclaim')
+    def test_metadata(self, mock_reclaim):
         # Initializes a good broker for us
         broker = self.get_replication_info_tester(metadata=True)
         # Add our first item
         first_timestamp = normalize_timestamp(1)
         first_value = '1'
         broker.update_metadata({'First': [first_value, first_timestamp]})
-        self.assertTrue('First' in broker.metadata)
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
         # Add our second item
         second_timestamp = normalize_timestamp(2)
         second_value = '2'
         broker.update_metadata({'Second': [second_value, second_timestamp]})
-        self.assertTrue('First' in broker.metadata)
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
-        self.assertTrue('Second' in broker.metadata)
+        self.assertIn('Second', broker.metadata)
         self.assertEqual(broker.metadata['Second'],
                          [second_value, second_timestamp])
         # Update our first item
         first_timestamp = normalize_timestamp(3)
         first_value = '1b'
         broker.update_metadata({'First': [first_value, first_timestamp]})
-        self.assertTrue('First' in broker.metadata)
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
-        self.assertTrue('Second' in broker.metadata)
+        self.assertIn('Second', broker.metadata)
         self.assertEqual(broker.metadata['Second'],
                          [second_value, second_timestamp])
         # Delete our second item (by setting to empty string)
         second_timestamp = normalize_timestamp(4)
         second_value = ''
         broker.update_metadata({'Second': [second_value, second_timestamp]})
-        self.assertTrue('First' in broker.metadata)
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
-        self.assertTrue('Second' in broker.metadata)
+        self.assertIn('Second', broker.metadata)
         self.assertEqual(broker.metadata['Second'],
                          [second_value, second_timestamp])
         # Reclaim at point before second item was deleted
-        reclaim(broker, normalize_timestamp(3))
-        self.assertTrue('First' in broker.metadata)
+        broker.reclaim(normalize_timestamp(3), normalize_timestamp(3))
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
-        self.assertTrue('Second' in broker.metadata)
+        self.assertIn('Second', broker.metadata)
         self.assertEqual(broker.metadata['Second'],
                          [second_value, second_timestamp])
         # Reclaim at point second item was deleted
-        reclaim(broker, normalize_timestamp(4))
-        self.assertTrue('First' in broker.metadata)
+        broker.reclaim(normalize_timestamp(4), normalize_timestamp(4))
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
-        self.assertTrue('Second' in broker.metadata)
+        self.assertIn('Second', broker.metadata)
         self.assertEqual(broker.metadata['Second'],
                          [second_value, second_timestamp])
         # Reclaim after point second item was deleted
-        reclaim(broker, normalize_timestamp(5))
-        self.assertTrue('First' in broker.metadata)
+        broker.reclaim(normalize_timestamp(5), normalize_timestamp(5))
+        self.assertIn('First', broker.metadata)
         self.assertEqual(broker.metadata['First'],
                          [first_value, first_timestamp])
         self.assertNotIn('Second', broker.metadata)
+        # Delete first item (by setting to empty string)
+        first_timestamp = normalize_timestamp(6)
+        broker.update_metadata({'First': ['', first_timestamp]})
+        self.assertIn('First', broker.metadata)
+        # Check that sync_timestamp doesn't cause item to be reclaimed
+        broker.reclaim(normalize_timestamp(5), normalize_timestamp(99))
+        self.assertIn('First', broker.metadata)
+
+    def test_update_metadata_missing_container_info(self):
+        # Test missing container_info/container_stat row
+        dbpath = os.path.join(self.testdir, 'dev', 'dbs', 'par', 'pre', 'db')
+        mkdirs(dbpath)
+        qpath = os.path.join(self.testdir, 'dev', 'quarantined', 'containers',
+                             'db')
+        copy(os.path.join(os.path.dirname(__file__),
+                          'missing_container_info.db'),
+             os.path.join(dbpath, '1.db'))
+
+        broker = DatabaseBroker(os.path.join(dbpath, '1.db'))
+        broker.db_type = 'container'
+
+        with self.assertRaises(sqlite3.DatabaseError) as raised:
+            broker.update_metadata({'First': ['1', normalize_timestamp(1)]})
+        self.assertEqual(
+            str(raised.exception),
+            'Quarantined %s to %s due to missing row in container_stat table' %
+            (dbpath, qpath))
+
+    def test_reclaim_missing_container_info(self):
+        # Test missing container_info/container_stat row
+        dbpath = os.path.join(self.testdir, 'dev', 'dbs', 'par', 'pre', 'db')
+        mkdirs(dbpath)
+        qpath = os.path.join(self.testdir, 'dev', 'quarantined', 'containers',
+                             'db')
+        copy(os.path.join(os.path.dirname(__file__),
+                          'missing_container_info.db'),
+             os.path.join(dbpath, '1.db'))
+
+        broker = DatabaseBroker(os.path.join(dbpath, '1.db'))
+        broker.db_type = 'container'
+
+        with self.assertRaises(sqlite3.DatabaseError) as raised, \
+                broker.get() as conn:
+            broker._reclaim_metadata(conn, 0)
+        self.assertEqual(
+            str(raised.exception),
+            'Quarantined %s to %s due to missing row in container_stat table' %
+            (dbpath, qpath))
 
     @patch.object(DatabaseBroker, 'validate_metadata')
     def test_validate_metadata_is_called_from_update_metadata(self, mock):
@@ -1158,19 +1278,13 @@ class TestDatabaseBroker(unittest.TestCase):
             metadata[key] = ('B', normalize_timestamp(1))
         key = 'X-Account-Meta-Foo'.format(c)
         metadata[key] = ('', normalize_timestamp(1))
-        try:
-            DatabaseBroker.validate_metadata(metadata)
-        except HTTPException:
-            self.fail('Unexpected HTTPException')
+        self.assertIsNone(DatabaseBroker.validate_metadata(metadata))
 
     def test_metadata_raises_exception_on_non_utf8(self):
         def try_validate(metadata):
-            try:
+            with self.assertRaises(HTTPException) as raised:
                 DatabaseBroker.validate_metadata(metadata)
-            except HTTPException as e:
-                self.assertEqual(str(e), '400 Bad Request')
-            else:
-                self.fail('HTTPException not raised')
+            self.assertEqual(str(raised.exception), '400 Bad Request')
         ts = normalize_timestamp(1)
         try_validate({'X-Account-Meta-Foo': (b'\xff', ts)})
         try_validate({b'X-Container-Meta-\xff': ('bar', ts)})
@@ -1202,10 +1316,7 @@ class TestDatabaseBroker(unittest.TestCase):
             metadata['X-Account-Meta-k'] = (
                 'v' * (MAX_META_OVERALL_SIZE - size - 1),
                 normalize_timestamp(1))
-        try:
-            DatabaseBroker.validate_metadata(metadata)
-        except HTTPException:
-            self.fail('Unexpected HTTPException')
+        self.assertIsNone(DatabaseBroker.validate_metadata(metadata))
 
     def test_metadata_raises_exception_over_max_overall_size(self):
         metadata = {}
@@ -1250,16 +1361,154 @@ class TestDatabaseBroker(unittest.TestCase):
             broker.db_type = 'test'
             try:
                 raise ex
-            except (sqlite3.DatabaseError, DatabaseConnectionError):
-                try:
+            except sqlite3.DatabaseError:
+                with self.assertRaises(sqlite3.DatabaseError) as raised:
                     broker.possibly_quarantine(*sys.exc_info())
-                except Exception as exc:
-                    self.assertEqual(
-                        str(exc),
-                        'Quarantined %s to %s due to %s database' %
-                        (dbpath, qpath, hint))
-                else:
-                    self.fail('Expected an exception to be raised')
+                self.assertEqual(
+                    str(raised.exception),
+                    'Quarantined %s to %s due to %s database' %
+                    (dbpath, qpath, hint))
+
+    def test_skip_commits(self):
+        broker = DatabaseBroker(':memory:')
+        self.assertTrue(broker._skip_commit_puts())
+        broker._initialize = MagicMock()
+        broker.initialize(Timestamp.now())
+        self.assertTrue(broker._skip_commit_puts())
+
+        # not initialized
+        db_file = os.path.join(self.testdir, '1.db')
+        broker = DatabaseBroker(db_file)
+        self.assertFalse(os.path.exists(broker.db_file))  # sanity check
+        self.assertTrue(broker._skip_commit_puts())
+
+        # no pending file
+        broker._initialize = MagicMock()
+        broker.initialize(Timestamp.now())
+        self.assertTrue(os.path.exists(broker.db_file))  # sanity check
+        self.assertFalse(os.path.exists(broker.pending_file))  # sanity check
+        self.assertTrue(broker._skip_commit_puts())
+
+        # pending file exists
+        with open(broker.pending_file, 'wb'):
+            pass
+        self.assertTrue(os.path.exists(broker.pending_file))  # sanity check
+        self.assertFalse(broker._skip_commit_puts())
+
+        # skip_commits is True
+        broker.skip_commits = True
+        self.assertTrue(broker._skip_commit_puts())
+
+        # re-init
+        broker = DatabaseBroker(db_file)
+        self.assertFalse(broker._skip_commit_puts())
+
+        # constructor can override
+        broker = DatabaseBroker(db_file, skip_commits=True)
+        self.assertTrue(broker._skip_commit_puts())
+
+    def test_commit_puts(self):
+        db_file = os.path.join(self.testdir, '1.db')
+        broker = DatabaseBroker(db_file)
+        broker._initialize = MagicMock()
+        broker.initialize(Timestamp.now())
+        with open(broker.pending_file, 'wb'):
+            pass
+
+        # merge given list
+        with patch.object(broker, 'merge_items') as mock_merge_items:
+            broker._commit_puts(['test'])
+        mock_merge_items.assert_called_once_with(['test'])
+
+        # load file and merge
+        with open(broker.pending_file, 'wb') as fd:
+            for v in (1, 2, 99):
+                fd.write(b':' + base64.b64encode(pickle.dumps(
+                    v, protocol=PICKLE_PROTOCOL)))
+        with patch.object(broker, 'merge_items') as mock_merge_items:
+            broker._commit_puts_load = lambda l, e: l.append(e)
+            broker._commit_puts()
+        mock_merge_items.assert_called_once_with([1, 2, 99])
+        self.assertEqual(0, os.path.getsize(broker.pending_file))
+
+        # load file and merge with given list
+        with open(broker.pending_file, 'wb') as fd:
+            fd.write(b':' + base64.b64encode(pickle.dumps(
+                b'bad', protocol=PICKLE_PROTOCOL)))
+        with patch.object(broker, 'merge_items') as mock_merge_items:
+            broker._commit_puts_load = lambda l, e: l.append(e)
+            broker._commit_puts([b'not'])
+        mock_merge_items.assert_called_once_with([b'not', b'bad'])
+        self.assertEqual(0, os.path.getsize(broker.pending_file))
+
+        # skip_commits True - no merge
+        db_file = os.path.join(self.testdir, '2.db')
+        broker = DatabaseBroker(db_file, skip_commits=True)
+        broker._initialize = MagicMock()
+        broker.initialize(Timestamp.now())
+        with open(broker.pending_file, 'wb') as fd:
+            fd.write(b':ignored')
+        with patch.object(broker, 'merge_items') as mock_merge_items:
+            with self.assertRaises(DatabaseConnectionError) as cm:
+                broker._commit_puts([b'hmmm'])
+        mock_merge_items.assert_not_called()
+        self.assertIn('commits not accepted', str(cm.exception))
+        with open(broker.pending_file, 'rb') as fd:
+            self.assertEqual(b':ignored', fd.read())
+
+    def test_put_record(self):
+        db_file = os.path.join(self.testdir, '1.db')
+        broker = DatabaseBroker(db_file)
+        broker._initialize = MagicMock()
+        broker.initialize(Timestamp.now())
+
+        # pending file created and record written
+        broker.make_tuple_for_pickle = lambda x: x.upper()
+        with patch.object(broker, '_commit_puts') as mock_commit_puts:
+            broker.put_record('pinky')
+        mock_commit_puts.assert_not_called()
+        with open(broker.pending_file, 'rb') as fd:
+            pending = fd.read()
+        items = pending.split(b':')
+        self.assertEqual(['PINKY'],
+                         [pickle.loads(base64.b64decode(i))
+                             for i in items[1:]])
+
+        # record appended
+        with patch.object(broker, '_commit_puts') as mock_commit_puts:
+            broker.put_record('perky')
+        mock_commit_puts.assert_not_called()
+        with open(broker.pending_file, 'rb') as fd:
+            pending = fd.read()
+        items = pending.split(b':')
+        self.assertEqual(['PINKY', 'PERKY'],
+                         [pickle.loads(base64.b64decode(i))
+                             for i in items[1:]])
+
+        # pending file above cap
+        cap = swift.common.db.PENDING_CAP
+        while os.path.getsize(broker.pending_file) < cap:
+            with open(broker.pending_file, 'ab') as fd:
+                fd.write(b'x' * 100000)
+        with patch.object(broker, '_commit_puts') as mock_commit_puts:
+            broker.put_record('direct')
+        mock_commit_puts.called_once_with(['direct'])
+
+        # records shouldn't be put to brokers with skip_commits True because
+        # they cannot be accepted if the pending file is full
+        broker.skip_commits = True
+        with open(broker.pending_file, 'wb'):
+            # empty the pending file
+            pass
+        with patch.object(broker, '_commit_puts') as mock_commit_puts:
+            with self.assertRaises(DatabaseConnectionError) as cm:
+                broker.put_record('unwelcome')
+        self.assertIn('commits not accepted', str(cm.exception))
+        mock_commit_puts.assert_not_called()
+        with open(broker.pending_file, 'rb') as fd:
+            pending = fd.read()
+        self.assertFalse(pending)
+
 
 if __name__ == '__main__':
     unittest.main()

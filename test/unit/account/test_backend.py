@@ -32,6 +32,8 @@ import random
 import mock
 import base64
 
+import six
+
 from swift.account.backend import AccountBroker
 from swift.common.utils import Timestamp
 from test.unit import patch_policies, with_tempdir, make_timestamp_iter
@@ -87,40 +89,40 @@ class TestAccountBroker(unittest.TestCase):
                 raise Exception('OMG')
         except Exception:
             pass
-        self.assertTrue(broker.conn is None)
+        self.assertIsNone(broker.conn)
 
     def test_empty(self):
         # Test AccountBroker.empty
         broker = AccountBroker(':memory:', account='a')
         broker.initialize(Timestamp('1').internal)
         self.assertTrue(broker.empty())
-        broker.put_container('o', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('o', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        self.assertTrue(not broker.empty())
+        self.assertFalse(broker.empty())
         sleep(.00001)
-        broker.put_container('o', 0, Timestamp(time()).internal, 0, 0,
+        broker.put_container('o', 0, Timestamp.now().internal, 0, 0,
                              POLICIES.default.idx)
         self.assertTrue(broker.empty())
 
     def test_is_status_deleted(self):
         # Test AccountBroker.is_status_deleted
         broker1 = AccountBroker(':memory:', account='a')
-        broker1.initialize(Timestamp(time()).internal)
-        self.assertTrue(not broker1.is_status_deleted())
-        broker1.delete_db(Timestamp(time()).internal)
+        broker1.initialize(Timestamp.now().internal)
+        self.assertFalse(broker1.is_status_deleted())
+        broker1.delete_db(Timestamp.now().internal)
         self.assertTrue(broker1.is_status_deleted())
         broker2 = AccountBroker(':memory:', account='a')
-        broker2.initialize(Timestamp(time()).internal)
+        broker2.initialize(Timestamp.now().internal)
         # Set delete_timestamp greater than put_timestamp
         broker2.merge_timestamps(
-            time(), Timestamp(time()).internal,
+            time(), Timestamp.now().internal,
             Timestamp(time() + 999).internal)
         self.assertTrue(broker2.is_status_deleted())
 
     def test_reclaim(self):
         broker = AccountBroker(':memory:', account='test_account')
         broker.initialize(Timestamp('1').internal)
-        broker.put_container('c', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('c', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
             self.assertEqual(conn.execute(
@@ -138,7 +140,7 @@ class TestAccountBroker(unittest.TestCase):
                 "SELECT count(*) FROM container "
                 "WHERE deleted = 1").fetchone()[0], 0)
         sleep(.00001)
-        broker.put_container('c', 0, Timestamp(time()).internal, 0, 0,
+        broker.put_container('c', 0, Timestamp.now().internal, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
             self.assertEqual(conn.execute(
@@ -156,7 +158,7 @@ class TestAccountBroker(unittest.TestCase):
                 "SELECT count(*) FROM container "
                 "WHERE deleted = 1").fetchone()[0], 1)
         sleep(.00001)
-        broker.reclaim(Timestamp(time()).internal, time())
+        broker.reclaim(Timestamp.now().internal, time())
         with broker.get() as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM container "
@@ -168,10 +170,10 @@ class TestAccountBroker(unittest.TestCase):
         broker.put_container('x', 0, 0, 0, 0, POLICIES.default.idx)
         broker.put_container('y', 0, 0, 0, 0, POLICIES.default.idx)
         broker.put_container('z', 0, 0, 0, 0, POLICIES.default.idx)
-        broker.reclaim(Timestamp(time()).internal, time())
+        broker.reclaim(Timestamp.now().internal, time())
         # Now delete the account
-        broker.delete_db(Timestamp(time()).internal)
-        broker.reclaim(Timestamp(time()).internal, time())
+        broker.delete_db(Timestamp.now().internal)
+        broker.reclaim(Timestamp.now().internal, time())
 
     def test_delete_db_status(self):
         ts = (Timestamp(t).internal for t in itertools.count(int(time())))
@@ -180,7 +182,7 @@ class TestAccountBroker(unittest.TestCase):
         broker.initialize(start)
         info = broker.get_info()
         self.assertEqual(info['put_timestamp'], Timestamp(start).internal)
-        self.assertTrue(Timestamp(info['created_at']) >= start)
+        self.assertGreaterEqual(Timestamp(info['created_at']), start)
         self.assertEqual(info['delete_timestamp'], '0')
         if self.__class__ == TestAccountBrokerBeforeMetadata:
             self.assertEqual(info['status_changed_at'], '0')
@@ -193,7 +195,7 @@ class TestAccountBroker(unittest.TestCase):
         broker.delete_db(delete_timestamp)
         info = broker.get_info()
         self.assertEqual(info['put_timestamp'], Timestamp(start).internal)
-        self.assertTrue(Timestamp(info['created_at']) >= start)
+        self.assertGreaterEqual(Timestamp(info['created_at']), start)
         self.assertEqual(info['delete_timestamp'], delete_timestamp)
         self.assertEqual(info['status_changed_at'], delete_timestamp)
 
@@ -201,7 +203,7 @@ class TestAccountBroker(unittest.TestCase):
         # Test AccountBroker.delete_container
         broker = AccountBroker(':memory:', account='a')
         broker.initialize(Timestamp('1').internal)
-        broker.put_container('o', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('o', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
             self.assertEqual(conn.execute(
@@ -211,7 +213,7 @@ class TestAccountBroker(unittest.TestCase):
                 "SELECT count(*) FROM container "
                 "WHERE deleted = 1").fetchone()[0], 0)
         sleep(.00001)
-        broker.put_container('o', 0, Timestamp(time()).internal, 0, 0,
+        broker.put_container('o', 0, Timestamp.now().internal, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
             self.assertEqual(conn.execute(
@@ -227,7 +229,7 @@ class TestAccountBroker(unittest.TestCase):
         broker.initialize(Timestamp('1').internal)
 
         # Create initial container
-        timestamp = Timestamp(time()).internal
+        timestamp = Timestamp.now().internal
         broker.put_container('"{<container \'&\' name>}"', timestamp, 0, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
@@ -255,7 +257,7 @@ class TestAccountBroker(unittest.TestCase):
 
         # Put new event
         sleep(.00001)
-        timestamp = Timestamp(time()).internal
+        timestamp = Timestamp.now().internal
         broker.put_container('"{<container \'&\' name>}"', timestamp, 0, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
@@ -301,7 +303,7 @@ class TestAccountBroker(unittest.TestCase):
 
         # Put new delete event
         sleep(.00001)
-        timestamp = Timestamp(time()).internal
+        timestamp = Timestamp.now().internal
         broker.put_container('"{<container \'&\' name>}"', 0, timestamp, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
@@ -316,7 +318,7 @@ class TestAccountBroker(unittest.TestCase):
 
         # Put new event
         sleep(.00001)
-        timestamp = Timestamp(time()).internal
+        timestamp = Timestamp.now().internal
         broker.put_container('"{<container \'&\' name>}"', timestamp, 0, 0, 0,
                              POLICIES.default.idx)
         with broker.get() as conn:
@@ -347,31 +349,31 @@ class TestAccountBroker(unittest.TestCase):
         info = broker.get_info()
         self.assertEqual(info['container_count'], 0)
 
-        broker.put_container('c1', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('c1', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         info = broker.get_info()
         self.assertEqual(info['container_count'], 1)
 
         sleep(.00001)
-        broker.put_container('c2', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('c2', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         info = broker.get_info()
         self.assertEqual(info['container_count'], 2)
 
         sleep(.00001)
-        broker.put_container('c2', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('c2', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         info = broker.get_info()
         self.assertEqual(info['container_count'], 2)
 
         sleep(.00001)
-        broker.put_container('c1', 0, Timestamp(time()).internal, 0, 0,
+        broker.put_container('c1', 0, Timestamp.now().internal, 0, 0,
                              POLICIES.default.idx)
         info = broker.get_info()
         self.assertEqual(info['container_count'], 1)
 
         sleep(.00001)
-        broker.put_container('c2', 0, Timestamp(time()).internal, 0, 0,
+        broker.put_container('c2', 0, Timestamp.now().internal, 0, 0,
                              POLICIES.default.idx)
         info = broker.get_info()
         self.assertEqual(info['container_count'], 0)
@@ -383,16 +385,16 @@ class TestAccountBroker(unittest.TestCase):
         for cont1 in range(4):
             for cont2 in range(125):
                 broker.put_container('%d-%04d' % (cont1, cont2),
-                                     Timestamp(time()).internal, 0, 0, 0,
+                                     Timestamp.now().internal, 0, 0, 0,
                                      POLICIES.default.idx)
         for cont in range(125):
             broker.put_container('2-0051-%04d' % cont,
-                                 Timestamp(time()).internal, 0, 0, 0,
+                                 Timestamp.now().internal, 0, 0, 0,
                                  POLICIES.default.idx)
 
         for cont in range(125):
             broker.put_container('3-%04d-0049' % cont,
-                                 Timestamp(time()).internal, 0, 0, 0,
+                                 Timestamp.now().internal, 0, 0, 0,
                                  POLICIES.default.idx)
 
         listing = broker.list_containers_iter(100, '', None, None, '')
@@ -485,7 +487,7 @@ class TestAccountBroker(unittest.TestCase):
                           '3-0047-', '3-0048', '3-0048-', '3-0049',
                           '3-0049-', '3-0050'])
 
-        broker.put_container('3-0049-', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('3-0049-', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         listing = broker.list_containers_iter(10, '3-0048', None, None, None)
         self.assertEqual(len(listing), 10)
@@ -673,30 +675,30 @@ class TestAccountBroker(unittest.TestCase):
         # account that has an odd container with a trailing delimiter
         broker = AccountBroker(':memory:', account='a')
         broker.initialize(Timestamp('1').internal)
-        broker.put_container('a', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('a-', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a-', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('a-a', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a-a', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('a-a-a', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a-a-a', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('a-a-b', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a-a-b', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('a-b', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a-b', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         # NB: ord(".") == ord("-") + 1
-        broker.put_container('a.', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a.', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('a.b', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('a.b', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('b', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('b', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('b-a', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('b-a', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('b-b', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('b-b', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
-        broker.put_container('c', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('c', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         listing = broker.list_containers_iter(15, None, None, None, None)
         self.assertEqual([row[0] for row in listing],
@@ -720,26 +722,23 @@ class TestAccountBroker(unittest.TestCase):
         broker.put_container('b', Timestamp(2).internal,
                              Timestamp(0).internal, 0, 0,
                              POLICIES.default.idx)
-        hasha = hashlib.md5(
-            '%s-%s' % ('a', "%s-%s-%s-%s" % (
-                Timestamp(1).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashb = hashlib.md5(
-            '%s-%s' % ('b', "%s-%s-%s-%s" % (
-                Timestamp(2).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashc = \
-            ''.join(('%02x' % (ord(a) ^ ord(b)) for a, b in zip(hasha, hashb)))
+        text = '%s-%s' % ('a', "%s-%s-%s-%s" % (
+               Timestamp(1).internal, Timestamp(0).internal, 0, 0))
+        hasha = hashlib.md5(text.encode('ascii')).digest()
+        text = '%s-%s' % ('b', "%s-%s-%s-%s" % (
+               Timestamp(2).internal, Timestamp(0).internal, 0, 0))
+        hashb = hashlib.md5(text.encode('ascii')).digest()
+        hashc = ''.join(('%02x' % (ord(a) ^ ord(b) if six.PY2 else a ^ b)
+                         for a, b in zip(hasha, hashb)))
         self.assertEqual(broker.get_info()['hash'], hashc)
         broker.put_container('b', Timestamp(3).internal,
                              Timestamp(0).internal, 0, 0,
                              POLICIES.default.idx)
-        hashb = hashlib.md5(
-            '%s-%s' % ('b', "%s-%s-%s-%s" % (
-                Timestamp(3).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashc = \
-            ''.join(('%02x' % (ord(a) ^ ord(b)) for a, b in zip(hasha, hashb)))
+        text = '%s-%s' % ('b', "%s-%s-%s-%s" % (
+               Timestamp(3).internal, Timestamp(0).internal, 0, 0))
+        hashb = hashlib.md5(text.encode('ascii')).digest()
+        hashc = ''.join(('%02x' % (ord(a) ^ ord(b) if six.PY2 else a ^ b)
+                         for a, b in zip(hasha, hashb)))
         self.assertEqual(broker.get_info()['hash'], hashc)
 
     def test_merge_items(self):
@@ -767,7 +766,9 @@ class TestAccountBroker(unittest.TestCase):
                          sorted([rec['name'] for rec in items]))
 
     def test_merge_items_overwrite_unicode(self):
-        snowman = u'\N{SNOWMAN}'.encode('utf-8')
+        snowman = u'\N{SNOWMAN}'
+        if six.PY2:
+            snowman = snowman.encode('utf-8')
         broker1 = AccountBroker(':memory:', account='a')
         broker1.initialize(Timestamp('1').internal, 0)
         id1 = broker1.get_info()['id']
@@ -1022,7 +1023,7 @@ def premetadata_create_account_stat_table(self, conn, put_timestamp):
     conn.execute('''
         UPDATE account_stat SET account = ?, created_at = ?, id = ?,
                put_timestamp = ?
-        ''', (self.account, Timestamp(time()).internal, str(uuid4()),
+        ''', (self.account, Timestamp.now().internal, str(uuid4()),
               put_timestamp))
 
 
@@ -1062,7 +1063,7 @@ class TestAccountBrokerBeforeMetadata(TestAccountBroker):
                 conn.execute('SELECT metadata FROM account_stat')
             except BaseException as err:
                 exc = err
-        self.assertTrue('no such column: metadata' in str(exc))
+        self.assertIn('no such column: metadata', str(exc))
 
     def tearDown(self):
         AccountBroker.create_account_stat_table = \
@@ -1149,12 +1150,12 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
                 conn.execute('SELECT storage_policy_index FROM container')
             except BaseException as err:
                 exc = err
-        self.assertTrue('no such column: storage_policy_index' in str(exc))
+        self.assertIn('no such column: storage_policy_index', str(exc))
         with broker.get() as conn:
             try:
                 conn.execute('SELECT * FROM policy_stat')
             except sqlite3.OperationalError as err:
-                self.assertTrue('no such table: policy_stat' in str(err))
+                self.assertIn('no such table: policy_stat', str(err))
             else:
                 self.fail('database created with policy_stat table')
 
@@ -1174,24 +1175,30 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
         # first init an acct DB without the policy_stat table present
         broker = AccountBroker(db_path, account='a')
         broker.initialize(Timestamp('1').internal)
-        with broker.get() as conn:
-            try:
-                conn.execute('''
-                    SELECT * FROM policy_stat
-                    ''').fetchone()[0]
-            except sqlite3.OperationalError as err:
-                # confirm that the table really isn't there
-                self.assertTrue('no such table: policy_stat' in str(err))
-            else:
-                self.fail('broker did not raise sqlite3.OperationalError '
-                          'trying to select from policy_stat table!')
+
+        def confirm_no_table():
+            with broker.get() as conn:
+                try:
+                    conn.execute('''
+                        SELECT * FROM policy_stat
+                        ''').fetchone()[0]
+                except sqlite3.OperationalError as err:
+                    # confirm that the table really isn't there
+                    self.assertIn('no such table: policy_stat', str(err))
+                else:
+                    self.fail('broker did not raise sqlite3.OperationalError '
+                              'trying to select from policy_stat table!')
+
+        confirm_no_table()
 
         # make sure we can HEAD this thing w/o the table
         stats = broker.get_policy_stats()
         self.assertEqual(len(stats), 0)
 
+        confirm_no_table()
+
         # now do a PUT to create the table
-        broker.put_container('o', Timestamp(time()).internal, 0, 0, 0,
+        broker.put_container('o', Timestamp.now().internal, 0, 0, 0,
                              POLICIES.default.idx)
         broker._commit_puts_stale_ok()
 
@@ -1201,6 +1208,54 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
 
         stats = broker.get_policy_stats()
         self.assertEqual(len(stats), 1)
+
+    @with_tempdir
+    def test_policy_table_migration_in_get_policy_stats(self, tempdir):
+        db_path = os.path.join(tempdir, 'account.db')
+
+        # first init an acct DB without the policy_stat table present
+        broker = AccountBroker(db_path, account='a')
+        broker.initialize(Timestamp('1').internal)
+
+        # And manually add some container records for the default policy
+        with broker.get() as conn:
+            conn.execute('''
+                INSERT INTO container (
+                    name, put_timestamp, delete_timestamp,
+                    object_count, bytes_used
+                ) VALUES (
+                    'c', '%s', '0', 0, 0
+                )''' % Timestamp.now().internal).fetchone()
+            conn.commit()
+
+        def confirm_no_table():
+            with broker.get() as conn:
+                try:
+                    conn.execute('''
+                        SELECT * FROM policy_stat
+                        ''').fetchone()[0]
+                except sqlite3.OperationalError as err:
+                    # confirm that the table really isn't there
+                    self.assertIn('no such table: policy_stat', str(err))
+                else:
+                    self.fail('broker did not raise sqlite3.OperationalError '
+                              'trying to select from policy_stat table!')
+
+        confirm_no_table()
+
+        # make sure we can HEAD this thing w/o the table
+        stats = broker.get_policy_stats()
+        self.assertEqual(len(stats), 0)
+
+        confirm_no_table()
+
+        # but if we pass in do_migrations (like in the auditor), it comes in
+        stats = broker.get_policy_stats(do_migrations=True)
+        self.assertEqual(len(stats), 1)
+
+        # double check that it really exists
+        with broker.get() as conn:
+            conn.execute('SELECT * FROM policy_stat')
 
     @patch_policies
     @with_tempdir
@@ -1217,26 +1272,27 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
                     ''').fetchone()[0]
             except sqlite3.OperationalError as err:
                 # confirm that the table doesn't have this column
-                self.assertTrue('no such column: storage_policy_index' in
-                                str(err))
+                self.assertIn('no such column: storage_policy_index',
+                              str(err))
             else:
                 self.fail('broker did not raise sqlite3.OperationalError '
                           'trying to select from storage_policy_index '
                           'from container table!')
 
         # manually insert an existing row to avoid migration
+        timestamp = Timestamp.now().internal
         with broker.get() as conn:
             conn.execute('''
                 INSERT INTO container (name, put_timestamp,
                     delete_timestamp, object_count, bytes_used,
                     deleted)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', ('test_name', Timestamp(time()).internal, 0, 1, 2, 0))
+            ''', ('test_name', timestamp, 0, 1, 2, 0))
             conn.commit()
 
         # make sure we can iter containers without the migration
         for c in broker.list_containers_iter(1, None, None, None, None):
-            self.assertEqual(c, ('test_name', 1, 2, 0))
+            self.assertEqual(c, ('test_name', 1, 2, timestamp, 0))
 
         # stats table is mysteriously empty...
         stats = broker.get_policy_stats()
@@ -1246,7 +1302,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
         # which will update the DB schema as well as update policy_stats
         # for legacy containers in the DB (those without an SPI)
         other_policy = [p for p in POLICIES if p.idx != 0][0]
-        broker.put_container('test_second', Timestamp(time()).internal,
+        broker.put_container('test_second', Timestamp.now().internal,
                              0, 3, 4, other_policy.idx)
         broker._commit_puts_stale_ok()
 
@@ -1329,7 +1385,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
             self.fail('mock exception was not raised')
 
         self.assertEqual(len(called), 1)
-        self.assertTrue('CREATE TABLE policy_stat' in called[0])
+        self.assertIn('CREATE TABLE policy_stat', called[0])
 
         # nothing was committed
         broker = AccountBroker(db_path, account='a')
@@ -1337,7 +1393,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
             try:
                 conn.execute('SELECT * FROM policy_stat')
             except sqlite3.OperationalError as err:
-                self.assertTrue('no such table: policy_stat' in str(err))
+                self.assertIn('no such table: policy_stat', str(err))
             else:
                 self.fail('half upgraded database!')
             container_count = conn.execute(
@@ -1363,6 +1419,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
         new_broker = AccountBroker(os.path.join(tempdir, 'new_account.db'),
                                    account='a')
         new_broker.initialize(next(ts).internal)
+        timestamp = next(ts).internal
 
         # manually insert an existing row to avoid migration for old database
         with old_broker.get() as conn:
@@ -1371,7 +1428,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
                     delete_timestamp, object_count, bytes_used,
                     deleted)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', ('test_name', next(ts).internal, 0, 1, 2, 0))
+            ''', ('test_name', timestamp, 0, 1, 2, 0))
             conn.commit()
 
         # get replication info and rows form old database
@@ -1384,7 +1441,7 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
         # make sure "test_name" container in new database
         self.assertEqual(new_broker.get_info()['container_count'], 1)
         for c in new_broker.list_containers_iter(1, None, None, None, None):
-            self.assertEqual(c, ('test_name', 1, 2, 0))
+            self.assertEqual(c, ('test_name', 1, 2, timestamp, 0))
 
         # full migration successful
         with new_broker.get() as conn:
@@ -1501,7 +1558,7 @@ class AccountBrokerPreTrackContainerCountSetup(object):
                     ''').fetchone()[0]
             except sqlite3.OperationalError as err:
                 # confirm that the column really isn't there
-                self.assertTrue('no such column: container_count' in str(err))
+                self.assertIn('no such column: container_count', str(err))
             else:
                 self.fail('broker did not raise sqlite3.OperationalError '
                           'trying to select container_count from policy_stat!')
@@ -1589,7 +1646,7 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
             self.assertEqual(stats['object_count'], 0)
             self.assertEqual(stats['bytes_used'], 0)
             # un-migrated dbs should not return container_count
-            self.assertFalse('container_count' in stats)
+            self.assertNotIn('container_count', stats)
 
         # now force the migration
         policy_stats = self.broker.get_policy_stats(do_migrations=True)
@@ -1673,7 +1730,7 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
                                       0, 0, int(policy))
 
         total_container_count = self.broker.get_info()['container_count']
-        self.assertEqual(total_container_count, num_containers / 2)
+        self.assertEqual(total_container_count, num_containers // 2)
 
         # trigger migration
         policy_info = self.broker.get_policy_stats(do_migrations=True)

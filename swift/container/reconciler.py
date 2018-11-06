@@ -54,6 +54,14 @@ def cmp_policy_info(info, remote_info):
         return (info['delete_timestamp'] > info['put_timestamp'] and
                 info.get('count', info.get('object_count', 0)) == 0)
 
+    def cmp(a, b):
+        if a < b:
+            return -1
+        elif b < a:
+            return 1
+        else:
+            return 0
+
     deleted = is_deleted(info)
     remote_deleted = is_deleted(remote_info)
     if any([deleted, remote_deleted]):
@@ -204,7 +212,7 @@ def add_to_reconciler_queue(container_ring, account, container, obj,
         # already been popped from the queue to be reprocessed, but
         # could potentially prevent out of order updates from making it
         # into the queue
-        x_timestamp = Timestamp(time.time()).internal
+        x_timestamp = Timestamp.now().internal
     else:
         x_timestamp = obj_timestamp
     q_op_type = get_reconciler_content_type(op)
@@ -337,6 +345,9 @@ class ContainerReconciler(Daemon):
 
     def __init__(self, conf):
         self.conf = conf
+        # This option defines how long an un-processable misplaced object
+        # marker will be retried before it is abandoned.  It is not coupled
+        # with the tombstone reclaim age in the consistency engine.
         self.reclaim_age = int(conf.get('reclaim_age', 86400 * 7))
         self.interval = int(conf.get('interval', 30))
         conf_path = conf.get('__file__') or \

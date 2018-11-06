@@ -28,6 +28,7 @@ from six.moves.urllib.parse import quote
 
 import os
 import time
+import json
 import functools
 import inspect
 import itertools
@@ -40,12 +41,13 @@ from eventlet import sleep
 from eventlet.timeout import Timeout
 import six
 
-from swift.common.wsgi import make_pre_authed_env
+from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request
 from swift.common.utils import Timestamp, config_true_value, \
     public, split_path, list_from_csv, GreenthreadSafeIterator, \
     GreenAsyncPile, quorum_size, parse_content_type, \
-    document_iters_to_http_response_body
+    document_iters_to_http_response_body, ShardRange
 from swift.common.bufferedhttp import http_connect
+from swift.common import constraints
 from swift.common.exceptions import ChunkReadTimeout, ChunkWriteTimeout, \
     ConnectionTimeout, RangeAlreadyComplete
 from swift.common.header_key_dict import HeaderKeyDict
@@ -79,8 +81,9 @@ def update_headers(response, headers):
     for name, value in headers:
         if name == 'etag':
             response.headers[name] = value.replace('"', '')
-        elif name not in ('date', 'content-length', 'content-type',
-                          'connection', 'x-put-timestamp', 'x-delete-after'):
+        elif name.lower() not in (
+                'date', 'content-length', 'content-type',
+                'connection', 'x-put-timestamp', 'x-delete-after'):
             response.headers[name] = value
 
 
@@ -91,7 +94,8 @@ def source_key(resp):
 
     :param resp: bufferedhttp response object
     """
-    return Timestamp(resp.getheader('x-backend-timestamp') or
+    return Timestamp(resp.getheader('x-backend-data-timestamp') or
+                     resp.getheader('x-backend-timestamp') or
                      resp.getheader('x-put-timestamp') or
                      resp.getheader('x-timestamp') or 0)
 
@@ -143,6 +147,18 @@ def headers_to_account_info(headers, status_int=HTTP_OK):
         'container_count': headers.get('x-account-container-count'),
         'total_object_count': headers.get('x-account-object-count'),
         'bytes': headers.get('x-account-bytes-used'),
+        'storage_policies': {policy.idx: {
+            'container_count': int(headers.get(
+                'x-account-storage-policy-{}-container-count'.format(
+                    policy.name), 0)),
+            'object_count': int(headers.get(
+                'x-account-storage-policy-{}-object-count'.format(
+                    policy.name), 0)),
+            'bytes': int(headers.get(
+                'x-account-storage-policy-{}-bytes-used'.format(
+                    policy.name), 0))}
+            for policy in POLICIES
+        },
         'meta': meta,
         'sysmeta': sysmeta,
     }
@@ -173,6 +189,7 @@ def headers_to_container_info(headers, status_int=HTTP_OK):
         },
         'meta': meta,
         'sysmeta': sysmeta,
+        'sharding_state': headers.get('x-backend-sharding-state', 'unsharded'),
     }
 
 
@@ -182,7 +199,7 @@ def headers_to_object_info(headers, status_int=HTTP_OK):
     """
     headers, meta, sysmeta = _prep_headers_to_info(headers, 'object')
     transient_sysmeta = {}
-    for key, val in headers.iteritems():
+    for key, val in headers.items():
         if is_object_transient_sysmeta(key):
             key = strip_object_transient_sysmeta_prefix(key.lower())
             transient_sysmeta[key] = val
@@ -232,6 +249,7 @@ def cors_validation(func):
             #  - simple response headers,
             #    http://www.w3.org/TR/cors/#simple-response-header
             #  - swift specific: etag, x-timestamp, x-trans-id
+            #  - headers provided by the operator in cors_expose_headers
             #  - user metadata headers
             #  - headers provided by the user in
             #    x-container-meta-access-control-expose-headers
@@ -240,6 +258,7 @@ def cors_validation(func):
                     'cache-control', 'content-language', 'content-type',
                     'expires', 'last-modified', 'pragma', 'etag',
                     'x-timestamp', 'x-trans-id', 'x-openstack-request-id'])
+                expose_headers.update(controller.app.cors_expose_headers)
                 for header in resp.headers:
                     if header.startswith('X-Container-Meta') or \
                             header.startswith('X-Object-Meta'):
@@ -357,6 +376,9 @@ def get_container_info(env, app, swift_source=None):
             info[field] = 0
         else:
             info[field] = int(info[field])
+
+    if info.get('sharding_state') is None:
+        info['sharding_state'] = 'unsharded'
 
     return info
 
@@ -503,9 +525,10 @@ def set_object_info_cache(app, env, account, container, obj, resp):
     per-request cache only.
 
     :param  app: the application object
+    :param env: the environment used by the current request
     :param  account: the unquoted account name
     :param  container: the unquoted container name
-    :param  object: the unquoted object name
+    :param  obj: the unquoted object name
     :param  resp: a GET or HEAD response received from an object server, or
               None if info cache should be cleared
     :returns: the object info
@@ -567,7 +590,8 @@ def _get_info_from_memcache(app, env, account, container=None):
     memcache = getattr(app, 'memcache', None) or env.get('swift.cache')
     if memcache:
         info = memcache.get(cache_key)
-        if info:
+        if info and six.PY2:
+            # Get back to native strings
             for key in info:
                 if isinstance(info[key], six.text_type):
                     info[key] = info[key].encode("utf-8")
@@ -575,6 +599,7 @@ def _get_info_from_memcache(app, env, account, container=None):
                     for subkey, value in info[key].items():
                         if isinstance(value, six.text_type):
                             info[key][subkey] = value.encode("utf-8")
+        if info:
             env.setdefault('swift.infocache', {})[cache_key] = info
         return info
     return None
@@ -743,6 +768,7 @@ class ResumingGetter(object):
         self.concurrency = concurrency
         self.node = None
         self.header_provider = header_provider
+        self.latest_404_timestamp = Timestamp(0)
 
         # stuff from request
         self.req_method = req.method
@@ -771,14 +797,16 @@ class ResumingGetter(object):
                            this request. This will change the Range header
                            so that the next req will start where it left off.
 
-        :raises ValueError: if invalid range header
         :raises HTTPRequestedRangeNotSatisfiable: if begin + num_bytes
                                                   > end of range + 1
         :raises RangeAlreadyComplete: if begin + num_bytes == end of range + 1
         """
-        if 'Range' in self.backend_headers:
-            req_range = Range(self.backend_headers['Range'])
+        try:
+            req_range = Range(self.backend_headers.get('Range'))
+        except ValueError:
+            req_range = None
 
+        if req_range:
             begin, end = req_range.ranges[0]
             if begin is None:
                 # this is a -50 range req (last 50 bytes of file)
@@ -801,6 +829,9 @@ class ResumingGetter(object):
             self.backend_headers['Range'] = str(req_range)
         else:
             self.backend_headers['Range'] = 'bytes=%d-' % num_bytes
+
+        # Reset so if we need to do this more than once, we don't double-up
+        self.bytes_used_from_backend = 0
 
     def pop_range(self):
         """
@@ -934,7 +965,7 @@ class ResumingGetter(object):
 
             def iter_bytes_from_response_part(part_file):
                 nchunks = 0
-                buf = ''
+                buf = b''
                 while True:
                     try:
                         with ChunkReadTimeout(node_timeout):
@@ -944,14 +975,14 @@ class ResumingGetter(object):
                     except ChunkReadTimeout:
                         exc_type, exc_value, exc_traceback = exc_info()
                         if self.newest or self.server_type != 'Object':
-                            six.reraise(exc_type, exc_value, exc_traceback)
+                            raise
                         try:
                             self.fast_forward(self.bytes_used_from_backend)
                         except (HTTPException, ValueError):
                             six.reraise(exc_type, exc_value, exc_traceback)
                         except RangeAlreadyComplete:
                             break
-                        buf = ''
+                        buf = b''
                         new_source, new_node = self._get_source_and_node()
                         if new_source:
                             self.app.exception_occurred(
@@ -988,7 +1019,7 @@ class ResumingGetter(object):
                             else:
                                 self.skip_bytes -= len(buf)
                                 self.bytes_used_from_backend += len(buf)
-                                buf = ''
+                                buf = b''
 
                         if not chunk:
                             if buf:
@@ -996,7 +1027,7 @@ class ResumingGetter(object):
                                         self.app.client_timeout):
                                     self.bytes_used_from_backend += len(buf)
                                     yield buf
-                                buf = ''
+                                buf = b''
                             break
 
                         if client_chunk_size is not None:
@@ -1012,7 +1043,7 @@ class ResumingGetter(object):
                             with ChunkWriteTimeout(self.app.client_timeout):
                                 self.bytes_used_from_backend += len(buf)
                                 yield buf
-                            buf = ''
+                            buf = b''
 
                         # This is for fairness; if the network is outpacing
                         # the CPU, we'll always be able to read and write
@@ -1062,20 +1093,18 @@ class ResumingGetter(object):
                 self.app.client_timeout)
             self.app.logger.increment('client_timeouts')
         except GeneratorExit:
-            exc_type, exc_value, exc_traceback = exc_info()
             warn = True
-            try:
-                req_range = Range(self.backend_headers['Range'])
-            except ValueError:
-                req_range = None
-            if req_range and len(req_range.ranges) == 1:
-                begin, end = req_range.ranges[0]
-                if end is not None and begin is not None:
-                    if end - begin + 1 == self.bytes_used_from_backend:
-                        warn = False
+            req_range = self.backend_headers['Range']
+            if req_range:
+                req_range = Range(req_range)
+                if len(req_range.ranges) == 1:
+                    begin, end = req_range.ranges[0]
+                    if end is not None and begin is not None:
+                        if end - begin + 1 == self.bytes_used_from_backend:
+                            warn = False
             if not req.environ.get('swift.non_client_disconnect') and warn:
                 self.app.logger.warning(_('Client disconnected on read'))
-            six.reraise(exc_type, exc_value, exc_traceback)
+            raise
         except Exception:
             self.app.logger.exception(_('Trying to send to client'))
             raise
@@ -1135,32 +1164,51 @@ class ResumingGetter(object):
                 self.source_headers.append([])
                 close_swift_conn(possible_source)
             else:
-                if self.used_source_etag:
-                    src_headers = dict(
-                        (k.lower(), v) for k, v in
-                        possible_source.getheaders())
+                src_headers = dict(
+                    (k.lower(), v) for k, v in
+                    possible_source.getheaders())
+                if self.used_source_etag and \
+                    self.used_source_etag != src_headers.get(
+                        'x-object-sysmeta-ec-etag',
+                        src_headers.get('etag', '')).strip('"'):
+                    self.statuses.append(HTTP_NOT_FOUND)
+                    self.reasons.append('')
+                    self.bodies.append('')
+                    self.source_headers.append([])
+                    return False
 
-                    if self.used_source_etag != src_headers.get(
-                            'x-object-sysmeta-ec-etag',
-                            src_headers.get('etag', '')).strip('"'):
-                        self.statuses.append(HTTP_NOT_FOUND)
-                        self.reasons.append('')
-                        self.bodies.append('')
-                        self.source_headers.append([])
-                        return False
-
-                self.statuses.append(possible_source.status)
-                self.reasons.append(possible_source.reason)
-                self.bodies.append(None)
-                self.source_headers.append(possible_source.getheaders())
-                self.sources.append((possible_source, node))
-                if not self.newest:  # one good source is enough
-                    return True
+                # a possible source should only be added as a valid source
+                # if its timestamp is newer than previously found tombstones
+                ps_timestamp = Timestamp(
+                    src_headers.get('x-backend-data-timestamp') or
+                    src_headers.get('x-backend-timestamp') or
+                    src_headers.get('x-put-timestamp') or
+                    src_headers.get('x-timestamp') or 0)
+                if ps_timestamp >= self.latest_404_timestamp:
+                    self.statuses.append(possible_source.status)
+                    self.reasons.append(possible_source.reason)
+                    self.bodies.append(None)
+                    self.source_headers.append(possible_source.getheaders())
+                    self.sources.append((possible_source, node))
+                    if not self.newest:  # one good source is enough
+                        return True
         else:
+
             self.statuses.append(possible_source.status)
             self.reasons.append(possible_source.reason)
             self.bodies.append(possible_source.read())
             self.source_headers.append(possible_source.getheaders())
+
+            # if 404, record the timestamp. If a good source shows up, its
+            # timestamp will be compared to the latest 404.
+            # For now checking only on objects, but future work could include
+            # the same check for account and containers. See lp 1560574.
+            if self.server_type == 'Object' and \
+                    possible_source.status == HTTP_NOT_FOUND:
+                hdrs = HeaderKeyDict(possible_source.getheaders())
+                ts = Timestamp(hdrs.get('X-Backend-Timestamp', 0))
+                if ts > self.latest_404_timestamp:
+                    self.latest_404_timestamp = ts
             if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
                 self.app.error_limit(node, _('ERROR Insufficient Storage'))
             elif is_server_error(possible_source.status):
@@ -1197,6 +1245,12 @@ class ResumingGetter(object):
         else:
             # ran out of nodes, see if any stragglers will finish
             any(pile)
+
+        # this helps weed out any sucess status that were found before a 404
+        # and added to the list in the case of x-newest.
+        if self.sources:
+            self.sources = [s for s in self.sources
+                            if source_key(s[0]) >= self.latest_404_timestamp]
 
         if self.sources:
             self.sources.sort(key=lambda s: source_key(s[0]))
@@ -1302,9 +1356,11 @@ class NodeIter(object):
     :param partition: ring partition to yield nodes for
     :param node_iter: optional iterable of nodes to try. Useful if you
         want to filter or reorder the nodes.
+    :param policy: an instance of :class:`BaseStoragePolicy`. This should be
+        None for an account or container ring.
     """
 
-    def __init__(self, app, ring, partition, node_iter=None):
+    def __init__(self, app, ring, partition, node_iter=None, policy=None):
         self.app = app
         self.ring = ring
         self.partition = partition
@@ -1320,7 +1376,8 @@ class NodeIter(object):
         # Use of list() here forcibly yanks the first N nodes (the primary
         # nodes) from node_iter, so the rest of its values are handoffs.
         self.primary_nodes = self.app.sort_nodes(
-            list(itertools.islice(node_iter, num_primary_nodes)))
+            list(itertools.islice(node_iter, num_primary_nodes)),
+            policy=policy)
         self.handoff_iter = node_iter
         self._node_provider = None
 
@@ -1356,6 +1413,7 @@ class NodeIter(object):
         Install a callback function that will be used during a call to next()
         to get an alternate node instead of returning the next node from the
         iterator.
+
         :param callback: A no argument function that should return a node dict
                          or None.
         """
@@ -1464,7 +1522,7 @@ class Controller(object):
         headers = HeaderKeyDict(additional) if additional else HeaderKeyDict()
         if transfer:
             self.transfer_headers(orig_req.headers, headers)
-        headers.setdefault('x-timestamp', Timestamp(time.time()).internal)
+        headers.setdefault('x-timestamp', Timestamp.now().internal)
         if orig_req:
             referer = orig_req.as_referer()
         else:
@@ -1588,7 +1646,8 @@ class Controller(object):
                     {'method': method, 'path': path})
 
     def make_requests(self, req, ring, part, method, path, headers,
-                      query_string='', overrides=None):
+                      query_string='', overrides=None, node_count=None,
+                      node_iterator=None):
         """
         Sends an HTTP request to multiple nodes and aggregates the results.
         It attempts the primary nodes concurrently, then iterates over the
@@ -1605,11 +1664,16 @@ class Controller(object):
         :param query_string: optional query string to send to the backend
         :param overrides: optional return status override map used to override
                           the returned status of a request.
+        :param node_count: optional number of nodes to send request to.
+        :param node_iterator: optional node iterator.
         :returns: a swob.Response object
         """
-        start_nodes = ring.get_part_nodes(part)
-        nodes = GreenthreadSafeIterator(self.app.iter_nodes(ring, part))
-        pile = GreenAsyncPile(len(start_nodes))
+        nodes = GreenthreadSafeIterator(
+            node_iterator or self.app.iter_nodes(ring, part)
+        )
+        node_number = node_count or len(ring.get_part_nodes(part))
+        pile = GreenAsyncPile(node_number)
+
         for head in headers:
             pile.spawn(self._make_request, nodes, part, method, path,
                        head, query_string, self.app.logger.thread_locals)
@@ -1620,7 +1684,7 @@ class Controller(object):
                 continue
             response.append(resp)
             statuses.append(resp[0])
-            if self.have_quorum(statuses, len(start_nodes)):
+            if self.have_quorum(statuses, node_number):
                 break
         # give any pending requests *some* chance to finish
         finished_quickly = pile.waitall(self.app.post_quorum_timeout)
@@ -1629,7 +1693,7 @@ class Controller(object):
                 continue
             response.append(resp)
             statuses.append(resp[0])
-        while len(response) < len(start_nodes):
+        while len(response) < node_number:
             response.append((HTTP_SERVICE_UNAVAILABLE, '', '', ''))
         statuses, reasons, resp_headers, bodies = zip(*response)
         return self.best_response(req, statuses, reasons, bodies,
@@ -1766,7 +1830,7 @@ class Controller(object):
         """
         partition, nodes = self.app.account_ring.get_nodes(account)
         path = '/%s' % account
-        headers = {'X-Timestamp': Timestamp(time.time()).internal,
+        headers = {'X-Timestamp': Timestamp.now().internal,
                    'X-Trans-Id': self.trans_id,
                    'X-Openstack-Request-Id': self.trans_id,
                    'Connection': 'close'}
@@ -1781,9 +1845,11 @@ class Controller(object):
         if is_success(resp.status_int):
             self.app.logger.info(_('autocreate account %r'), path)
             clear_info_cache(self.app, req.environ, account)
+            return True
         else:
             self.app.logger.warning(_('Could not autocreate account %r'),
                                     path)
+            return False
 
     def GETorHEAD_base(self, req, server_type, node_iter, partition, path,
                        concurrency=1, client_chunk_size=None):
@@ -1885,28 +1951,139 @@ class Controller(object):
             resp.status = HTTP_UNAUTHORIZED
             return resp
 
-        # Allow all headers requested in the request. The CORS
-        # specification does leave the door open for this, as mentioned in
-        # http://www.w3.org/TR/cors/#resource-preflight-requests
-        # Note: Since the list of headers can be unbounded
-        # simply returning headers can be enough.
-        allow_headers = set()
-        if req.headers.get('Access-Control-Request-Headers'):
-            allow_headers.update(
-                list_from_csv(req.headers['Access-Control-Request-Headers']))
-
         # Populate the response with the CORS preflight headers
         if cors.get('allow_origin') and \
                 cors.get('allow_origin').strip() == '*':
             headers['access-control-allow-origin'] = '*'
         else:
             headers['access-control-allow-origin'] = req_origin_value
+            if 'vary' in headers:
+                headers['vary'] += ', Origin'
+            else:
+                headers['vary'] = 'Origin'
+
         if cors.get('max_age') is not None:
             headers['access-control-max-age'] = cors.get('max_age')
+
         headers['access-control-allow-methods'] = \
             ', '.join(self.allowed_methods)
+
+        # Allow all headers requested in the request. The CORS
+        # specification does leave the door open for this, as mentioned in
+        # http://www.w3.org/TR/cors/#resource-preflight-requests
+        # Note: Since the list of headers can be unbounded
+        # simply returning headers can be enough.
+        allow_headers = set(
+            list_from_csv(req.headers.get('Access-Control-Request-Headers')))
         if allow_headers:
             headers['access-control-allow-headers'] = ', '.join(allow_headers)
+            if 'vary' in headers:
+                headers['vary'] += ', Access-Control-Request-Headers'
+            else:
+                headers['vary'] = 'Access-Control-Request-Headers'
+
         resp.headers = headers
 
         return resp
+
+    def get_name_length_limit(self):
+        if self.account_name.startswith(self.app.auto_create_account_prefix):
+            multiplier = 2
+        else:
+            multiplier = 1
+
+        if self.server_type == 'Account':
+            return constraints.MAX_ACCOUNT_NAME_LENGTH * multiplier
+        elif self.server_type == 'Container':
+            return constraints.MAX_CONTAINER_NAME_LENGTH * multiplier
+        else:
+            raise ValueError(
+                "server_type can only be 'account' or 'container'")
+
+    def _get_container_listing(self, req, account, container, headers=None,
+                               params=None):
+        """
+        Fetch container listing from given `account/container`.
+
+        :param req: original Request instance.
+        :param account: account in which `container` is stored.
+        :param container: container from listing should be fetched.
+        :param headers: headers to be included with the request
+        :param params: query string parameters to be used.
+        :return: a tuple of (deserialized json data structure, swob Response)
+        """
+        params = params or {}
+        version, _a, _c, _other = req.split_path(3, 4, True)
+        path = '/'.join(['', version, account, container])
+
+        subreq = make_pre_authed_request(
+            req.environ, method='GET', path=quote(path), headers=req.headers,
+            swift_source='SH')
+        if headers:
+            subreq.headers.update(headers)
+        subreq.params = params
+        self.app.logger.debug(
+            'Get listing from %s %s' % (subreq.path_qs, headers))
+        response = self.app.handle_request(subreq)
+
+        if not is_success(response.status_int):
+            self.app.logger.warning(
+                'Failed to get container listing from %s: %s',
+                subreq.path_qs, response.status_int)
+            return None, response
+
+        try:
+            data = json.loads(response.body)
+            if not isinstance(data, list):
+                raise ValueError('not a list')
+            return data, response
+        except ValueError as err:
+            self.app.logger.error(
+                'Problem with listing response from %s: %r',
+                subreq.path_qs, err)
+            return None, response
+
+    def _get_shard_ranges(self, req, account, container, includes=None,
+                          states=None):
+        """
+        Fetch shard ranges from given `account/container`. If `includes` is
+        given then the shard range for that object name is requested, otherwise
+        all shard ranges are requested.
+
+        :param req: original Request instance.
+        :param account: account from which shard ranges should be fetched.
+        :param container: container from which shard ranges should be fetched.
+        :param includes: (optional) restricts the list of fetched shard ranges
+            to those which include the given name.
+        :param states: (optional) the states of shard ranges to be fetched.
+        :return: a list of instances of :class:`swift.common.utils.ShardRange`,
+            or None if there was a problem fetching the shard ranges
+        """
+        params = req.params.copy()
+        params.pop('limit', None)
+        params['format'] = 'json'
+        if includes:
+            params['includes'] = includes
+        if states:
+            params['states'] = states
+        headers = {'X-Backend-Record-Type': 'shard'}
+        listing, response = self._get_container_listing(
+            req, account, container, headers=headers, params=params)
+        if listing is None:
+            return None
+
+        record_type = response.headers.get('x-backend-record-type')
+        if record_type != 'shard':
+            err = 'unexpected record type %r' % record_type
+            self.app.logger.error("Failed to get shard ranges from %s: %s",
+                                  req.path_qs, err)
+            return None
+
+        try:
+            return [ShardRange.from_dict(shard_range)
+                    for shard_range in listing]
+        except (ValueError, TypeError, KeyError) as err:
+            self.app.logger.error(
+                "Failed to get shard ranges from %s: invalid data: %r",
+                req.path_qs, err)
+            return None

@@ -23,6 +23,7 @@ import time
 import subprocess
 import re
 from swift import gettext_ as _
+import tempfile
 
 from swift.common.utils import search_tree, remove_file, write_file
 from swift.common.exceptions import InvalidPidFileException
@@ -31,10 +32,9 @@ SWIFT_DIR = '/etc/swift'
 RUN_DIR = '/var/run/swift'
 PROC_DIR = '/proc'
 
-# auth-server has been removed from ALL_SERVERS, start it explicitly
 ALL_SERVERS = ['account-auditor', 'account-server', 'container-auditor',
                'container-replicator', 'container-reconciler',
-               'container-server', 'container-sync',
+               'container-server', 'container-sharder', 'container-sync',
                'container-updater', 'object-auditor', 'object-server',
                'object-expirer', 'object-replicator',
                'object-reconstructor', 'object-updater',
@@ -44,7 +44,7 @@ MAIN_SERVERS = ['proxy-server', 'account-server', 'container-server',
 REST_SERVERS = [s for s in ALL_SERVERS if s not in MAIN_SERVERS]
 # aliases mapping
 ALIASES = {'all': ALL_SERVERS, 'main': MAIN_SERVERS, 'rest': REST_SERVERS}
-GRACEFUL_SHUTDOWN_SERVERS = MAIN_SERVERS + ['auth-server']
+GRACEFUL_SHUTDOWN_SERVERS = MAIN_SERVERS
 START_ONCE_SERVERS = REST_SERVERS
 # These are servers that match a type (account-*, container-*, object-*) but
 # don't use that type-server.conf file and instead use their own.
@@ -83,7 +83,7 @@ def setup_env():
                 "Running as non-root?"))
 
     # Set PYTHON_EGG_CACHE if it isn't already set
-    os.environ.setdefault('PYTHON_EGG_CACHE', '/tmp')
+    os.environ.setdefault('PYTHON_EGG_CACHE', tempfile.gettempdir())
 
 
 def command(func):
@@ -637,13 +637,16 @@ class Server(object):
                   {'server': self.server, 'pid': pid, 'conf': conf_file})
         return 0
 
-    def spawn(self, conf_file, once=False, wait=True, daemon=True, **kwargs):
+    def spawn(self, conf_file, once=False, wait=True, daemon=True,
+              additional_args=None, **kwargs):
         """Launch a subprocess for this server.
 
         :param conf_file: path to conf_file to use as first arg
         :param once: boolean, add once argument to command
         :param wait: boolean, if true capture stdout with a pipe
         :param daemon: boolean, if false ask server to log to console
+        :param additional_args: list of additional arguments to pass
+                                on the command line
 
         :returns: the pid of the spawned process
         """
@@ -653,6 +656,10 @@ class Server(object):
         if not daemon:
             # ask the server to log to console
             args.append('verbose')
+        if additional_args:
+            if isinstance(additional_args, str):
+                additional_args = [additional_args]
+            args.extend(additional_args)
 
         # figure out what we're going to do with stdio
         if not daemon:
@@ -678,8 +685,13 @@ class Server(object):
         """
         status = 0
         for proc in self.procs:
-            # wait for process to close its stdout
-            output = proc.stdout.read()
+            # wait for process to close its stdout (if we haven't done that)
+            if proc.stdout.closed:
+                output = ''
+            else:
+                output = proc.stdout.read()
+                proc.stdout.close()
+
             if kwargs.get('once', False):
                 # if you don't want once to wait you can send it to the
                 # background on the command line, I generally just run with
@@ -703,7 +715,7 @@ class Server(object):
         status = 0
         for proc in self.procs:
             # wait for process to terminate
-            proc.communicate()
+            proc.communicate()  # should handle closing pipes
             if proc.returncode:
                 status += 1
         return status

@@ -16,6 +16,7 @@
 import errno
 import os
 import mock
+import posix
 import unittest
 from tempfile import mkdtemp
 from shutil import rmtree
@@ -34,9 +35,9 @@ from swift.common.swob import (Request, WsgiBytesIO, HTTPNoContent)
 from swift.common import constraints
 from swift.account.server import AccountController
 from swift.common.utils import (normalize_timestamp, replication, public,
-                                mkdirs, storage_directory)
+                                mkdirs, storage_directory, Timestamp)
 from swift.common.request_helpers import get_sys_meta_prefix
-from test.unit import patch_policies, debug_logger
+from test.unit import patch_policies, debug_logger, mock_check_drive
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
 
@@ -47,6 +48,7 @@ class TestAccountController(unittest.TestCase):
         """Set up for testing swift.account.server.AccountController"""
         self.testdir_base = mkdtemp()
         self.testdir = os.path.join(self.testdir_base, 'account_server')
+        mkdirs(os.path.join(self.testdir, 'sda1'))
         self.controller = AccountController(
             {'devices': self.testdir, 'mount_check': 'false'})
 
@@ -66,11 +68,54 @@ class TestAccountController(unittest.TestCase):
         resp = server_handler.OPTIONS(req)
         self.assertEqual(200, resp.status_int)
         for verb in 'OPTIONS GET POST PUT DELETE HEAD REPLICATE'.split():
-            self.assertTrue(
-                verb in resp.headers['Allow'].split(', '))
+            self.assertIn(verb, resp.headers['Allow'].split(', '))
         self.assertEqual(len(resp.headers['Allow'].split(', ')), 7)
         self.assertEqual(resp.headers['Server'],
                          (server_handler.server_type + '/' + swift_version))
+
+    def test_insufficient_storage_mount_check_true(self):
+        conf = {'devices': self.testdir, 'mount_check': 'true'}
+        account_controller = AccountController(conf)
+        self.assertTrue(account_controller.mount_check)
+        for method in account_controller.allowed_methods:
+            if method == 'OPTIONS':
+                continue
+            req = Request.blank('/sda1/p/a-or-suff', method=method,
+                                headers={'x-timestamp': '1'})
+            with mock_check_drive() as mocks:
+                try:
+                    resp = req.get_response(account_controller)
+                    self.assertEqual(resp.status_int, 507)
+                    mocks['ismount'].return_value = True
+                    resp = req.get_response(account_controller)
+                    self.assertNotEqual(resp.status_int, 507)
+                    # feel free to rip out this last assertion...
+                    expected = 2 if method == 'PUT' else 4
+                    self.assertEqual(resp.status_int // 100, expected)
+                except AssertionError as e:
+                    self.fail('%s for %s' % (e, method))
+
+    def test_insufficient_storage_mount_check_false(self):
+        conf = {'devices': self.testdir, 'mount_check': 'false'}
+        account_controller = AccountController(conf)
+        self.assertFalse(account_controller.mount_check)
+        for method in account_controller.allowed_methods:
+            if method == 'OPTIONS':
+                continue
+            req = Request.blank('/sda1/p/a-or-suff', method=method,
+                                headers={'x-timestamp': '1'})
+            with mock_check_drive() as mocks:
+                try:
+                    resp = req.get_response(account_controller)
+                    self.assertEqual(resp.status_int, 507)
+                    mocks['isdir'].return_value = True
+                    resp = req.get_response(account_controller)
+                    self.assertNotEqual(resp.status_int, 507)
+                    # feel free to rip out this last assertion...
+                    expected = 2 if method == 'PUT' else 4
+                    self.assertEqual(resp.status_int // 100, expected)
+                except AssertionError as e:
+                    self.fail('%s for %s' % (e, method))
 
     def test_DELETE_not_found(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'DELETE',
@@ -148,28 +193,32 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
 
-    def test_DELETE_insufficient_storage(self):
-        self.controller = AccountController({'devices': self.testdir})
-        req = Request.blank(
-            '/sda-null/p/a', environ={'REQUEST_METHOD': 'DELETE',
-                                      'HTTP_X_TIMESTAMP': '1'})
-        resp = req.get_response(self.controller)
+    def test_REPLICATE_insufficient_space(self):
+        conf = {'devices': self.testdir,
+                'mount_check': 'false',
+                'fallocate_reserve': '2%'}
+        account_controller = AccountController(conf)
+
+        req = Request.blank('/sda1/p/a',
+                            environ={'REQUEST_METHOD': 'REPLICATE'})
+        statvfs_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            59000,    # f_bfree
+            57000,    # f_bavail  (just under 2% free)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs',
+                        return_value=statvfs_result) as mock_statvfs:
+            resp = req.get_response(account_controller)
         self.assertEqual(resp.status_int, 507)
-
-    def test_REPLICATE_insufficient_storage(self):
-        conf = {'devices': self.testdir, 'mount_check': 'true'}
-        self.account_controller = AccountController(conf)
-
-        def fake_check_mount(*args, **kwargs):
-            return False
-
-        with mock.patch("swift.common.constraints.check_mount",
-                        fake_check_mount):
-            req = Request.blank('/sda1/p/suff',
-                                environ={'REQUEST_METHOD': 'REPLICATE'},
-                                headers={})
-            resp = req.get_response(self.account_controller)
-        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(mock_statvfs.mock_calls,
+                         [mock.call(os.path.join(self.testdir, 'sda1'))])
 
     def test_REPLICATE_rsync_then_merge_works(self):
         def fake_rsync_then_merge(self, drive, db_file, args):
@@ -332,12 +381,12 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 406)
 
-    def test_HEAD_insufficient_storage(self):
-        self.controller = AccountController({'devices': self.testdir})
-        req = Request.blank('/sda-null/p/a', environ={'REQUEST_METHOD': 'HEAD',
-                                                      'HTTP_X_TIMESTAMP': '1'})
+    def test_HEAD_invalid_accept(self):
+        req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'HEAD'},
+                            headers={'Accept': 'application/plain;q=1;q=0.5'})
         resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(resp.body, '')
 
     def test_HEAD_invalid_format(self):
         format = '%D1%BD%8A9'  # invalid UTF-8; should be %E1%BD%8A9 (E -> D)
@@ -357,6 +406,35 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('X-Account-Status', resp.headers)
+
+    def test_PUT_insufficient_space(self):
+        conf = {'devices': self.testdir,
+                'mount_check': 'false',
+                'fallocate_reserve': '2%'}
+        account_controller = AccountController(conf)
+
+        req = Request.blank(
+            '/sda1/p/a',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': '1517612949.541469'})
+        statvfs_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            59000,    # f_bfree
+            57000,    # f_bavail  (just under 2% free)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs',
+                        return_value=statvfs_result) as mock_statvfs:
+            resp = req.get_response(account_controller)
+        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(mock_statvfs.mock_calls,
+                         [mock.call(os.path.join(self.testdir, 'sda1'))])
 
     def test_PUT(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -383,7 +461,7 @@ class TestAccountController(unittest.TestCase):
                 elif state[0] == 'race':
                     # Save the original db_file attribute value
                     self._saved_db_file = self.db_file
-                    self.db_file += '.doesnotexist'
+                    self._db_file += '.doesnotexist'
 
             def initialize(self, *args, **kwargs):
                 if state[0] == 'initial':
@@ -392,7 +470,7 @@ class TestAccountController(unittest.TestCase):
                 elif state[0] == 'race':
                     # Restore the original db_file attribute to get the race
                     # behavior
-                    self.db_file = self._saved_db_file
+                    self._db_file = self._saved_db_file
                 return super(InterceptedAcBr, self).initialize(*args, **kwargs)
 
         with mock.patch("swift.account.server.AccountBroker", InterceptedAcBr):
@@ -570,13 +648,6 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
 
-    def test_PUT_insufficient_storage(self):
-        self.controller = AccountController({'devices': self.testdir})
-        req = Request.blank('/sda-null/p/a', environ={'REQUEST_METHOD': 'PUT',
-                                                      'HTTP_X_TIMESTAMP': '1'})
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 507)
-
     def test_POST_HEAD_metadata(self):
         req = Request.blank(
             '/sda1/p/a', environ={'REQUEST_METHOD': 'PUT'},
@@ -687,19 +758,41 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
 
+    def test_POST_insufficient_space(self):
+        conf = {'devices': self.testdir,
+                'mount_check': 'false',
+                'fallocate_reserve': '2%'}
+        account_controller = AccountController(conf)
+
+        req = Request.blank(
+            '/sda1/p/a',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': '1517611584.937603'})
+        statvfs_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            59000,    # f_bfree
+            57000,    # f_bavail  (just under 2% free)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs',
+                        return_value=statvfs_result) as mock_statvfs:
+            resp = req.get_response(account_controller)
+        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(mock_statvfs.mock_calls,
+                         [mock.call(os.path.join(self.testdir, 'sda1'))])
+
     def test_POST_timestamp_not_float(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'POST',
                                                   'HTTP_X_TIMESTAMP': '0'},
                             headers={'X-Timestamp': 'not-float'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
-
-    def test_POST_insufficient_storage(self):
-        self.controller = AccountController({'devices': self.testdir})
-        req = Request.blank('/sda-null/p/a', environ={'REQUEST_METHOD': 'POST',
-                                                      'HTTP_X_TIMESTAMP': '1'})
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 507)
 
     def test_POST_after_DELETE_not_found(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -787,6 +880,13 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(resp.headers['Content-Type'],
                          'application/xml; charset=utf-8')
 
+    def test_GET_invalid_accept(self):
+        req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Accept': 'application/plain;q=foo'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(resp.body, 'Invalid Accept header')
+
     def test_GET_over_limit(self):
         req = Request.blank(
             '/sda1/p/a?limit=%d' % (constraints.ACCOUNT_LISTING_LIMIT + 1),
@@ -847,18 +947,21 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(resp.charset, 'utf-8')
 
     def test_GET_with_containers_json(self):
+        put_timestamps = {}
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
                                                   'HTTP_X_TIMESTAMP': '0'})
         req.get_response(self.controller)
+        put_timestamps['c1'] = normalize_timestamp(1)
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Put-Timestamp': '1',
+                            headers={'X-Put-Timestamp': put_timestamps['c1'],
                                      'X-Delete-Timestamp': '0',
                                      'X-Object-Count': '0',
                                      'X-Bytes-Used': '0',
                                      'X-Timestamp': normalize_timestamp(0)})
         req.get_response(self.controller)
+        put_timestamps['c2'] = normalize_timestamp(2)
         req = Request.blank('/sda1/p/a/c2', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Put-Timestamp': '2',
+                            headers={'X-Put-Timestamp': put_timestamps['c2'],
                                      'X-Delete-Timestamp': '0',
                                      'X-Object-Count': '0',
                                      'X-Bytes-Used': '0',
@@ -868,18 +971,23 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(json.loads(resp.body),
-                         [{'count': 0, 'bytes': 0, 'name': 'c1'},
-                          {'count': 0, 'bytes': 0, 'name': 'c2'}])
+        self.assertEqual(
+            json.loads(resp.body),
+            [{'count': 0, 'bytes': 0, 'name': 'c1',
+              'last_modified': Timestamp(put_timestamps['c1']).isoformat},
+             {'count': 0, 'bytes': 0, 'name': 'c2',
+              'last_modified': Timestamp(put_timestamps['c2']).isoformat}])
+        put_timestamps['c1'] = normalize_timestamp(3)
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Put-Timestamp': '1',
+                            headers={'X-Put-Timestamp': put_timestamps['c1'],
                                      'X-Delete-Timestamp': '0',
                                      'X-Object-Count': '1',
                                      'X-Bytes-Used': '2',
                                      'X-Timestamp': normalize_timestamp(0)})
         req.get_response(self.controller)
+        put_timestamps['c2'] = normalize_timestamp(4)
         req = Request.blank('/sda1/p/a/c2', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Put-Timestamp': '2',
+                            headers={'X-Put-Timestamp': put_timestamps['c2'],
                                      'X-Delete-Timestamp': '0',
                                      'X-Object-Count': '3',
                                      'X-Bytes-Used': '4',
@@ -889,25 +997,31 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(json.loads(resp.body),
-                         [{'count': 1, 'bytes': 2, 'name': 'c1'},
-                          {'count': 3, 'bytes': 4, 'name': 'c2'}])
+        self.assertEqual(
+            json.loads(resp.body),
+            [{'count': 1, 'bytes': 2, 'name': 'c1',
+              'last_modified': Timestamp(put_timestamps['c1']).isoformat},
+             {'count': 3, 'bytes': 4, 'name': 'c2',
+              'last_modified': Timestamp(put_timestamps['c2']).isoformat}])
         self.assertEqual(resp.content_type, 'application/json')
         self.assertEqual(resp.charset, 'utf-8')
 
     def test_GET_with_containers_xml(self):
+        put_timestamps = {}
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
                                                   'HTTP_X_TIMESTAMP': '0'})
         req.get_response(self.controller)
+        put_timestamps['c1'] = normalize_timestamp(1)
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Put-Timestamp': '1',
+                            headers={'X-Put-Timestamp': put_timestamps['c1'],
                                      'X-Delete-Timestamp': '0',
                                      'X-Object-Count': '0',
                                      'X-Bytes-Used': '0',
                                      'X-Timestamp': normalize_timestamp(0)})
         req.get_response(self.controller)
+        put_timestamps['c2'] = normalize_timestamp(2)
         req = Request.blank('/sda1/p/a/c2', environ={'REQUEST_METHOD': 'PUT'},
-                            headers={'X-Put-Timestamp': '2',
+                            headers={'X-Put-Timestamp': put_timestamps['c2'],
                                      'X-Delete-Timestamp': '0',
                                      'X-Object-Count': '0',
                                      'X-Bytes-Used': '0',
@@ -926,24 +1040,30 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(listing[0].nodeName, 'container')
         container = [n for n in listing[0].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c1')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '0')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '0')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp(put_timestamps['c1']).isoformat)
         self.assertEqual(listing[-1].nodeName, 'container')
         container = \
             [n for n in listing[-1].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c2')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '0')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '0')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp(put_timestamps['c2']).isoformat)
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Put-Timestamp': '1',
                                      'X-Delete-Timestamp': '0',
@@ -970,24 +1090,30 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(listing[0].nodeName, 'container')
         container = [n for n in listing[0].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c1')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '1')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '2')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp(put_timestamps['c1']).isoformat)
         self.assertEqual(listing[-1].nodeName, 'container')
         container = [
             n for n in listing[-1].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c2')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '3')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '4')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp(put_timestamps['c2']).isoformat)
         self.assertEqual(resp.charset, 'utf-8')
 
     def test_GET_xml_escapes_account_name(self):
@@ -1054,15 +1180,16 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
                                                   'HTTP_X_TIMESTAMP': '0'})
         req.get_response(self.controller)
+        put_timestamp = normalize_timestamp(0)
         for c in range(5):
             req = Request.blank(
                 '/sda1/p/a/c%d' % c,
                 environ={'REQUEST_METHOD': 'PUT'},
-                headers={'X-Put-Timestamp': str(c + 1),
+                headers={'X-Put-Timestamp': put_timestamp,
                          'X-Delete-Timestamp': '0',
                          'X-Object-Count': '2',
                          'X-Bytes-Used': '3',
-                         'X-Timestamp': normalize_timestamp(0)})
+                         'X-Timestamp': put_timestamp})
             req.get_response(self.controller)
         req = Request.blank('/sda1/p/a?limit=3',
                             environ={'REQUEST_METHOD': 'GET'})
@@ -1080,44 +1207,51 @@ class TestAccountController(unittest.TestCase):
                                                   'HTTP_X_TIMESTAMP': '0'})
         req.get_response(self.controller)
         for c in range(5):
+            put_timestamp = normalize_timestamp(c + 1)
             req = Request.blank(
                 '/sda1/p/a/c%d' % c,
                 environ={'REQUEST_METHOD': 'PUT'},
-                headers={'X-Put-Timestamp': str(c + 1),
+                headers={'X-Put-Timestamp': put_timestamp,
                          'X-Delete-Timestamp': '0',
                          'X-Object-Count': '2',
                          'X-Bytes-Used': '3',
-                         'X-Timestamp': normalize_timestamp(0)})
+                         'X-Timestamp': put_timestamp})
             req.get_response(self.controller)
         req = Request.blank('/sda1/p/a?limit=3&format=json',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(json.loads(resp.body),
-                         [{'count': 2, 'bytes': 3, 'name': 'c0'},
-                          {'count': 2, 'bytes': 3, 'name': 'c1'},
-                          {'count': 2, 'bytes': 3, 'name': 'c2'}])
+        expected = [{'count': 2, 'bytes': 3, 'name': 'c0',
+                     'last_modified': Timestamp('1').isoformat},
+                    {'count': 2, 'bytes': 3, 'name': 'c1',
+                     'last_modified': Timestamp('2').isoformat},
+                    {'count': 2, 'bytes': 3, 'name': 'c2',
+                     'last_modified': Timestamp('3').isoformat}]
+        self.assertEqual(json.loads(resp.body), expected)
         req = Request.blank('/sda1/p/a?limit=3&marker=c2&format=json',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(json.loads(resp.body),
-                         [{'count': 2, 'bytes': 3, 'name': 'c3'},
-                          {'count': 2, 'bytes': 3, 'name': 'c4'}])
+        expected = [{'count': 2, 'bytes': 3, 'name': 'c3',
+                     'last_modified': Timestamp('4').isoformat},
+                    {'count': 2, 'bytes': 3, 'name': 'c4',
+                     'last_modified': Timestamp('5').isoformat}]
+        self.assertEqual(json.loads(resp.body), expected)
 
     def test_GET_limit_marker_xml(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
                                                   'HTTP_X_TIMESTAMP': '0'})
         req.get_response(self.controller)
         for c in range(5):
+            put_timestamp = normalize_timestamp(c + 1)
             req = Request.blank(
                 '/sda1/p/a/c%d' % c,
                 environ={'REQUEST_METHOD': 'PUT'},
-                headers={'X-Put-Timestamp': str(c + 1),
+                headers={'X-Put-Timestamp': put_timestamp,
                          'X-Delete-Timestamp': '0',
                          'X-Object-Count': '2',
                          'X-Bytes-Used': '3',
-                         'X-Timestamp': normalize_timestamp(c)})
+                         'X-Timestamp': put_timestamp})
             req.get_response(self.controller)
         req = Request.blank('/sda1/p/a?limit=3&format=xml',
                             environ={'REQUEST_METHOD': 'GET'})
@@ -1131,24 +1265,30 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(listing[0].nodeName, 'container')
         container = [n for n in listing[0].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c0')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '2')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '3')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp('1').isoformat)
         self.assertEqual(listing[-1].nodeName, 'container')
         container = [
             n for n in listing[-1].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c2')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '2')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '3')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp('3').isoformat)
         req = Request.blank('/sda1/p/a?limit=3&marker=c2&format=xml',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
@@ -1161,24 +1301,30 @@ class TestAccountController(unittest.TestCase):
         self.assertEqual(listing[0].nodeName, 'container')
         container = [n for n in listing[0].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c3')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '2')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '3')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp('4').isoformat)
         self.assertEqual(listing[-1].nodeName, 'container')
         container = [
             n for n in listing[-1].childNodes if n.nodeName != '#text']
         self.assertEqual(sorted([n.nodeName for n in container]),
-                         ['bytes', 'count', 'name'])
+                         ['bytes', 'count', 'last_modified', 'name'])
         node = [n for n in container if n.nodeName == 'name'][0]
         self.assertEqual(node.firstChild.nodeValue, 'c4')
         node = [n for n in container if n.nodeName == 'count'][0]
         self.assertEqual(node.firstChild.nodeValue, '2')
         node = [n for n in container if n.nodeName == 'bytes'][0]
         self.assertEqual(node.firstChild.nodeValue, '3')
+        node = [n for n in container if n.nodeName == 'last_modified'][0]
+        self.assertEqual(node.firstChild.nodeValue,
+                         Timestamp('5').isoformat)
 
     def test_GET_accept_wildcard(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1457,13 +1603,6 @@ class TestAccountController(unittest.TestCase):
                         listing.append(node2.firstChild.nodeValue)
         self.assertEqual(listing, ['sub.1.0', 'sub.1.1', 'sub.1.2'])
 
-    def test_GET_insufficient_storage(self):
-        self.controller = AccountController({'devices': self.testdir})
-        req = Request.blank('/sda-null/p/a', environ={'REQUEST_METHOD': 'GET',
-                                                      'HTTP_X_TIMESTAMP': '1'})
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 507)
-
     def test_through_call(self):
         inbuf = BytesIO()
         errbuf = StringIO()
@@ -1667,7 +1806,7 @@ class TestAccountController(unittest.TestCase):
     def test_serv_reserv(self):
         # Test replication_server flag was set from configuration file.
         conf = {'devices': self.testdir, 'mount_check': 'false'}
-        self.assertEqual(AccountController(conf).replication_server, None)
+        self.assertIsNone(AccountController(conf).replication_server)
         for val in [True, '1', 'True', 'true']:
             conf['replication_server'] = val
             self.assertTrue(AccountController(conf).replication_server)
@@ -2000,7 +2139,7 @@ class TestAccountController(unittest.TestCase):
             self.assertEqual(resp.status_int // 100, 2)
             for key in resp.headers:
                 if 'storage-policy' in key.lower():
-                    self.assertTrue(policy.name.lower() in key.lower())
+                    self.assertIn(policy.name.lower(), key.lower())
 
     def test_multiple_policies_in_use(self):
         ts = itertools.count()
@@ -2057,8 +2196,8 @@ class TestAccountController(unittest.TestCase):
                  StoragePolicy(2, 'two', False),
                  StoragePolicy(3, 'three', False)])
 class TestNonLegacyDefaultStoragePolicy(TestAccountController):
-
     pass
+
 
 if __name__ == '__main__':
     unittest.main()
